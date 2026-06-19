@@ -205,6 +205,7 @@ def to_safe_json_summary(result: GuardedRunResult) -> dict[str, Any]:
         "backend_name": result.backend_name,
         "backend_safe_by_default": result.backend_safe_by_default,
         "containment_verified": result.containment_verified,
+        "containment_features": dict(getattr(result, "containment_features", {})),
         "trusted_repo_path": result.trusted_repo_path,
         "workspace_path": _visible_workspace_path(result),
         "baseline_commit_sha": result.baseline_commit_sha,

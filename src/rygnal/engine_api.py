@@ -294,6 +294,7 @@ def _guarded_result_summary(result: GuardedRunResult, request: EngineRequest) ->
             "name": result.backend_name,
             "safe_by_default": result.backend_safe_by_default,
             "containment_verified": result.containment_verified,
+            "containment_features": dict(getattr(result, "containment_features", {})),
         },
         "cleanup": {
             "performed": result.cleanup_performed,

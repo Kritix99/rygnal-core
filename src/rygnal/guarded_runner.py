@@ -5,7 +5,7 @@ import os
 import shutil
 import subprocess  # nosec B404
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Protocol
@@ -59,7 +59,9 @@ from rygnal.workspace_cleanup import CleanupResult, CleanupStatus, destroy_workt
 UNSAFE_LOCAL_WARNING = "Unsafe local execution is not a containment backend."
 _SANDBOX_WORKSPACE = PurePosixPath("/").joinpath("workspace")
 _SANDBOX_TMP = PurePosixPath("/").joinpath("tmp")
+_SANDBOX_VAR_TMP = PurePosixPath("/").joinpath("var", "tmp")
 _SANDBOX_RUN = PurePosixPath("/").joinpath("run")
+_SANDBOX_ETC = PurePosixPath("/").joinpath("etc")
 
 
 class GuardedRunStatus(StrEnum):
@@ -133,6 +135,7 @@ class GuardedRunResult:
     blocked_reason: str | None
     warnings: tuple[str, ...]
     approval_request: ApprovalRequest | None = None
+    containment_features: dict[str, bool] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -270,6 +273,7 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
     backend_name: str | None = None
     backend_safe_by_default = False
     containment_verified = False
+    containment_features: dict[str, bool] = {}
 
     try:
         backend_selection = _select_backend(config)
@@ -279,6 +283,7 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
         containment = evaluate_containment_capabilities(backend_selection.name)
         containment_result = build_lifecycle_result(containment, LifecycleEvent.STARTED)
         containment_verified = containment_result.containment_verified
+        containment_features = containment.isolation_features
 
         if backend_selection.warning:
             warnings.append(backend_selection.warning)
@@ -298,6 +303,7 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
                 backend_name=backend_name,
                 backend_safe_by_default=backend_safe_by_default,
                 containment_verified=containment_verified,
+                containment_features=containment_features,
             )
 
         if not containment_verified and not containment.unsafe_local:
@@ -310,6 +316,7 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
                 backend_name=backend_name,
                 backend_safe_by_default=backend_safe_by_default,
                 containment_verified=containment_verified,
+                containment_features=containment_features,
             )
 
         command_backend = _command_backend_for(backend_selection.name)
@@ -323,6 +330,7 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
                 backend_name=backend_name,
                 backend_safe_by_default=backend_safe_by_default,
                 containment_verified=containment_verified,
+                containment_features=containment_features,
                 event_type="guarded_run.backend_blocked",
             )
 
@@ -338,6 +346,7 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
                 "backend_name": backend_name,
                 "backend_safe_by_default": backend_safe_by_default,
                 "containment_verified": containment_verified,
+                "containment_features": containment_features,
                 "selection_reason": backend_selection.reason,
                 "warnings": tuple(warnings),
             },
@@ -701,6 +710,7 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
         blocked_reason=blocked_reason,
         warnings=tuple(warnings),
         approval_request=approval_request,
+        containment_features=containment_features,
     )
 
 
@@ -929,19 +939,28 @@ def _build_bubblewrap_command(command: tuple[str, ...], workspace_path: Path) ->
         raise GuardedCommandExecutionError("Bubblewrap backend selected but bwrap was not found.")
 
     workspace = workspace_path.resolve()
+    passwd_file, group_file = _write_synthetic_identity_files(workspace)
 
     args = [
         bwrap_path,
         "--unshare-user",
         "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
         "--unshare-net",
         "--die-with-parent",
         "--proc",
         "/proc",
         "--dev",
         "/dev",
+        "--dir",
+        _SANDBOX_ETC.as_posix(),
+        "--dir",
+        "/var",
         "--tmpfs",
         _SANDBOX_TMP.as_posix(),
+        "--tmpfs",
+        _SANDBOX_VAR_TMP.as_posix(),
         "--dir",
         _SANDBOX_RUN.as_posix(),
         "--clearenv",
@@ -957,6 +976,12 @@ def _build_bubblewrap_command(command: tuple[str, ...], workspace_path: Path) ->
         "--setenv",
         "PWD",
         _SANDBOX_WORKSPACE.as_posix(),
+        "--ro-bind",
+        passwd_file.as_posix(),
+        "/etc/passwd",
+        "--ro-bind",
+        group_file.as_posix(),
+        "/etc/group",
     ]
 
     for runtime_path in ("/usr", "/bin", "/lib", "/lib64"):
@@ -964,8 +989,6 @@ def _build_bubblewrap_command(command: tuple[str, ...], workspace_path: Path) ->
             args.extend(["--ro-bind", runtime_path, runtime_path])
 
     for runtime_file in (
-        "/etc/passwd",
-        "/etc/group",
         "/etc/nsswitch.conf",
         "/etc/ld.so.cache",
     ):
@@ -987,6 +1010,47 @@ def _build_bubblewrap_command(command: tuple[str, ...], workspace_path: Path) ->
     return args
 
 
+def _write_synthetic_identity_files(workspace: Path) -> tuple[Path, Path]:
+    """Create minimal identity files outside the sandbox-visible workspace."""
+
+    identity_dir = workspace.parent.joinpath(".rygnal-sandbox-identity")
+    identity_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    uid = os.getuid() if hasattr(os, "getuid") else 65534
+    gid = os.getgid() if hasattr(os, "getgid") else 65534
+
+    passwd_file = identity_dir.joinpath("passwd")
+    group_file = identity_dir.joinpath("group")
+
+    passwd_file.write_text(
+        "\\n".join(
+            (
+                "root:x:0:0:root:/root:/usr/sbin/nologin",
+                f"rygnal:x:{uid}:{gid}:Rygnal Sandbox User:/tmp:/usr/sbin/nologin",
+                "nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    group_file.write_text(
+        "\\n".join(
+            (
+                "root:x:0:",
+                f"rygnal:x:{gid}:",
+                "nogroup:x:65534:",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    passwd_file.chmod(0o644)
+    group_file.chmod(0o644)
+
+    return passwd_file, group_file
+
+
 def _blocked_result(
     *,
     config: GuardedRunConfig,
@@ -997,6 +1061,7 @@ def _blocked_result(
     backend_name: str | None = None,
     backend_safe_by_default: bool = False,
     containment_verified: bool = False,
+    containment_features: dict[str, bool] | None = None,
     event_type: str = "guarded_run.blocked",
 ) -> GuardedRunResult:
     _audit(
@@ -1011,6 +1076,7 @@ def _blocked_result(
             "backend_name": backend_name,
             "backend_safe_by_default": backend_safe_by_default,
             "containment_verified": containment_verified,
+            "containment_features": containment_features or {},
             "blocked_reason": reason,
             "warnings": tuple(warnings),
             "command": _command_audit_summary(config.command),
@@ -1034,6 +1100,7 @@ def _blocked_result(
         change_risk_report=None,
         blocked_reason=reason,
         warnings=tuple(warnings),
+        containment_features=containment_features or {},
     )
 
 
