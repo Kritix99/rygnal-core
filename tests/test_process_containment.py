@@ -84,3 +84,21 @@ def test_model_prevents_parent_only_kill_from_claiming_security() -> None:
     assert result.containment_verified is False
     # Explicitly verify the limitation exists exposing the parent-only/group escape risk
     assert any("Parent exit code 0 does not guarantee" in lim for lim in result.limitations)
+
+
+def test_bubblewrap_reports_production_isolation_features() -> None:
+    caps = evaluate_containment_capabilities(ExecutionBackendName.LINUX_BUBBLEWRAP)
+
+    assert caps.isolation_features == {
+        "network_isolated": True,
+        "pid_namespace": True,
+        "ipc_namespace": True,
+        "uts_namespace": True,
+        "tmpfs_isolated": True,
+        "var_tmpfs_isolated": True,
+        "dev_sandboxed": True,
+        "identity_masked": True,
+        "host_environment_cleared": True,
+        "workspace_only_writable": True,
+        "atomic_tree_kill": True,
+    }

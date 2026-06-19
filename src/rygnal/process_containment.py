@@ -54,6 +54,33 @@ class ProcessContainmentCapabilities:
     supports_atomic_tree_kill: bool
     unsafe_local: bool
     limitations: tuple[str, ...]
+    network_isolated: bool = False
+    ipc_namespace: bool = False
+    uts_namespace: bool = False
+    tmpfs_isolated: bool = False
+    var_tmpfs_isolated: bool = False
+    dev_sandboxed: bool = False
+    identity_masked: bool = False
+    host_environment_cleared: bool = False
+    workspace_only_writable: bool = False
+
+    @property
+    def isolation_features(self) -> dict[str, bool]:
+        """Return auditable sandbox isolation features for this backend."""
+
+        return {
+            "network_isolated": self.network_isolated,
+            "pid_namespace": self.supports_pid_namespace,
+            "ipc_namespace": self.ipc_namespace,
+            "uts_namespace": self.uts_namespace,
+            "tmpfs_isolated": self.tmpfs_isolated,
+            "var_tmpfs_isolated": self.var_tmpfs_isolated,
+            "dev_sandboxed": self.dev_sandboxed,
+            "identity_masked": self.identity_masked,
+            "host_environment_cleared": self.host_environment_cleared,
+            "workspace_only_writable": self.workspace_only_writable,
+            "atomic_tree_kill": self.supports_atomic_tree_kill,
+        }
 
 
 @dataclass(frozen=True)
@@ -84,6 +111,15 @@ def evaluate_containment_capabilities(
             supports_atomic_tree_kill=True,
             unsafe_local=False,
             limitations=(),
+            network_isolated=True,
+            ipc_namespace=True,
+            uts_namespace=True,
+            tmpfs_isolated=True,
+            var_tmpfs_isolated=True,
+            dev_sandboxed=True,
+            identity_masked=True,
+            host_environment_cleared=True,
+            workspace_only_writable=True,
         )
 
     if backend == ExecutionBackendName.LINUX_SYSTEMD_USER:
