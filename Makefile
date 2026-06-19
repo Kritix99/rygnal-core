@@ -1,4 +1,4 @@
-.PHONY: install install-dev check-install format lint test security audit demo validate validate-local docker-build docker-test docker-demo docker-validate
+.PHONY: install install-dev check-install format lint test security audit demo validate-go validate-rust validate-python validate validate-local docker-build docker-test docker-demo docker-validate
 
 install: install-dev
 
@@ -31,7 +31,23 @@ audit:
 demo:
 	python -m demo.run_demo
 
-validate: format lint test security audit demo
+validate-go:
+	@echo "==> Validating Go (CLI)..."
+	go fmt ./...
+	go vet ./...
+	go test ./...
+
+validate-rust:
+	@echo "==> Validating Rust (Kernel)..."
+	cd rust-kernel && cargo fmt --check
+	cd rust-kernel && cargo clippy -- -D warnings
+	cd rust-kernel && cargo test
+
+validate-python: format lint test security audit demo
+	@echo "==> Python engine checks passed!"
+
+validate: validate-go validate-rust validate-python
+	@echo "==> All monorepo checks passed!"
 
 validate-local: validate check-install
 

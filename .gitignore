@@ -230,3 +230,18 @@ logs/*.jsonl
 
 # Local Go build output
 /rygnal
+
+# --- Task 7 Monorepo Exclusions ---
+# Go artifacts
+/bin/
+*.exe
+
+# Python artifacts
+*.py[cod]
+*$py.class
+*.whl
+dist/
+build/
+
+# Rust artifacts
+/rust-kernel/target/
