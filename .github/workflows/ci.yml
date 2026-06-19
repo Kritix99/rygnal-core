@@ -18,6 +18,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test Go CLI
+        run: go test ./...
+
+      - name: Build Go CLI
+        run: go build -o bin/rygnal ./cmd/rygnal
+
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
