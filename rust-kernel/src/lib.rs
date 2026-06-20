@@ -12,6 +12,7 @@ use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use tree_sitter::Parser;
 
 create_exception!(rygnal_kernel, CriticalityEvaluationError, PyException);
@@ -191,19 +192,66 @@ fn evaluate_agent_action(json_payload: String) -> PyResult<String> {
         .map_err(|err| PyValueError::new_err(format!("Failed to serialize assessment: {}", err)))
 }
 
+#[derive(Debug)]
+enum CriticalityBoundaryError {
+    InvalidPayload(String),
+    Evaluation(CriticalityError),
+    Serialize(String),
+    NativePanic,
+}
+
 #[pyfunction]
-fn evaluate_criticality(json_payload: &str) -> PyResult<String> {
-    let input: CriticalityInput = serde_json::from_str(json_payload)
-        .map_err(|err| PyValueError::new_err(format!("Invalid criticality payload: {}", err)))?;
-
-    let assessment = evaluate_criticality_inner(&input).map_err(criticality_error_to_py_error)?;
-
-    serde_json::to_string(&assessment).map_err(|err| {
-        PyValueError::new_err(format!(
-            "Failed to serialize criticality assessment: {}",
-            err
-        ))
+fn evaluate_criticality(py: Python<'_>, json_payload: String) -> PyResult<String> {
+    py.allow_threads(move || {
+        evaluate_criticality_with_panic_boundary(|| evaluate_criticality_json(&json_payload))
     })
+    .map_err(criticality_boundary_error_to_py_error)
+}
+
+fn evaluate_criticality_with_panic_boundary<F>(
+    operation: F,
+) -> Result<String, CriticalityBoundaryError>
+where
+    F: FnOnce() -> Result<String, CriticalityBoundaryError>,
+{
+    match catch_unwind(AssertUnwindSafe(operation)) {
+        Ok(result) => result,
+        Err(_) => Err(CriticalityBoundaryError::NativePanic),
+    }
+}
+
+fn evaluate_criticality_json(json_payload: &str) -> Result<String, CriticalityBoundaryError> {
+    let input: CriticalityInput = serde_json::from_str(json_payload)
+        .map_err(|err| CriticalityBoundaryError::InvalidPayload(err.to_string()))?;
+
+    let assessment =
+        evaluate_criticality_inner(&input).map_err(CriticalityBoundaryError::Evaluation)?;
+
+    serde_json::to_string(&assessment)
+        .map_err(|err| CriticalityBoundaryError::Serialize(err.to_string()))
+}
+
+fn criticality_boundary_error_to_py_error(err: CriticalityBoundaryError) -> PyErr {
+    match err {
+        CriticalityBoundaryError::InvalidPayload(message) => {
+            PyValueError::new_err(format!("Invalid criticality payload: {message}"))
+        }
+        CriticalityBoundaryError::Evaluation(err) => criticality_error_to_py_error(err),
+        CriticalityBoundaryError::Serialize(message) => PyValueError::new_err(format!(
+            "Failed to serialize criticality assessment: {message}"
+        )),
+        CriticalityBoundaryError::NativePanic => {
+            CriticalityEvaluationError::new_err(native_panic_error_json())
+        }
+    }
+}
+
+fn native_panic_error_json() -> String {
+    serde_json::json!({
+        "error_code": "native-panic",
+        "reason": "Rust criticality evaluation panicked and was safely contained",
+    })
+    .to_string()
 }
 
 fn criticality_error_to_py_error(err: CriticalityError) -> PyErr {
@@ -260,4 +308,45 @@ fn rygnal_kernel(py: Python, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(evaluate_criticality, module)?)?;
     module.add_function(wrap_pyfunction!(evaluate_subjective_risk, module)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod criticality_boundary_hardening_tests {
+    use super::*;
+
+    #[test]
+    fn criticality_boundary_converts_native_panic_to_structured_error() {
+        let result = evaluate_criticality_with_panic_boundary(
+            || -> Result<String, CriticalityBoundaryError> {
+                panic!("simulated criticality panic");
+            },
+        );
+
+        match result {
+            Err(CriticalityBoundaryError::NativePanic) => {}
+            other => panic!("expected NativePanic boundary error, got {other:?}"),
+        }
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&native_panic_error_json()).expect("valid panic error JSON");
+
+        assert_eq!(payload["error_code"], "native-panic");
+        assert!(payload["reason"]
+            .as_str()
+            .expect("reason should be a string")
+            .contains("safely contained"));
+    }
+
+    #[test]
+    fn criticality_boundary_preserves_invalid_payload_as_value_error_path() {
+        let result =
+            evaluate_criticality_with_panic_boundary(|| evaluate_criticality_json("{not-json}"));
+
+        match result {
+            Err(CriticalityBoundaryError::InvalidPayload(message)) => {
+                assert!(!message.trim().is_empty());
+            }
+            other => panic!("expected InvalidPayload boundary error, got {other:?}"),
+        }
+    }
 }

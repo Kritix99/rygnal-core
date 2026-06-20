@@ -10,6 +10,8 @@ use crate::path_safety::PathSafetyError;
 use std::collections::BTreeMap;
 
 const MAX_CRITICALITY: f64 = 10.0;
+const MAX_TEXT_FALLBACK_LINE_BYTES: usize = 1_000;
+const MAX_TEXT_FALLBACK_LINES: usize = 20_000;
 
 #[derive(Debug)]
 pub enum CriticalityError {
@@ -100,7 +102,7 @@ fn semantic_metrics_for_input(
     if is_python_path(normalized_path) {
         return match analyze_python_survival(&input.old_code, &input.new_code) {
             Ok(metrics) => Ok(metrics),
-            Err(AstError::ParseFailed) => {
+            Err(AstError::ParseFailed) | Err(AstError::SyntaxErrorNodes { .. }) => {
                 Ok(text_survival_metrics(&input.old_code, &input.new_code))
             }
             Err(err) => Err(CriticalityError::from(err)),
@@ -111,6 +113,10 @@ fn semantic_metrics_for_input(
 }
 
 fn text_survival_metrics(old_code: &str, new_code: &str) -> SemanticMetrics {
+    if should_use_bounded_text_fallback(old_code, new_code) {
+        return bounded_text_survival_metrics(old_code, new_code);
+    }
+
     let old_lines = normalized_non_empty_lines(old_code);
     let new_lines = normalized_non_empty_lines(new_code);
 
@@ -118,6 +124,55 @@ fn text_survival_metrics(old_code: &str, new_code: &str) -> SemanticMetrics {
     let new_count = new_lines.len();
 
     let matched = count_multiset_intersection(&old_lines, &new_lines);
+
+    let survival_ratio = if old_count == 0 {
+        1.0
+    } else {
+        matched as f64 / old_count as f64
+    };
+
+    SemanticMetrics {
+        old_node_count: 0,
+        new_node_count: 0,
+        old_token_count: old_count,
+        new_token_count: new_count,
+        matched_node_count: matched,
+        survival_ratio: clamp_unit(survival_ratio),
+    }
+}
+
+fn should_use_bounded_text_fallback(old_code: &str, new_code: &str) -> bool {
+    has_oversized_trimmed_line(old_code)
+        || has_oversized_trimmed_line(new_code)
+        || bounded_non_empty_line_count(old_code) > MAX_TEXT_FALLBACK_LINES
+        || bounded_non_empty_line_count(new_code) > MAX_TEXT_FALLBACK_LINES
+}
+
+fn has_oversized_trimmed_line(code: &str) -> bool {
+    code.lines()
+        .map(str::trim)
+        .any(|line| line.len() > MAX_TEXT_FALLBACK_LINE_BYTES)
+}
+
+fn bounded_non_empty_line_count(code: &str) -> usize {
+    code.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(MAX_TEXT_FALLBACK_LINES + 1)
+        .count()
+}
+
+fn bounded_text_survival_metrics(old_code: &str, new_code: &str) -> SemanticMetrics {
+    let old_count = bounded_non_empty_line_count(old_code);
+    let new_count = bounded_non_empty_line_count(new_code);
+
+    let matched = if old_count == 0 {
+        0
+    } else if old_code.trim() == new_code.trim() {
+        old_count.min(new_count)
+    } else {
+        0
+    };
 
     let survival_ratio = if old_count == 0 {
         1.0
@@ -624,5 +679,59 @@ mod tests {
         assert_eq!(assessment.semantic_metrics.matched_node_count, 2);
         assert_eq!(assessment.semantic_metrics.survival_ratio, 1.0);
         assert_eq!(assessment.risk_level, CriticalityRiskLevel::Medium);
+    }
+}
+
+#[cfg(test)]
+mod hardening_regression_tests {
+    use super::*;
+
+    fn hardening_input(old_code: &str, new_code: &str) -> CriticalityInput {
+        CriticalityInput {
+            file_path: "src/service.py".to_string(),
+            action_type: FileActionType::Modified,
+            old_code: old_code.to_string(),
+            new_code: new_code.to_string(),
+        }
+    }
+
+    #[test]
+    fn broken_python_uses_text_fallback_instead_of_partial_ast_metrics() {
+        let assessment = evaluate_criticality(&hardening_input(
+            "def broken_0(:\ndef broken_1(:\ndef broken_2(:\n",
+            "def fixed():\n    return 1\n",
+        ))
+        .expect("broken Python should fall back safely");
+
+        assert_eq!(assessment.semantic_metrics.old_node_count, 0);
+        assert_eq!(assessment.semantic_metrics.new_node_count, 0);
+        assert!((0.0..=1.0).contains(&assessment.semantic_metrics.survival_ratio));
+    }
+
+    #[test]
+    fn broken_minified_python_uses_bounded_text_fallback() {
+        let old_code = format!("def broken(:\n{}\n", "x".repeat(2_000));
+        let new_code = format!("def broken(:\n{}\n", "y".repeat(2_000));
+
+        let assessment = evaluate_criticality(&hardening_input(&old_code, &new_code))
+            .expect("broken minified Python should remain bounded");
+
+        assert_eq!(assessment.semantic_metrics.old_node_count, 0);
+        assert_eq!(assessment.semantic_metrics.new_node_count, 0);
+        assert_eq!(assessment.semantic_metrics.old_token_count, 2);
+        assert_eq!(assessment.semantic_metrics.new_token_count, 2);
+        assert_eq!(assessment.semantic_metrics.matched_node_count, 0);
+        assert_eq!(assessment.semantic_metrics.survival_ratio, 0.0);
+    }
+
+    #[test]
+    fn large_multibyte_lines_remain_bounded_and_deterministic() {
+        let old_code = format!("def value():\n    return {:?}\n", "🚀".repeat(1_500));
+        let new_code = format!("def value():\n    return {:?}\n", "🌍".repeat(1_500));
+
+        let assessment = evaluate_criticality(&hardening_input(&old_code, &new_code))
+            .expect("large multi-byte lines should not panic or hang");
+
+        assert!((0.0..=1.0).contains(&assessment.semantic_metrics.survival_ratio));
     }
 }

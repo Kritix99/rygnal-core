@@ -3,11 +3,18 @@ use std::collections::BTreeMap;
 use tree_sitter::{Node, Parser};
 
 const MAX_AST_NAMED_NODES: usize = 50_000;
+// Any Tree-Sitter error or missing node means the recovered AST is not
+// trustworthy enough for semantic-destruction math. Fall back to text.
+const MAX_TRUSTED_AST_ERROR_NODES: usize = 0;
 
 #[derive(Debug)]
 pub enum AstError {
     LanguageLoad(String),
     ParseFailed,
+    SyntaxErrorNodes {
+        error_node_count: usize,
+        limit: usize,
+    },
     AstTooLarge {
         named_node_count: usize,
         limit: usize,
@@ -22,6 +29,13 @@ impl std::fmt::Display for AstError {
                 write!(formatter, "failed to load Python grammar: {message}")
             }
             AstError::ParseFailed => write!(formatter, "tree-sitter failed to parse Python code"),
+            AstError::SyntaxErrorNodes {
+                error_node_count,
+                limit,
+            } => write!(
+                formatter,
+                "Python AST contains {error_node_count} untrusted syntax nodes, exceeding limit {limit}"
+            ),
             AstError::AstTooLarge {
                 named_node_count,
                 limit,
@@ -96,6 +110,14 @@ fn extract_python_features(code: &str) -> Result<SyntaxFeatures, AstError> {
     let tree = parser.parse(code, None).ok_or(AstError::ParseFailed)?;
     let root = tree.root_node();
 
+    let untrusted_syntax_count = count_untrusted_syntax_nodes(root);
+    if untrusted_syntax_count > MAX_TRUSTED_AST_ERROR_NODES {
+        return Err(AstError::SyntaxErrorNodes {
+            error_node_count: untrusted_syntax_count,
+            limit: MAX_TRUSTED_AST_ERROR_NODES,
+        });
+    }
+
     if root.has_error() {
         return Err(AstError::ParseFailed);
     }
@@ -138,6 +160,16 @@ fn count_named_nodes_inner(node: Node<'_>, count: &mut usize) -> Result<(), AstE
     }
 
     Ok(())
+}
+
+fn count_untrusted_syntax_nodes(node: Node<'_>) -> usize {
+    let current = usize::from(node.is_error() || node.is_missing() || node.kind() == "ERROR");
+
+    current
+        + (0..node.child_count())
+            .filter_map(|index| node.child(index))
+            .map(count_untrusted_syntax_nodes)
+            .fold(0usize, usize::saturating_add)
 }
 
 fn collect_semantic_tokens(
@@ -381,6 +413,51 @@ def stable():
                 assert_eq!(limit, MAX_AST_NAMED_NODES);
             }
             other => panic!("expected AstTooLarge, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod hardening_regression_tests {
+    use super::*;
+
+    #[test]
+    fn multibyte_python_source_does_not_panic_or_break_utf8_boundaries() {
+        let old_code = r#"
+def load_message():
+    message = "नमस्ते 🚀"
+    return message
+"#;
+
+        let new_code = r#"
+def load_message():
+    message = "नमस्ते 🌍"
+    return message
+"#;
+
+        let metrics = analyze_python_survival(old_code, new_code)
+            .expect("multi-byte Python source should remain byte-boundary safe");
+
+        assert!(metrics.old_token_count > 0);
+        assert!(metrics.new_token_count > 0);
+        assert!((0.0..=1.0).contains(&metrics.survival_ratio));
+    }
+
+    #[test]
+    fn syntax_error_nodes_are_rejected_for_safe_fallback() {
+        let broken_code = "def broken_0(:\ndef broken_1(:\ndef broken_2(:\n";
+
+        let error = analyze_python_survival(broken_code, "def ok():\n    return 1\n")
+            .expect_err("syntax-error AST should not be trusted");
+
+        match error {
+            AstError::SyntaxErrorNodes {
+                error_node_count,
+                limit,
+            } => {
+                assert!(error_node_count > limit);
+            }
+            other => panic!("expected SyntaxErrorNodes, got {other:?}"),
         }
     }
 }
