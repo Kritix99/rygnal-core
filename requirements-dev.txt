@@ -1,5 +1,5 @@
 pytest>=9.1.0
-ruff>=0.15.16
+ruff>=0.15.18
 bandit>=1.7.9
 pip-audit>=2.10.1
 
