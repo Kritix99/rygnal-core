@@ -295,3 +295,97 @@ def test_hostile_attempt_common_secret_path_in_workspace_is_captured_not_applied
     assert gate.blocked is True
     assert not (trusted / ".aws" / "credentials").exists()
     assert git_status_porcelain(trusted) == ""
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group cleanup is POSIX-specific")
+def test_timeout_kills_same_process_group_child_before_late_host_write(
+    tmp_path: Path,
+) -> None:
+    trusted = create_trusted_repo(tmp_path / "trusted")
+    sentinel = tmp_path / "child-survived.txt"
+
+    child_code = (
+        "import time; "
+        "time.sleep(2); "
+        f"open({sentinel.as_posix()!r}, 'w', encoding='utf-8').write('survived')"
+    )
+
+    result = run_guarded(
+        unsafe_runner_config(
+            trusted,
+            py_command(
+                "import subprocess, sys, time; "
+                f"subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+                "time.sleep(30)"
+            ),
+            timeout_seconds=1,
+        )
+    )
+
+    time.sleep(2.5)
+
+    assert result.status == GuardedRunStatus.TIMED_OUT
+    assert result.command_result is not None
+    assert result.command_result.timed_out is True
+    assert git_status_porcelain(trusted) == ""
+    assert result.workspace_path is not None
+    assert not Path(result.workspace_path).exists()
+    assert not sentinel.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group cleanup is POSIX-specific")
+def test_timeout_escalates_sigterm_ignoring_child_to_force_kill(
+    tmp_path: Path,
+) -> None:
+    trusted = create_trusted_repo(tmp_path / "trusted")
+    ready = tmp_path / "sigterm-ignoring-child-ready.txt"
+    sentinel = tmp_path / "sigterm-ignoring-child-survived.txt"
+
+    child_code = (
+        "import signal, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        f"open({ready.as_posix()!r}, 'w', encoding='utf-8').write('ready'); "
+        "time.sleep(3); "
+        f"open({sentinel.as_posix()!r}, 'w', encoding='utf-8').write('survived')"
+    )
+
+    result = run_guarded(
+        unsafe_runner_config(
+            trusted,
+            py_command(
+                "import subprocess, sys, time; "
+                f"subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+                "time.sleep(30)"
+            ),
+            timeout_seconds=1,
+        )
+    )
+
+    time.sleep(3.5)
+
+    assert result.status == GuardedRunStatus.TIMED_OUT
+    assert result.command_result is not None
+    assert result.command_result.timed_out is True
+    assert ready.exists()
+    assert not sentinel.exists()
+    assert git_status_porcelain(trusted) == ""
+
+
+def test_timeout_preserves_partial_stdout_before_process_cleanup(
+    tmp_path: Path,
+) -> None:
+    trusted = create_trusted_repo(tmp_path / "trusted")
+
+    result = run_guarded(
+        unsafe_runner_config(
+            trusted,
+            py_command("import time; print('before-timeout', flush=True); time.sleep(30)"),
+            timeout_seconds=1,
+        )
+    )
+
+    assert result.status == GuardedRunStatus.TIMED_OUT
+    assert result.command_result is not None
+    assert result.command_result.timed_out is True
+    assert "before-timeout" in result.command_result.stdout
+    assert git_status_porcelain(trusted) == ""

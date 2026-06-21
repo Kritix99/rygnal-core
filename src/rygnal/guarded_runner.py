@@ -3,8 +3,11 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import signal
 import subprocess  # nosec B404
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
@@ -57,6 +60,10 @@ from rygnal.untracked_files import UntrackedFilePolicy
 from rygnal.workspace_cleanup import CleanupResult, CleanupStatus, destroy_worktree
 
 UNSAFE_LOCAL_WARNING = "Unsafe local execution is not a containment backend."
+# Keep timeout cleanup bounded. This is lifecycle cleanup, not verified containment.
+_PROCESS_GROUP_TERMINATION_GRACE_SECONDS = 1.0
+_PROCESS_OUTPUT_DRAIN_GRACE_SECONDS = 1.0
+_SIGNAL_NAMES_FOR_PROCESS_CLEANUP = ("SIGINT", "SIGTERM", "SIGHUP")
 _SANDBOX_WORKSPACE = PurePosixPath("/").joinpath("workspace")
 _SANDBOX_TMP = PurePosixPath("/").joinpath("tmp")
 _SANDBOX_VAR_TMP = PurePosixPath("/").joinpath("var", "tmp")
@@ -897,40 +904,274 @@ def _run_subprocess(
     timeout_seconds: int,
 ) -> GuardedCommandResult:
     started = time.monotonic()
+    cleanup_warnings: list[str] = []
 
     try:
-        completed = subprocess.run(  # nosec B603 B607
-            command,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            check=False,
-            shell=False,
-            timeout=timeout_seconds,
-        )
-        duration_ms = int((time.monotonic() - started) * 1000)
+        process = _start_guarded_process(command, cwd=cwd)
 
-        return GuardedCommandResult(
-            command=command,
-            exit_code=completed.returncode,
-            stdout=completed.stdout or "",
-            stderr=completed.stderr or "",
-            timed_out=False,
-            duration_ms=duration_ms,
-        )
-    except subprocess.TimeoutExpired as exc:
-        duration_ms = int((time.monotonic() - started) * 1000)
+        with _temporary_process_signal_cleanup(process, cleanup_warnings):
+            try:
+                stdout, stderr = process.communicate(timeout=timeout_seconds)
+                duration_ms = int((time.monotonic() - started) * 1000)
 
-        return GuardedCommandResult(
-            command=command,
-            exit_code=None,
-            stdout=_stream_to_text(exc.stdout),
-            stderr=_stream_to_text(exc.stderr),
-            timed_out=True,
-            duration_ms=duration_ms,
-        )
+                return GuardedCommandResult(
+                    command=command,
+                    exit_code=process.returncode,
+                    stdout=stdout or "",
+                    stderr=_append_cleanup_warnings(stderr or "", cleanup_warnings),
+                    timed_out=False,
+                    duration_ms=duration_ms,
+                )
+            except subprocess.TimeoutExpired as exc:
+                cleanup_warnings.extend(_terminate_guarded_process_tree(process))
+                stdout, stderr, drain_warning = _drain_guarded_process_output(process, exc)
+                if drain_warning:
+                    cleanup_warnings.append(drain_warning)
+
+                duration_ms = int((time.monotonic() - started) * 1000)
+
+                return GuardedCommandResult(
+                    command=command,
+                    exit_code=None,
+                    stdout=stdout,
+                    stderr=_append_cleanup_warnings(stderr, cleanup_warnings),
+                    timed_out=True,
+                    duration_ms=duration_ms,
+                )
     except OSError as exc:
         raise GuardedCommandExecutionError(f"Failed to start guarded command: {exc}") from exc
+
+
+def _start_guarded_process(command: tuple[str, ...], *, cwd: Path) -> subprocess.Popen[str]:
+    kwargs: dict[str, object] = {}
+    if _posix_process_group_supported():
+        kwargs["start_new_session"] = True
+
+    return subprocess.Popen(  # nosec B603 B607
+        command,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        shell=False,
+        **kwargs,
+    )
+
+
+def _posix_process_group_supported() -> bool:
+    return os.name == "posix" and hasattr(os, "getpgid") and hasattr(os, "killpg")
+
+
+def _terminate_guarded_process_tree(process: subprocess.Popen[str]) -> list[str]:
+    warnings: list[str] = []
+    process_group_id, group_warning = _guarded_process_group_id(process)
+    if group_warning:
+        warnings.append(group_warning)
+
+    if process.poll() is None:
+        warnings.extend(_terminate_guarded_process(process, process_group_id))
+
+        try:
+            process.wait(timeout=_PROCESS_GROUP_TERMINATION_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+
+    # SIGTERM can kill the parent while same-group children keep running.
+    # Always attempt one bounded force-kill pass against the original group id.
+    warnings.extend(_force_kill_guarded_process(process, process_group_id))
+
+    try:
+        process.wait(timeout=_PROCESS_GROUP_TERMINATION_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        warnings.append("Guarded command did not exit after forced cleanup; output may be partial.")
+
+    return warnings
+
+
+def _terminate_guarded_process(
+    process: subprocess.Popen[str],
+    process_group_id: int | None,
+) -> list[str]:
+    if process_group_id is not None:
+        return _signal_guarded_process_group_id(
+            process_group_id,
+            signal.SIGTERM,
+            action="terminate",
+        )
+
+    return _signal_direct_process(
+        process,
+        signal.SIGTERM,
+        action="terminate",
+        fallback_message="POSIX process groups unavailable; terminated direct process only.",
+    )
+
+
+def _force_kill_guarded_process(
+    process: subprocess.Popen[str],
+    process_group_id: int | None,
+) -> list[str]:
+    sigkill = getattr(signal, "SIGKILL", None)
+    if process_group_id is not None and sigkill is not None:
+        return _signal_guarded_process_group_id(
+            process_group_id,
+            sigkill,
+            action="force-kill",
+        )
+
+    if process.poll() is not None:
+        return []
+
+    try:
+        process.kill()
+    except ProcessLookupError:
+        return []
+    except OSError as exc:
+        return [f"Failed to force-kill guarded process: {exc}"]
+
+    return ["POSIX process groups unavailable; force-killed direct process only."]
+
+
+def _guarded_process_group_id(process: subprocess.Popen[str]) -> tuple[int | None, str | None]:
+    if not _posix_process_group_supported():
+        return None, None
+
+    try:
+        return os.getpgid(process.pid), None
+    except ProcessLookupError:
+        return None, None
+    except OSError as exc:
+        return None, f"Failed to inspect guarded process group: {exc}"
+
+
+def _signal_guarded_process_group_id(
+    process_group_id: int,
+    signal_number: int,
+    *,
+    action: str,
+) -> list[str]:
+    try:
+        os.killpg(process_group_id, signal_number)
+    except ProcessLookupError:
+        return []
+    except OSError as exc:
+        return [f"Failed to signal guarded process group during {action}: {exc}"]
+
+    return []
+
+
+def _signal_direct_process(
+    process: subprocess.Popen[str],
+    signal_number: int,
+    *,
+    action: str,
+    fallback_message: str,
+) -> list[str]:
+    if process.poll() is not None:
+        return []
+
+    try:
+        process.send_signal(signal_number)
+    except ProcessLookupError:
+        return []
+    except OSError as exc:
+        return [f"Failed to signal guarded process during {action}: {exc}"]
+
+    return [fallback_message]
+
+
+def _drain_guarded_process_output(
+    process: subprocess.Popen[str],
+    timeout_error: subprocess.TimeoutExpired,
+) -> tuple[str, str, str | None]:
+    try:
+        stdout, stderr = process.communicate(timeout=_PROCESS_OUTPUT_DRAIN_GRACE_SECONDS)
+        return stdout or "", stderr or "", None
+    except subprocess.TimeoutExpired as drain_error:
+        _close_process_pipes(process)
+        stdout = _stream_to_text(drain_error.stdout) or _stream_to_text(timeout_error.stdout)
+        stderr = _stream_to_text(drain_error.stderr) or _stream_to_text(timeout_error.stderr)
+        return (
+            stdout,
+            stderr,
+            (
+                "Guarded command output pipes did not close after cleanup; "
+                "stdout/stderr may be partial."
+            ),
+        )
+
+
+def _close_process_pipes(process: subprocess.Popen[str]) -> None:
+    for stream in (process.stdout, process.stderr):
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
+def _append_cleanup_warnings(stderr: str, warnings: list[str]) -> str:
+    if not warnings:
+        return stderr
+
+    warning_text = "\n".join(f"[rygnal cleanup] {warning}" for warning in warnings)
+    if not stderr:
+        return f"{warning_text}\n"
+
+    return f"{stderr.rstrip()}\n{warning_text}\n"
+
+
+@contextmanager
+def _temporary_process_signal_cleanup(
+    process: subprocess.Popen[str],
+    cleanup_warnings: list[str],
+):
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    previous_handlers: dict[int, object] = {}
+
+    def restore_handlers() -> None:
+        for signal_number, previous_handler in previous_handlers.items():
+            signal.signal(signal_number, previous_handler)
+
+    def cleanup_before_signal_exit(signum: int, frame: object) -> None:
+        cleanup_warnings.extend(_terminate_guarded_process_tree(process))
+        restore_handlers()
+
+        previous_handler = previous_handlers.get(signum, signal.SIG_DFL)
+        if callable(previous_handler):
+            previous_handler(signum, frame)
+            return
+
+        if previous_handler == signal.SIG_IGN:
+            return
+
+        if signum == getattr(signal, "SIGINT", None):
+            raise KeyboardInterrupt
+
+        raise SystemExit(128 + signum)
+
+    for signal_name in _SIGNAL_NAMES_FOR_PROCESS_CLEANUP:
+        signal_number = getattr(signal, signal_name, None)
+        if signal_number is None:
+            continue
+
+        try:
+            previous_handlers[signal_number] = signal.getsignal(signal_number)
+            signal.signal(signal_number, cleanup_before_signal_exit)
+        except (OSError, RuntimeError, ValueError) as exc:
+            previous_handlers.pop(signal_number, None)
+            cleanup_warnings.append(
+                f"Could not install guarded cleanup handler for {signal_name}: {exc}"
+            )
+
+    try:
+        yield
+    finally:
+        restore_handlers()
 
 
 def _build_bubblewrap_command(command: tuple[str, ...], workspace_path: Path) -> list[str]:
