@@ -629,10 +629,7 @@ def test_rust_criticality_shadow_invokes_rust_for_malformed_root_lockfile(
     assert shadow["available"] is True
     assert shadow["criticality_bypass_verdict"] == "elevated-risk"
     assert shadow["criticality_bypass_reason"] == "lockfile-claim-invalid-structure"
-    assert any(
-        reason.code == "lockfile-claim-invalid-structure"
-        for reason in file_risk.reasons
-    )
+    assert any(reason.code == "lockfile-claim-invalid-structure" for reason in file_risk.reasons)
 
 
 def test_rust_criticality_shadow_invokes_rust_for_generated_marker_spoof(
@@ -666,9 +663,7 @@ def test_rust_criticality_shadow_invokes_rust_for_generated_marker_spoof(
     assert captured["input"].file_path == "src/app.py"
     assert shadow["available"] is True
     assert shadow["criticality_bypass_verdict"] == "rust-invoked"
-    assert shadow["criticality_bypass_reason"] == (
-        "rust-invoked:generated-marker-without-path"
-    )
+    assert shadow["criticality_bypass_reason"] == ("rust-invoked:generated-marker-without-path")
 
 
 def test_rust_criticality_shadow_bypasses_verified_generated_file(
@@ -680,9 +675,7 @@ def test_rust_criticality_shadow_bypasses_verified_generated_file(
     def fake_evaluate(criticality_input):
         nonlocal calls
         calls += 1
-        raise AssertionError(
-            "Rust criticality should not be called for verified generated files"
-        )
+        raise AssertionError("Rust criticality should not be called for verified generated files")
 
     monkeypatch.setattr("rygnal.change_risk.evaluate_criticality", fake_evaluate)
 
