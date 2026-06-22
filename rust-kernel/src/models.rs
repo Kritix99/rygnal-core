@@ -117,6 +117,7 @@ pub enum PathSensitivitySeverity {
 }
 
 pub const DEFAULT_ELEVATED_RISK_WEIGHT: f64 = 2.0;
+pub const ELEVATED_RISK_WEIGHT_ENV: &str = "RYGNAL_ELEVATED_RISK_WEIGHT";
 
 #[allow(dead_code)]
 #[derive(Deserialize, Debug, PartialEq)]
@@ -127,9 +128,7 @@ pub struct CriticalityInput {
     pub old_code: String,
     pub new_code: String,
     #[serde(default)]
-    pub elevated: bool,
-    #[serde(default)]
-    pub elevated_weight: Option<f64>,
+    pub elevated: Option<bool>,
 }
 
 #[allow(dead_code)]
@@ -162,8 +161,7 @@ mod criticality_model_tests {
         assert_eq!(input.action_type, FileActionType::Modified);
         assert_eq!(input.old_code, "def old(): pass");
         assert_eq!(input.new_code, "def new(): pass");
-        assert!(!input.elevated);
-        assert_eq!(input.elevated_weight, None);
+        assert_eq!(input.elevated, None);
     }
 
     #[test]
@@ -173,14 +171,12 @@ mod criticality_model_tests {
             "action_type": "modified",
             "old_code": "{}",
             "new_code": "{bad-json",
-            "elevated": true,
-            "elevated_weight": 1.5
+            "elevated": true
         }"#;
 
         let input = serde_json::from_str::<CriticalityInput>(payload).expect("valid input");
 
-        assert!(input.elevated);
-        assert_eq!(input.elevated_weight, Some(1.5));
+        assert_eq!(input.elevated, Some(true));
     }
 
     #[test]

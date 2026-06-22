@@ -273,6 +273,37 @@ def test_rust_kernel_evaluates_criticality_bridge() -> None:
     assert any("Semantic destruction" in reason for reason in result["reasons"])
 
 
+def test_rust_kernel_criticality_explicit_false_matches_legacy_score() -> None:
+    rygnal_kernel = pytest.importorskip("rygnal_kernel")
+
+    legacy_payload = {
+        "file_path": "src/unknown.txt",
+        "action_type": "modified",
+        "old_code": "value = 1\n",
+        "new_code": "value = 1\n",
+    }
+    explicit_false_payload = {
+        **legacy_payload,
+        "elevated": False,
+    }
+
+    legacy = json.loads(rygnal_kernel.evaluate_criticality(json.dumps(legacy_payload)))
+    explicit_false = json.loads(
+        rygnal_kernel.evaluate_criticality(json.dumps(explicit_false_payload))
+    )
+
+    assert explicit_false["criticality_index"] == legacy["criticality_index"]
+    assert explicit_false["risk_level"] == legacy["risk_level"]
+    assert any(
+        "Elevated risk field absent in payload; defaulted to false." in reason
+        for reason in legacy["reasons"]
+    )
+    assert not any(
+        "Elevated risk field absent in payload; defaulted to false." in reason
+        for reason in explicit_false["reasons"]
+    )
+
+
 def test_rust_kernel_criticality_accepts_elevated_signal() -> None:
     rygnal_kernel = pytest.importorskip("rygnal_kernel")
 
@@ -285,7 +316,6 @@ def test_rust_kernel_criticality_accepts_elevated_signal() -> None:
     elevated_payload = {
         **baseline_payload,
         "elevated": True,
-        "elevated_weight": 1.5,
     }
 
     baseline = json.loads(rygnal_kernel.evaluate_criticality(json.dumps(baseline_payload)))
