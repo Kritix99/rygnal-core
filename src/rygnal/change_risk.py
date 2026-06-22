@@ -737,6 +737,10 @@ def _criticality_shadow_for_file(
                 action_type=file_diff.kind.value,
                 old_code=old_code,
                 new_code=new_code,
+                elevated=(
+                    criticality_bypass_verdict is not None
+                    and criticality_bypass_verdict.verdict == BYPASS_VERDICT_ELEVATED_RISK
+                ),
             )
         )
     except Exception as exc:

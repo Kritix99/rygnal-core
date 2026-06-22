@@ -608,6 +608,7 @@ def test_rust_criticality_shadow_invokes_rust_for_malformed_root_lockfile(
     calls = 0
 
     def fake_evaluate(criticality_input):
+        assert criticality_input.elevated is True
         nonlocal calls
         calls += 1
         return _low_rust_criticality_assessment()
