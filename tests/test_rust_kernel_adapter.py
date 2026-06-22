@@ -348,12 +348,11 @@ def test_rust_kernel_adapter_serializes_elevated_criticality_input(
             old_code="{}",
             new_code="{bad-json",
             elevated=True,
-            elevated_weight=1.5,
         )
     )
 
     assert captured["payload"]["elevated"] is True
-    assert captured["payload"]["elevated_weight"] == 1.5
+    assert "elevated_weight" not in captured["payload"]
 
 
 def test_rust_kernel_adapter_rejects_null_criticality_index(

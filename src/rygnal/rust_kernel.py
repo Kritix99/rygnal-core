@@ -91,7 +91,6 @@ class RustCriticalityInput:
     old_code: str = ""
     new_code: str = ""
     elevated: bool = False
-    elevated_weight: float | None = None
 
 
 @dataclass(frozen=True)
