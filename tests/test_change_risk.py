@@ -517,6 +517,187 @@ def test_rust_criticality_shadow_bypasses_massive_files(
     assert shadow["error_reason"] == "file size exceeds shadow mode criticality limits"
 
 
+def _low_rust_criticality_assessment():
+    from rygnal.rust_kernel import RustCriticalityAssessment, RustSemanticMetrics
+
+    return RustCriticalityAssessment(
+        criticality_index=1.0,
+        risk_level="low",
+        reasons=(),
+        semantic_metrics=RustSemanticMetrics(
+            old_node_count=0,
+            new_node_count=1,
+            old_token_count=0,
+            new_token_count=1,
+            matched_node_count=0,
+            survival_ratio=1.0,
+        ),
+        path_category="source",
+        path_severity="low",
+    )
+
+
+def test_rust_criticality_shadow_bypasses_verified_root_lockfile(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls = 0
+
+    def fake_evaluate(criticality_input):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("Rust criticality should not be called for verified lockfiles")
+
+    monkeypatch.setattr("rygnal.change_risk.evaluate_criticality", fake_evaluate)
+
+    repo = create_repo(tmp_path)
+    (repo / "package-lock.json").write_text(
+        '{"lockfileVersion": 3, "packages": {}}\n',
+        encoding="utf-8",
+    )
+
+    report = classify_repo_changes(repo)
+    file_risk = risk_for_path(report, "package-lock.json")
+    shadow = file_risk.audit_summary["rust_criticality"]
+
+    assert calls == 0
+    assert shadow["available"] is False
+    assert shadow["error_code"] == "criticality-bypass"
+    assert shadow["criticality_bypass_verdict"] == "bypassed"
+    assert shadow["criticality_bypass_reason"] == "bypassed:lockfile-root-valid-json"
+
+
+def test_rust_criticality_shadow_invokes_rust_for_nested_lockfile(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls = 0
+    captured = {}
+
+    def fake_evaluate(criticality_input):
+        nonlocal calls
+        calls += 1
+        captured["input"] = criticality_input
+        return _low_rust_criticality_assessment()
+
+    monkeypatch.setattr("rygnal.change_risk.evaluate_criticality", fake_evaluate)
+
+    repo = create_repo(tmp_path)
+    nested = repo / "src"
+    nested.mkdir()
+    (nested / "package-lock.json").write_text(
+        '{"lockfileVersion": 3, "packages": {}}\n',
+        encoding="utf-8",
+    )
+
+    report = classify_repo_changes(repo)
+    file_risk = risk_for_path(report, "src/package-lock.json")
+    shadow = file_risk.audit_summary["rust_criticality"]
+
+    assert calls == 1
+    assert captured["input"].file_path == "src/package-lock.json"
+    assert shadow["available"] is True
+    assert shadow["criticality_bypass_verdict"] == "rust-invoked"
+    assert shadow["criticality_bypass_reason"] == "rust-invoked:lockfile-nested-path"
+
+
+def test_rust_criticality_shadow_invokes_rust_for_malformed_root_lockfile(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls = 0
+
+    def fake_evaluate(criticality_input):
+        nonlocal calls
+        calls += 1
+        return _low_rust_criticality_assessment()
+
+    monkeypatch.setattr("rygnal.change_risk.evaluate_criticality", fake_evaluate)
+
+    repo = create_repo(tmp_path)
+    (repo / "package-lock.json").write_text(
+        '{"not": "a real lockfile"\n',
+        encoding="utf-8",
+    )
+
+    report = classify_repo_changes(repo)
+    file_risk = risk_for_path(report, "package-lock.json")
+    shadow = file_risk.audit_summary["rust_criticality"]
+
+    assert calls == 1
+    assert file_risk.risk_level == RiskLevel.HIGH
+    assert shadow["available"] is True
+    assert shadow["criticality_bypass_verdict"] == "elevated-risk"
+    assert shadow["criticality_bypass_reason"] == "lockfile-claim-invalid-structure"
+    assert any(reason.code == "lockfile-claim-invalid-structure" for reason in file_risk.reasons)
+
+
+def test_rust_criticality_shadow_invokes_rust_for_generated_marker_spoof(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls = 0
+    captured = {}
+
+    def fake_evaluate(criticality_input):
+        nonlocal calls
+        calls += 1
+        captured["input"] = criticality_input
+        return _low_rust_criticality_assessment()
+
+    monkeypatch.setattr("rygnal.change_risk.evaluate_criticality", fake_evaluate)
+
+    repo = create_repo(tmp_path)
+    src = repo / "src"
+    src.mkdir()
+    (src / "app.py").write_text(
+        "# @generated\nprint('spoof')\n",
+        encoding="utf-8",
+    )
+
+    report = classify_repo_changes(repo)
+    file_risk = risk_for_path(report, "src/app.py")
+    shadow = file_risk.audit_summary["rust_criticality"]
+
+    assert calls == 1
+    assert captured["input"].file_path == "src/app.py"
+    assert shadow["available"] is True
+    assert shadow["criticality_bypass_verdict"] == "rust-invoked"
+    assert shadow["criticality_bypass_reason"] == ("rust-invoked:generated-marker-without-path")
+
+
+def test_rust_criticality_shadow_bypasses_verified_generated_file(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls = 0
+
+    def fake_evaluate(criticality_input):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("Rust criticality should not be called for verified generated files")
+
+    monkeypatch.setattr("rygnal.change_risk.evaluate_criticality", fake_evaluate)
+
+    repo = create_repo(tmp_path)
+    generated = repo / "src" / "generated"
+    generated.mkdir(parents=True)
+    (generated / "client.py").write_text(
+        "# @generated\nprint('generated')\n",
+        encoding="utf-8",
+    )
+
+    report = classify_repo_changes(repo)
+    file_risk = risk_for_path(report, "src/generated/client.py")
+    shadow = file_risk.audit_summary["rust_criticality"]
+
+    assert calls == 0
+    assert shadow["available"] is False
+    assert shadow["error_code"] == "criticality-bypass"
+    assert shadow["criticality_bypass_verdict"] == "bypassed"
+    assert shadow["criticality_bypass_reason"] == "bypassed:generated-marker-and-path"
+
+
 def test_rust_criticality_shadow_loads_deleted_file_content(
     tmp_path: Path,
     monkeypatch,
@@ -1019,7 +1200,7 @@ def test_rust_criticality_shadow_bypasses_jupyter_notebooks(
 
     repo = create_repo(tmp_path)
     (repo / "analysis.ipynb").write_text(
-        '{"cells":[{"cell_type":"code","source":["print(1)\\n"]}]}',
+        '{"cells":[{"cell_type":"code","source":["print(1)\n"]}]}',
         encoding="utf-8",
     )
 
@@ -1050,7 +1231,10 @@ def test_rust_criticality_shadow_bypasses_lockfiles(
     monkeypatch.setattr("rygnal.change_risk.evaluate_criticality", fake_evaluate)
 
     repo = create_repo(tmp_path)
-    (repo / "package-lock.json").write_text('{"lockfileVersion": 3}\\n', encoding="utf-8")
+    (repo / "package-lock.json").write_text(
+        '{"lockfileVersion": 3, "packages": {}}\n',
+        encoding="utf-8",
+    )
 
     report = classify_repo_changes(repo)
 
@@ -1059,8 +1243,10 @@ def test_rust_criticality_shadow_bypasses_lockfiles(
 
     assert calls == 0
     assert shadow["available"] is False
-    assert shadow["error_code"] == "lockfile"
-    assert shadow["error_reason"] == "Lockfiles are excluded from Rust criticality analysis"
+    assert shadow["error_code"] == "criticality-bypass"
+    assert shadow["error_reason"] == "bypassed:lockfile-root-valid-json"
+    assert shadow["criticality_bypass_verdict"] == "bypassed"
+    assert shadow["criticality_bypass_reason"] == "bypassed:lockfile-root-valid-json"
 
 
 def test_rust_criticality_shadow_bypasses_generated_files(
@@ -1080,7 +1266,7 @@ def test_rust_criticality_shadow_bypasses_generated_files(
     src = repo / "src"
     src.mkdir()
     (src / "generated.py").write_text(
-        "# This file is auto-generated. DO NOT EDIT.\\ndef generated_value():\\n    return 1\\n",
+        "# This file is auto-generated. DO NOT EDIT.\ndef generated_value():\n    return 1\n",
         encoding="utf-8",
     )
 
@@ -1091,8 +1277,10 @@ def test_rust_criticality_shadow_bypasses_generated_files(
 
     assert calls == 0
     assert shadow["available"] is False
-    assert shadow["error_code"] == "generated-file"
-    assert shadow["error_reason"] == "Generated files are excluded from Rust criticality analysis"
+    assert shadow["error_code"] == "criticality-bypass"
+    assert shadow["error_reason"] == "bypassed:generated-marker-and-path"
+    assert shadow["criticality_bypass_verdict"] == "bypassed"
+    assert shadow["criticality_bypass_reason"] == "bypassed:generated-marker-and-path"
 
 
 def test_rust_criticality_shadow_allows_whitespace_padded_file_under_raw_limit(
@@ -1127,7 +1315,7 @@ def test_rust_criticality_shadow_allows_whitespace_padded_file_under_raw_limit(
     src = repo / "src"
     src.mkdir()
     padding = "\n" * 600_000
-    (src / "padded.py").write_text(f"{padding}print('safe')\\n", encoding="utf-8")
+    (src / "padded.py").write_text(f"{padding}print('safe')\n", encoding="utf-8")
 
     report = classify_repo_changes(repo)
 
@@ -1136,7 +1324,7 @@ def test_rust_criticality_shadow_allows_whitespace_padded_file_under_raw_limit(
 
     assert shadow["available"] is True
     assert shadow["risk_level"] == "low"
-    assert captured["input"].new_code.endswith("print('safe')\\n")
+    assert captured["input"].new_code.endswith("print('safe')\n")
 
 
 def test_rust_criticality_shadow_rejects_raw_content_above_hard_limit(
@@ -1155,8 +1343,8 @@ def test_rust_criticality_shadow_rejects_raw_content_above_hard_limit(
     repo = create_repo(tmp_path)
     src = repo / "src"
     src.mkdir()
-    padding = "\\n" * 2_000_001
-    (src / "too_large_raw.py").write_text(f"{padding}print('safe')\\n", encoding="utf-8")
+    padding = "\n" * 2_000_001
+    (src / "too_large_raw.py").write_text(f"{padding}print('safe')\n", encoding="utf-8")
 
     report = classify_repo_changes(repo)
 
