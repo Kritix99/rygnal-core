@@ -311,6 +311,51 @@ def test_rust_kernel_adapter_returns_criticality_assessment(
     )
 
 
+def test_rust_kernel_adapter_serializes_elevated_criticality_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rygnal.rust_kernel import RustCriticalityInput, evaluate_criticality
+
+    captured = {}
+
+    def fake_evaluate(payload: str) -> str:
+        captured["payload"] = json.loads(payload)
+        return json.dumps(
+            {
+                "criticality_index": 6.0,
+                "risk_level": "high",
+                "reasons": ["Python elevated risk signal increases criticality by 1.5."],
+                "semantic_metrics": {
+                    "old_node_count": 0,
+                    "new_node_count": 0,
+                    "old_token_count": 0,
+                    "new_token_count": 0,
+                    "matched_node_count": 0,
+                    "survival_ratio": 1.0,
+                },
+                "path_category": "dependency",
+                "path_severity": "high",
+            }
+        )
+
+    fake_kernel = types.SimpleNamespace(evaluate_criticality=fake_evaluate)
+    monkeypatch.setattr("importlib.import_module", lambda name: fake_kernel)
+
+    evaluate_criticality(
+        RustCriticalityInput(
+            file_path="package-lock.json",
+            action_type="modified",
+            old_code="{}",
+            new_code="{bad-json",
+            elevated=True,
+            elevated_weight=1.5,
+        )
+    )
+
+    assert captured["payload"]["elevated"] is True
+    assert captured["payload"]["elevated_weight"] == 1.5
+
+
 def test_rust_kernel_adapter_rejects_null_criticality_index(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

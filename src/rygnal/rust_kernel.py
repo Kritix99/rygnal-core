@@ -90,6 +90,8 @@ class RustCriticalityInput:
     action_type: CriticalityActionType
     old_code: str = ""
     new_code: str = ""
+    elevated: bool = False
+    elevated_weight: float | None = None
 
 
 @dataclass(frozen=True)

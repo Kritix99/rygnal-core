@@ -273,6 +273,28 @@ def test_rust_kernel_evaluates_criticality_bridge() -> None:
     assert any("Semantic destruction" in reason for reason in result["reasons"])
 
 
+def test_rust_kernel_criticality_accepts_elevated_signal() -> None:
+    rygnal_kernel = pytest.importorskip("rygnal_kernel")
+
+    baseline_payload = {
+        "file_path": "src/service.py",
+        "action_type": "modified",
+        "old_code": "value = 1\n",
+        "new_code": "value = 1\n",
+    }
+    elevated_payload = {
+        **baseline_payload,
+        "elevated": True,
+        "elevated_weight": 1.5,
+    }
+
+    baseline = json.loads(rygnal_kernel.evaluate_criticality(json.dumps(baseline_payload)))
+    elevated = json.loads(rygnal_kernel.evaluate_criticality(json.dumps(elevated_payload)))
+
+    assert elevated["criticality_index"] > baseline["criticality_index"]
+    assert any("Python elevated risk signal" in reason for reason in elevated["reasons"])
+
+
 def test_rust_kernel_criticality_added_file_avoids_false_destruction() -> None:
     rygnal_kernel = pytest.importorskip("rygnal_kernel")
 
