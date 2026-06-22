@@ -4,6 +4,7 @@ use crate::ast::{analyze_python_survival, AstError};
 use crate::models::{
     CriticalityAssessment, CriticalityInput, CriticalityRiskLevel, FileActionType,
     PathSensitivityCategory, PathSensitivitySeverity, SemanticMetrics,
+    DEFAULT_ELEVATED_RISK_WEIGHT,
 };
 use crate::path_safety;
 use crate::path_safety::PathSafetyError;
@@ -66,8 +67,10 @@ pub fn evaluate_criticality(
         semantic_metrics.survival_ratio,
         &input.old_code,
     );
+    let elevated_modifier = elevated_risk_modifier(input);
 
-    let criticality_index = clamp_criticality(path_base + action_modifier + semantic_modifier);
+    let criticality_index =
+        clamp_criticality(path_base + action_modifier + semantic_modifier + elevated_modifier);
     let risk_level = risk_level_for_score(criticality_index);
 
     let reasons = build_reasons(CriticalityReasonContext {
@@ -77,6 +80,7 @@ pub fn evaluate_criticality(
         action_modifier,
         semantic_metrics,
         semantic_modifier,
+        elevated_modifier,
         risk_level,
         used_python_ast: is_python_path(&normalized_path),
     });
@@ -303,6 +307,7 @@ struct CriticalityReasonContext<'a> {
     action_modifier: f64,
     semantic_metrics: SemanticMetrics,
     semantic_modifier: f64,
+    elevated_modifier: f64,
     risk_level: CriticalityRiskLevel,
     used_python_ast: bool,
 }
@@ -344,6 +349,13 @@ fn build_reasons(context: CriticalityReasonContext<'_>) -> Vec<String> {
         reasons.push(format!(
             "Semantic destruction increases criticality by {:.1}.",
             context.semantic_modifier
+        ));
+    }
+
+    if context.elevated_modifier > 0.0 {
+        reasons.push(format!(
+            "Python elevated risk signal increases criticality by {:.1}.",
+            context.elevated_modifier
         ));
     }
 
@@ -435,6 +447,22 @@ fn is_python_path(path: &str) -> bool {
     path.ends_with(".py") || path.ends_with(".pyi")
 }
 
+fn elevated_risk_modifier(input: &CriticalityInput) -> f64 {
+    if !input.elevated {
+        return 0.0;
+    }
+
+    let weight = input
+        .elevated_weight
+        .unwrap_or(DEFAULT_ELEVATED_RISK_WEIGHT);
+
+    if !weight.is_finite() {
+        return DEFAULT_ELEVATED_RISK_WEIGHT;
+    }
+
+    weight.clamp(0.0, MAX_CRITICALITY)
+}
+
 fn clamp_criticality(value: f64) -> f64 {
     if !value.is_finite() {
         return MAX_CRITICALITY;
@@ -466,6 +494,8 @@ mod tests {
             action_type,
             old_code: old_code.to_string(),
             new_code: new_code.to_string(),
+            elevated: false,
+            elevated_weight: None,
         }
     }
 
@@ -596,6 +626,8 @@ mod tests {
             action_type: FileActionType::Modified,
             old_code,
             new_code,
+            elevated: false,
+            elevated_weight: None,
         };
 
         let assessment = evaluate_criticality(&input).expect("valid criticality input");
@@ -604,6 +636,36 @@ mod tests {
         assert_eq!(assessment.risk_level, CriticalityRiskLevel::High);
         assert!(assessment.criticality_index >= 5.0);
         assert!(assessment.criticality_index < 7.5);
+    }
+
+    #[test]
+    fn elevated_risk_signal_increases_criticality_with_configurable_weight() {
+        let baseline = evaluate_criticality(&input(
+            "src/service.py",
+            FileActionType::Modified,
+            "value = 1\n",
+            "value = 1\n",
+        ))
+        .expect("valid baseline assessment");
+
+        let mut elevated_input = input(
+            "src/service.py",
+            FileActionType::Modified,
+            "value = 1\n",
+            "value = 1\n",
+        );
+        elevated_input.elevated = true;
+        elevated_input.elevated_weight = Some(1.5);
+
+        let elevated = evaluate_criticality(&elevated_input).expect("valid elevated assessment");
+
+        assert!(elevated.criticality_index > baseline.criticality_index);
+        assert!(
+            (elevated.criticality_index - baseline.criticality_index - 1.5).abs() < f64::EPSILON
+        );
+        assert!(elevated.reasons.iter().any(|reason| {
+            reason.contains("Python elevated risk signal increases criticality by 1.5.")
+        }));
     }
 
     #[test]
@@ -631,6 +693,8 @@ mod tests {
             action_type: FileActionType::Modified,
             old_code: "old_setting = 'old'\n".to_string(),
             new_code: "new_setting = 'new'\n".to_string(),
+            elevated: false,
+            elevated_weight: None,
         };
 
         let assessment = evaluate_criticality(&input).expect("valid criticality input");
@@ -654,6 +718,8 @@ mod tests {
             action_type: FileActionType::Modified,
             old_code,
             new_code,
+            elevated: false,
+            elevated_weight: None,
         };
 
         let assessment = evaluate_criticality(&input).expect("valid criticality input");
@@ -670,6 +736,8 @@ mod tests {
             action_type: FileActionType::Modified,
             old_code: "def broken(:\n    value = 1\n".to_string(),
             new_code: "def broken(:\n    value = 1\n".to_string(),
+            elevated: false,
+            elevated_weight: None,
         };
 
         let assessment = evaluate_criticality(&input).expect("parse errors should fall back");
@@ -692,6 +760,8 @@ mod hardening_regression_tests {
             action_type: FileActionType::Modified,
             old_code: old_code.to_string(),
             new_code: new_code.to_string(),
+            elevated: false,
+            elevated_weight: None,
         }
     }
 
