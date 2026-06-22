@@ -8,11 +8,12 @@ file risk reasons for summaries, approval prompts, blocking, and audit.
 from __future__ import annotations
 
 import fnmatch
+import json
 import re
 import shutil
 import subprocess  # nosec B404
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path, PurePosixPath
@@ -26,6 +27,14 @@ from rygnal.diff_limits import (
 )
 from rygnal.patch_diff import PatchDiff, PatchFileDiff
 from rygnal.risk_engine import RiskLevel
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 compatibility
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:  # pragma: no cover - project runtime is Python 3.11+
+        tomllib = None
 from rygnal.rust_kernel import (
     RustCriticalityAssessment,
     RustCriticalityEvaluationError,
@@ -74,6 +83,30 @@ CRITICALITY_LOCKFILE_NAMES = {
     "uv.lock",
     "yarn.lock",
 }
+
+BYPASS_VERDICT_BYPASSED = "bypassed"
+BYPASS_VERDICT_RUST_INVOKED = "rust-invoked"
+BYPASS_VERDICT_ELEVATED_RISK = "elevated-risk"
+
+BYPASS_REASON_NOT_CANDIDATE = "not-bypass-candidate"
+BYPASS_REASON_LOCKFILE_PATH_VALID = "lockfile-root-path-valid"
+BYPASS_REASON_LOCKFILE_NESTED_PATH = "rust-invoked:lockfile-nested-path"
+BYPASS_REASON_LOCKFILE_INVALID_STRUCTURE = "lockfile-claim-invalid-structure"
+BYPASS_REASON_LOCKFILE_ROOT_VALID_JSON = "bypassed:lockfile-root-valid-json"
+BYPASS_REASON_LOCKFILE_ROOT_VALID_TOML = "bypassed:lockfile-root-valid-toml"
+BYPASS_REASON_PARSE_FAILED_EMPTY = "parse-failed-empty"
+BYPASS_REASON_PARSE_FAILED_JSON = "parse-failed-json"
+BYPASS_REASON_PARSE_FAILED_TOML = "parse-failed-toml"
+BYPASS_REASON_PARSE_FAILED_PATTERN = "parse-failed-pattern"
+BYPASS_REASON_SHAPE_MISMATCH_JSON = "shape-mismatch-json"
+BYPASS_REASON_SHAPE_MISMATCH_TOML = "shape-mismatch-toml"
+BYPASS_REASON_GENERATED_VALID = "bypassed:generated-marker-and-path"
+BYPASS_REASON_GENERATED_MARKER_WITHOUT_PATH = (
+    "rust-invoked:generated-marker-without-path"
+)
+BYPASS_REASON_GENERATED_PATH_WITHOUT_MARKER = (
+    "rust-invoked:generated-path-without-marker"
+)
 
 CRITICALITY_GENERATED_MARKERS = (
     "@generated",
@@ -334,6 +367,16 @@ class _CriticalityGitLfsPointerError(ChangeRiskClassificationError):
 
 
 @dataclass(frozen=True)
+class CriticalityBypassVerdict:
+    """Deterministic verdict for a claimed Rust criticality bypass."""
+
+    allowed: bool
+    reason_code: str
+    verdict: str
+    is_candidate: bool = True
+
+
+@dataclass(frozen=True)
 class ChangeRiskReason:
     """One deterministic reason for a file or report risk classification."""
 
@@ -365,6 +408,8 @@ class RustCriticalityShadow:
     path_severity: str | None = None
     error_code: str | None = None
     error_reason: str | None = None
+    criticality_bypass_verdict: str | None = None
+    criticality_bypass_reason: str | None = None
 
     @cached_property
     def audit_summary(self) -> dict[str, object]:
@@ -378,6 +423,8 @@ class RustCriticalityShadow:
             "path_severity": self.path_severity,
             "error_code": self.error_code,
             "error_reason": self.error_reason,
+            "criticality_bypass_verdict": self.criticality_bypass_verdict,
+            "criticality_bypass_reason": self.criticality_bypass_reason,
         }
 
 
@@ -496,8 +543,13 @@ def _attach_criticality_shadow(
     file_risk: FileRiskClassification,
     rust_criticality: RustCriticalityShadow,
 ) -> FileRiskClassification:
+    bypass_reason = _criticality_bypass_risk_reason(rust_criticality)
     rust_reason = _rust_criticality_risk_reason(file_risk, rust_criticality)
-    reasons = (*file_risk.reasons, rust_reason) if rust_reason else file_risk.reasons
+    reasons = tuple(
+        reason
+        for reason in (*file_risk.reasons, bypass_reason, rust_reason)
+        if reason is not None
+    )
     risk_level = _highest_risk(reason.risk_level for reason in reasons)
 
     return FileRiskClassification(
@@ -548,6 +600,26 @@ def classify_patch_file_risk(
         old_mode=file_diff.old_mode,
         new_mode=file_diff.new_mode,
         mode_changed=file_diff.mode_changed,
+    )
+
+
+def _criticality_bypass_risk_reason(
+    rust_criticality: RustCriticalityShadow,
+) -> ChangeRiskReason | None:
+    if (
+        rust_criticality.criticality_bypass_reason
+        != BYPASS_REASON_LOCKFILE_INVALID_STRUCTURE
+    ):
+        return None
+
+    return _reason(
+        BYPASS_REASON_LOCKFILE_INVALID_STRUCTURE,
+        RiskLevel.HIGH,
+        "Lockfile bypass claim failed structural validation before Rust analysis.",
+        {
+            "bypass_verdict": rust_criticality.criticality_bypass_verdict or "",
+            "bypass_reason": rust_criticality.criticality_bypass_reason or "",
+        },
     )
 
 
@@ -618,12 +690,6 @@ def _criticality_shadow_for_file(
             error_reason="Jupyter notebook files are excluded from Rust criticality analysis",
         )
 
-    if _is_criticality_lockfile(file_diff.path):
-        return _criticality_failure_shadow(
-            error_code="lockfile",
-            error_reason="Lockfiles are excluded from Rust criticality analysis",
-        )
-
     try:
         old_code, new_code = _load_criticality_file_contents(patch_diff, file_diff)
     except _CriticalityInvalidEncodingError:
@@ -644,11 +710,23 @@ def _criticality_shadow_for_file(
             ),
         )
 
-    if _has_generated_file_marker(old_code, new_code):
+    criticality_bypass_verdict = _evaluate_criticality_bypass_claim(
+        file_diff.path,
+        old_code,
+        new_code,
+    )
+    if criticality_bypass_verdict.allowed:
         return _criticality_failure_shadow(
-            error_code="generated-file",
-            error_reason="Generated files are excluded from Rust criticality analysis",
+            criticality_bypass_verdict=criticality_bypass_verdict,
+            error_code="criticality-bypass",
+            error_reason=criticality_bypass_verdict.reason_code,
         )
+
+    criticality_bypass_verdict = (
+        criticality_bypass_verdict
+        if criticality_bypass_verdict.is_candidate
+        else None
+    )
 
     if (
         _shadow_text_size_bytes(
@@ -658,6 +736,7 @@ def _criticality_shadow_for_file(
         > MAX_CRITICALITY_SHADOW_BYTES
     ):
         return _criticality_failure_shadow(
+            criticality_bypass_verdict=criticality_bypass_verdict,
             error_code="file-too-large",
             error_reason="file size exceeds shadow mode criticality limits",
         )
@@ -672,9 +751,15 @@ def _criticality_shadow_for_file(
             )
         )
     except Exception as exc:
-        return _criticality_exception_shadow(exc)
+        return _criticality_exception_shadow(
+            exc,
+            criticality_bypass_verdict=criticality_bypass_verdict,
+        )
 
-    return _criticality_success_shadow(assessment)
+    return _criticality_success_shadow(
+        assessment,
+        criticality_bypass_verdict=criticality_bypass_verdict,
+    )
 
 
 def _is_symlink_file(file_diff: PatchFileDiff) -> bool:
@@ -691,6 +776,308 @@ def _is_jupyter_notebook(path: str) -> bool:
 
 def _is_criticality_lockfile(path: str) -> bool:
     return PurePosixPath(path).name.lower() in CRITICALITY_LOCKFILE_NAMES
+
+
+def _bypass_verdict(
+    *,
+    allowed: bool,
+    reason_code: str,
+    verdict: str,
+    is_candidate: bool = True,
+) -> CriticalityBypassVerdict:
+    return CriticalityBypassVerdict(
+        allowed=allowed,
+        reason_code=reason_code,
+        verdict=verdict,
+        is_candidate=is_candidate,
+    )
+
+
+
+def _evaluate_criticality_bypass_claim(
+    path: str,
+    old_code: str,
+    new_code: str,
+    *,
+    lockfile_allowlist: Iterable[str] = (),
+) -> CriticalityBypassVerdict:
+    normalized_path = normalize_repo_relative_path(path)
+
+    lockfile_path_verdict = _is_valid_lockfile_bypass_path(
+        normalized_path,
+        allowlist=lockfile_allowlist,
+    )
+    if lockfile_path_verdict.allowed:
+        return _validate_lockfile_snapshots(normalized_path, old_code, new_code)
+
+    if lockfile_path_verdict.is_candidate:
+        return lockfile_path_verdict
+
+    return _is_valid_generated_bypass(normalized_path, old_code, new_code)
+
+
+def _is_valid_lockfile_bypass_path(
+    path: str,
+    *,
+    allowlist: Iterable[str] = (),
+) -> CriticalityBypassVerdict:
+    normalized_path = normalize_repo_relative_path(path)
+    posix_path = PurePosixPath(normalized_path)
+    lockfile_name = posix_path.name.lower()
+
+    if lockfile_name not in CRITICALITY_LOCKFILE_NAMES:
+        return _bypass_verdict(
+            allowed=False,
+            reason_code=BYPASS_REASON_NOT_CANDIDATE,
+            verdict=BYPASS_VERDICT_RUST_INVOKED,
+            is_candidate=False,
+        )
+
+    normalized_allowlist = {
+        normalize_repo_relative_path(item).lower() for item in allowlist
+    }
+
+    if posix_path.parent == PurePosixPath(".") or (
+        normalized_path.lower() in normalized_allowlist
+    ):
+        return _bypass_verdict(
+            allowed=True,
+            reason_code=BYPASS_REASON_LOCKFILE_PATH_VALID,
+            verdict=BYPASS_VERDICT_BYPASSED,
+        )
+
+    return _bypass_verdict(
+        allowed=False,
+        reason_code=BYPASS_REASON_LOCKFILE_NESTED_PATH,
+        verdict=BYPASS_VERDICT_RUST_INVOKED,
+    )
+
+
+
+def _parse_json_object(content: str) -> dict[str, object] | None:
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        return None
+
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _validate_json_lockfile(
+    content: str,
+    *,
+    expected_keys: frozenset[str],
+) -> CriticalityBypassVerdict:
+    parsed = _parse_json_object(content)
+    if parsed is None:
+        return _bypass_verdict(
+            allowed=False,
+            reason_code=BYPASS_REASON_PARSE_FAILED_JSON,
+            verdict=BYPASS_VERDICT_RUST_INVOKED,
+        )
+
+    if not expected_keys & parsed.keys():
+        return _bypass_verdict(
+            allowed=False,
+            reason_code=BYPASS_REASON_SHAPE_MISMATCH_JSON,
+            verdict=BYPASS_VERDICT_RUST_INVOKED,
+        )
+
+    return _bypass_verdict(
+        allowed=True,
+        reason_code=BYPASS_REASON_LOCKFILE_ROOT_VALID_JSON,
+        verdict=BYPASS_VERDICT_BYPASSED,
+    )
+
+
+def _validate_package_lock(content: str) -> CriticalityBypassVerdict:
+    return _validate_json_lockfile(
+        content,
+        expected_keys=frozenset({"lockfileVersion", "packages", "dependencies"}),
+    )
+
+
+def _validate_composer_lock(content: str) -> CriticalityBypassVerdict:
+    return _validate_json_lockfile(
+        content,
+        expected_keys=frozenset({"packages", "packages-dev"}),
+    )
+
+
+def _validate_pipfile_lock(content: str) -> CriticalityBypassVerdict:
+    return _validate_json_lockfile(
+        content,
+        expected_keys=frozenset({"_meta", "default", "develop"}),
+    )
+
+
+
+def _parse_toml_object(content: str) -> dict[str, object] | None:
+    if tomllib is None:
+        return None
+
+    try:
+        parsed = tomllib.loads(content)
+    except tomllib.TOMLDecodeError:
+        return None
+
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _validate_toml_lockfile(
+    content: str,
+    *,
+    expected_keys: frozenset[str],
+) -> CriticalityBypassVerdict:
+    parsed = _parse_toml_object(content)
+    if parsed is None:
+        return _bypass_verdict(
+            allowed=False,
+            reason_code=BYPASS_REASON_PARSE_FAILED_TOML,
+            verdict=BYPASS_VERDICT_RUST_INVOKED,
+        )
+
+    if not expected_keys <= parsed.keys():
+        return _bypass_verdict(
+            allowed=False,
+            reason_code=BYPASS_REASON_SHAPE_MISMATCH_TOML,
+            verdict=BYPASS_VERDICT_RUST_INVOKED,
+        )
+
+    return _bypass_verdict(
+        allowed=True,
+        reason_code=BYPASS_REASON_LOCKFILE_ROOT_VALID_TOML,
+        verdict=BYPASS_VERDICT_BYPASSED,
+    )
+
+
+def _validate_cargo_lock(content: str) -> CriticalityBypassVerdict:
+    return _validate_toml_lockfile(
+        content,
+        expected_keys=frozenset({"package"}),
+    )
+
+
+def _validate_poetry_lock(content: str) -> CriticalityBypassVerdict:
+    return _validate_toml_lockfile(
+        content,
+        expected_keys=frozenset({"package", "metadata"}),
+    )
+
+
+def _validate_uv_lock(content: str) -> CriticalityBypassVerdict:
+    return _validate_toml_lockfile(
+        content,
+        expected_keys=frozenset({"package"}),
+    )
+
+
+
+CRITICALITY_LOCKFILE_VALIDATORS: dict[
+    str,
+    Callable[[str], CriticalityBypassVerdict],
+] = {
+    "cargo.lock": _validate_cargo_lock,
+    "composer.lock": _validate_composer_lock,
+    "package-lock.json": _validate_package_lock,
+    "pipfile.lock": _validate_pipfile_lock,
+    "poetry.lock": _validate_poetry_lock,
+    "uv.lock": _validate_uv_lock,
+}
+
+
+def _validate_lockfile_structure(
+    path: str,
+    content: str,
+) -> CriticalityBypassVerdict:
+    validator = CRITICALITY_LOCKFILE_VALIDATORS.get(PurePosixPath(path).name.lower())
+    if validator is None:
+        return _bypass_verdict(
+            allowed=False,
+            reason_code=BYPASS_REASON_PARSE_FAILED_PATTERN,
+            verdict=BYPASS_VERDICT_RUST_INVOKED,
+        )
+
+    return validator(content)
+
+
+def _validate_lockfile_snapshots(
+    path: str,
+    old_code: str,
+    new_code: str,
+) -> CriticalityBypassVerdict:
+    snapshots = tuple(code for code in (old_code, new_code) if code.strip())
+    if not snapshots:
+        return _bypass_verdict(
+            allowed=False,
+            reason_code=BYPASS_REASON_LOCKFILE_INVALID_STRUCTURE,
+            verdict=BYPASS_VERDICT_ELEVATED_RISK,
+        )
+
+    for snapshot in snapshots:
+        structure_verdict = _validate_lockfile_structure(path, snapshot)
+        if not structure_verdict.allowed:
+            return _bypass_verdict(
+                allowed=False,
+                reason_code=BYPASS_REASON_LOCKFILE_INVALID_STRUCTURE,
+                verdict=BYPASS_VERDICT_ELEVATED_RISK,
+            )
+
+    return structure_verdict
+
+
+
+def _is_valid_generated_bypass(
+    path: str,
+    old_code: str,
+    new_code: str,
+) -> CriticalityBypassVerdict:
+    has_marker = _has_generated_file_marker(old_code, new_code)
+    normalized_path = normalize_repo_relative_path(path).lower()
+    posix_path = PurePosixPath(normalized_path)
+
+    has_path_evidence = any(
+        part in {"generated", "gen", "__generated__", "autogenerated"}
+        for part in posix_path.parts
+    ) or any(
+        token in posix_path.name
+        for token in (
+            "generated",
+            "autogenerated_",
+            "_pb2.py",
+            "_pb2_grpc.py",
+            ".pb.",
+            ".g.",
+        )
+    )
+
+    if has_marker and has_path_evidence:
+        return _bypass_verdict(
+            allowed=True,
+            reason_code=BYPASS_REASON_GENERATED_VALID,
+            verdict=BYPASS_VERDICT_BYPASSED,
+        )
+
+    if has_marker:
+        return _bypass_verdict(
+            allowed=False,
+            reason_code=BYPASS_REASON_GENERATED_MARKER_WITHOUT_PATH,
+            verdict=BYPASS_VERDICT_RUST_INVOKED,
+        )
+
+    if has_path_evidence:
+        return _bypass_verdict(
+            allowed=False,
+            reason_code=BYPASS_REASON_GENERATED_PATH_WITHOUT_MARKER,
+            verdict=BYPASS_VERDICT_RUST_INVOKED,
+        )
+
+    return _bypass_verdict(
+        allowed=False,
+        reason_code=BYPASS_REASON_NOT_CANDIDATE,
+        verdict=BYPASS_VERDICT_RUST_INVOKED,
+        is_candidate=False,
+    )
 
 
 def _has_generated_file_marker(old_code: str, new_code: str) -> bool:
@@ -799,6 +1186,8 @@ def _shadow_text_size_bytes(*values: str) -> int:
 
 def _criticality_success_shadow(
     assessment: RustCriticalityAssessment,
+    *,
+    criticality_bypass_verdict: CriticalityBypassVerdict | None = None,
 ) -> RustCriticalityShadow:
     metrics = assessment.semantic_metrics
     return RustCriticalityShadow(
@@ -816,6 +1205,14 @@ def _criticality_success_shadow(
         },
         path_category=assessment.path_category,
         path_severity=assessment.path_severity,
+        criticality_bypass_verdict=(
+            criticality_bypass_verdict.verdict if criticality_bypass_verdict else None
+        ),
+        criticality_bypass_reason=(
+            criticality_bypass_verdict.reason_code
+            if criticality_bypass_verdict
+            else None
+        ),
     )
 
 
@@ -823,34 +1220,51 @@ def _criticality_failure_shadow(
     *,
     error_code: str,
     error_reason: str,
+    criticality_bypass_verdict: CriticalityBypassVerdict | None = None,
 ) -> RustCriticalityShadow:
     return RustCriticalityShadow(
         available=False,
         error_code=error_code,
         error_reason=error_reason,
+        criticality_bypass_verdict=(
+            criticality_bypass_verdict.verdict if criticality_bypass_verdict else None
+        ),
+        criticality_bypass_reason=(
+            criticality_bypass_verdict.reason_code
+            if criticality_bypass_verdict
+            else None
+        ),
     )
 
 
-def _criticality_exception_shadow(exc: Exception) -> RustCriticalityShadow:
+def _criticality_exception_shadow(
+    exc: Exception,
+    *,
+    criticality_bypass_verdict: CriticalityBypassVerdict | None = None,
+) -> RustCriticalityShadow:
     if isinstance(exc, RustKernelUnavailableError):
         return _criticality_failure_shadow(
+            criticality_bypass_verdict=criticality_bypass_verdict,
             error_code="rust-kernel-unavailable",
             error_reason=str(exc),
         )
 
     if isinstance(exc, RustCriticalityEvaluationError):
         return _criticality_failure_shadow(
+            criticality_bypass_verdict=criticality_bypass_verdict,
             error_code=exc.error_code,
             error_reason=exc.reason,
         )
 
     if isinstance(exc, RustKernelError):
         return _criticality_failure_shadow(
+            criticality_bypass_verdict=criticality_bypass_verdict,
             error_code="rust-kernel-error",
             error_reason=str(exc),
         )
 
     return _criticality_failure_shadow(
+        criticality_bypass_verdict=criticality_bypass_verdict,
         error_code="rust-criticality-unexpected-error",
         error_reason=str(exc),
     )
