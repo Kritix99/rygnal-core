@@ -31,12 +31,12 @@ class Rygnal:
         runtime_mode: RuntimeMode | str = RuntimeMode.ENFORCE,
         audit_log_path: str | Path = "logs/audit_log.jsonl",
     ) -> None:
-        self.policy_engine = policy_engine or load_default_policy_engine()
+        self.runtime_mode = RuntimeMode(runtime_mode)
+        self.policy_engine = policy_engine or load_default_policy_engine(self.runtime_mode)
         self.audit_logger = audit_logger or AuditLogger(audit_log_path)
         self.tool_executor = tool_executor or ToolExecutor()
         self.risk_engine = risk_engine or RiskEngine()
         self.approval_workflow = approval_workflow
-        self.runtime_mode = RuntimeMode(runtime_mode)
 
         self.interceptor = RygnalInterceptor(
             policy_engine=self.policy_engine,
