@@ -176,3 +176,7 @@ def run_demo(args: argparse.Namespace) -> int:
     outcomes = runner.run_all()
     print(render_run_report(outcomes))
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
