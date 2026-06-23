@@ -69,6 +69,8 @@ _SANDBOX_TMP = PurePosixPath("/").joinpath("tmp")
 _SANDBOX_VAR_TMP = PurePosixPath("/").joinpath("var", "tmp")
 _SANDBOX_RUN = PurePosixPath("/").joinpath("run")
 _SANDBOX_ETC = PurePosixPath("/").joinpath("etc")
+_GUARDED_RUN_LOCK_DIR_NAME = ".rygnal-locks"
+_GUARDED_RUN_CONCURRENCY_REASON_CODE = "guarded_run_concurrency_conflict"
 
 
 class GuardedRunStatus(StrEnum):
@@ -223,6 +225,159 @@ class UnsupportedCommandBackend:
         raise GuardedCommandExecutionError(self.reason)
 
 
+@dataclass(frozen=True)
+class GuardedRunConcurrencyState:
+    lock_path: Path
+    lock_identity: str
+    blocked_reason: str | None = None
+    active_lock_pid: int | None = None
+    recovered_stale_lock: bool = False
+    stale_lock_pid: int | None = None
+
+
+def _guarded_run_concurrency_lock_path(
+    trusted_repo_path: Path,
+    run_root: Path,
+) -> Path:
+    trusted_repo = Path(trusted_repo_path).expanduser().resolve()
+    resolved_run_root = Path(run_root).expanduser().resolve()
+
+    key = f"{trusted_repo.as_posix()}\0{resolved_run_root.as_posix()}".encode()
+    lock_name = f"{hashlib.sha256(key).hexdigest()}.lock"
+
+    return resolved_run_root / _GUARDED_RUN_LOCK_DIR_NAME / lock_name
+
+
+def _read_guarded_run_lock_metadata(lock_path: Path) -> dict[str, str]:
+    try:
+        lines = lock_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+
+    metadata: dict[str, str] = {}
+    for line in lines:
+        if "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        metadata[key.strip()] = value.strip()
+
+    return metadata
+
+
+def _parse_lock_pid(raw_pid: str | None) -> int | None:
+    if raw_pid is None:
+        return None
+
+    try:
+        return int(raw_pid)
+    except ValueError:
+        return None
+
+
+def _process_is_alive(pid: int | None) -> bool:
+    if pid is None or pid <= 0:
+        return False
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+    return True
+
+
+@contextmanager
+def _guarded_run_concurrency_guard(
+    *,
+    trusted_repo_path: Path,
+    run_root: Path,
+    trace_id: str,
+):
+    lock_path = _guarded_run_concurrency_lock_path(trusted_repo_path, run_root)
+    trusted_repo = Path(trusted_repo_path).expanduser().resolve()
+    lock_identity = lock_path.stem
+    recovered_stale_lock = False
+    stale_lock_pid: int | None = None
+
+    while True:
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            break
+        except FileExistsError:
+            metadata = _read_guarded_run_lock_metadata(lock_path)
+            active_lock_pid = _parse_lock_pid(metadata.get("pid"))
+
+            if not _process_is_alive(active_lock_pid):
+                stale_lock_pid = active_lock_pid
+                try:
+                    lock_path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    yield GuardedRunConcurrencyState(
+                        lock_path=lock_path,
+                        lock_identity=lock_identity,
+                        blocked_reason=(
+                            "guarded_run_concurrency_lock_unavailable: failed to "
+                            f"remove stale guarded run lock at {lock_path.as_posix()}: {exc}"
+                        ),
+                        active_lock_pid=active_lock_pid,
+                    )
+                    return
+
+                recovered_stale_lock = True
+                continue
+
+            yield GuardedRunConcurrencyState(
+                lock_path=lock_path,
+                lock_identity=lock_identity,
+                blocked_reason=(
+                    f"{_GUARDED_RUN_CONCURRENCY_REASON_CODE}: guarded run already active "
+                    f"for trusted repository {trusted_repo.as_posix()}."
+                ),
+                active_lock_pid=active_lock_pid,
+            )
+            return
+        except OSError as exc:
+            yield GuardedRunConcurrencyState(
+                lock_path=lock_path,
+                lock_identity=lock_identity,
+                blocked_reason=(
+                    "guarded_run_concurrency_lock_unavailable: failed to acquire guarded "
+                    f"run lock at {lock_path.as_posix()}: {exc}"
+                ),
+            )
+            return
+
+    with os.fdopen(lock_fd, "w", encoding="utf-8") as lock_file:
+        lock_file.write(
+            f"pid={os.getpid()}\n"
+            f"trace_id={trace_id}\n"
+            f"trusted_repo_path={trusted_repo.as_posix()}\n"
+            f"lock_identity={lock_identity}\n"
+            f"created_at_unix={time.time()}\n"
+        )
+
+    try:
+        yield GuardedRunConcurrencyState(
+            lock_path=lock_path,
+            lock_identity=lock_identity,
+            recovered_stale_lock=recovered_stale_lock,
+            stale_lock_pid=stale_lock_pid,
+        )
+    finally:
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
     """Run a command inside a disposable guarded workspace."""
 
@@ -368,322 +523,331 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
             event_type="guarded_run.backend_blocked",
         )
 
-    worktree_config = GuardedWorktreeConfig(
+    with _guarded_run_concurrency_guard(
         trusted_repo_path=trusted_repo,
-        rygnal_run_root=config.rygnal_run_root,
-        untracked_policy=config.untracked_policy,
-        audit_logger=config.audit_logger,
-    )
+        run_root=config.rygnal_run_root,
+        trace_id=trace_id,
+    ) as concurrency_state:
+        if concurrency_state.recovered_stale_lock:
+            _audit(
+                config,
+                trace_id=trace_id,
+                event_type="guarded_run.stale_lock_recovered",
+                decision=Decision.ALLOW,
+                allowed=True,
+                severity=Severity.MEDIUM,
+                reason="Recovered stale guarded run concurrency lock.",
+                metadata={
+                    "lock_path": concurrency_state.lock_path.as_posix(),
+                    "lock_identity": concurrency_state.lock_identity,
+                    "stale_lock_pid": concurrency_state.stale_lock_pid,
+                    "trusted_repo_path": trusted_repo.as_posix(),
+                    "run_root": Path(config.rygnal_run_root).resolve().as_posix(),
+                },
+            )
 
-    worktree: GuardedWorktree | None = None
-    command_result: GuardedCommandResult | None = None
-    changed_file_report: ChangedFileReport | None = None
-    patch_diff: PatchDiff | None = None
-    change_risk_report: ChangeRiskReport | None = None
-    cleanup_result: CleanupResult | None = None
-    cleanup_performed = False
-    blocked_reason: str | None = None
-    approval_request: ApprovalRequest | None = None
-    status = GuardedRunStatus.FAILED
+        if concurrency_state.blocked_reason is not None:
+            _audit(
+                config,
+                trace_id=trace_id,
+                event_type="guarded_run.concurrency_blocked",
+                decision=Decision.BLOCK,
+                allowed=False,
+                severity=Severity.HIGH,
+                reason=concurrency_state.blocked_reason,
+                metadata={
+                    "lock_path": concurrency_state.lock_path.as_posix(),
+                    "lock_identity": concurrency_state.lock_identity,
+                    "active_lock_pid": concurrency_state.active_lock_pid,
+                    "trusted_repo_path": trusted_repo.as_posix(),
+                    "run_root": Path(config.rygnal_run_root).resolve().as_posix(),
+                },
+            )
 
-    try:
-        worktree = create_guarded_worktree(worktree_config)
-    except GuardedWorktreeError as exc:
-        return _blocked_result(
-            config=config,
-            trace_id=trace_id,
-            trusted_repo_path=trusted_repo.as_posix(),
-            reason=str(exc),
-            warnings=warnings,
-            backend_name=backend_name,
-            backend_safe_by_default=backend_safe_by_default,
-            containment_verified=containment_verified,
-            event_type="guarded_run.blocked",
+            return _blocked_result(
+                config=config,
+                trace_id=trace_id,
+                trusted_repo_path=trusted_repo.as_posix(),
+                reason=concurrency_state.blocked_reason,
+                warnings=warnings,
+                backend_name=backend_name,
+                backend_safe_by_default=backend_safe_by_default,
+                containment_verified=containment_verified,
+                containment_features=containment_features,
+                event_type="guarded_run.blocked",
+            )
+
+        worktree_config = GuardedWorktreeConfig(
+            trusted_repo_path=trusted_repo,
+            rygnal_run_root=config.rygnal_run_root,
+            untracked_policy=config.untracked_policy,
+            audit_logger=config.audit_logger,
         )
 
-    try:
-        _audit(
-            config,
-            trace_id=trace_id,
-            event_type="guarded_run.workspace_created",
-            decision=Decision.ALLOW,
-            allowed=True,
-            severity=Severity.LOW,
-            reason="Guarded workspace created.",
-            metadata=_worktree_metadata(worktree, backend_name, containment_verified),
-        )
+        worktree: GuardedWorktree | None = None
+        command_result: GuardedCommandResult | None = None
+        changed_file_report: ChangedFileReport | None = None
+        patch_diff: PatchDiff | None = None
+        change_risk_report: ChangeRiskReport | None = None
+        cleanup_result: CleanupResult | None = None
+        cleanup_performed = False
+        blocked_reason: str | None = None
+        approval_request: ApprovalRequest | None = None
+        status = GuardedRunStatus.FAILED
 
-        _audit(
-            config,
-            trace_id=trace_id,
-            event_type="guarded_run.command_started",
-            decision=Decision.ALLOW,
-            allowed=True,
-            severity=Severity.LOW,
-            reason="Guarded command started.",
-            metadata={
-                **_worktree_metadata(worktree, backend_name, containment_verified),
-                "command": _command_audit_summary(command),
-                "timeout_seconds": config.timeout_seconds,
-            },
-        )
+        try:
+            worktree = create_guarded_worktree(worktree_config)
+        except GuardedWorktreeError as exc:
+            return _blocked_result(
+                config=config,
+                trace_id=trace_id,
+                trusted_repo_path=trusted_repo.as_posix(),
+                reason=str(exc),
+                warnings=warnings,
+                backend_name=backend_name,
+                backend_safe_by_default=backend_safe_by_default,
+                containment_verified=containment_verified,
+                event_type="guarded_run.blocked",
+            )
 
-        command_result = command_backend.run(
-            command,
-            cwd=worktree.workspace_path,
-            timeout_seconds=config.timeout_seconds,
-        )
-
-        if command_result.timed_out:
-            status = GuardedRunStatus.TIMED_OUT
-            event_type = "guarded_run.command_timed_out"
-            event_reason = "Guarded command timed out."
-            event_severity = Severity.HIGH
-            event_decision = Decision.BLOCK
-            event_allowed = False
-        elif command_result.exit_code == 0:
-            status = GuardedRunStatus.COMPLETED
-            event_type = "guarded_run.command_completed"
-            event_reason = "Guarded command completed successfully."
-            event_severity = Severity.LOW
-            event_decision = Decision.ALLOW
-            event_allowed = True
-        else:
-            status = GuardedRunStatus.FAILED
-            event_type = "guarded_run.command_failed"
-            event_reason = "Guarded command exited with a non-zero status."
-            event_severity = Severity.MEDIUM
-            event_decision = Decision.BLOCK
-            event_allowed = False
-
-        _audit(
-            config,
-            trace_id=trace_id,
-            event_type=event_type,
-            decision=event_decision,
-            allowed=event_allowed,
-            severity=event_severity,
-            reason=event_reason,
-            metadata={
-                **_worktree_metadata(worktree, backend_name, containment_verified),
-                **_command_metadata(command_result),
-            },
-        )
-
-        changed_file_report = detect_changed_files(
-            worktree.workspace_path,
-            worktree.baseline_commit_sha,
-        )
-
-        _audit(
-            config,
-            trace_id=trace_id,
-            event_type="guarded_run.changed_files_detected",
-            decision=Decision.ALLOW,
-            allowed=True,
-            severity=Severity.LOW,
-            reason="Guarded workspace changed files detected.",
-            metadata={
-                **_worktree_metadata(worktree, backend_name, containment_verified),
-                "changed_file_count": len(changed_file_report.files),
-                "ignored_file_count": len(changed_file_report.ignored_files),
-                "changed_paths": tuple(file.path for file in changed_file_report.files),
-                "ignored_paths": tuple(file.path for file in changed_file_report.ignored_files),
-            },
-        )
-
-        if changed_file_report.files:
-            patch_diff = generate_patch_diff_from_report(changed_file_report)
-            patch_decision = classify_and_decide_patch(patch_diff)
-            change_risk_report = patch_decision.report
+        try:
+            _audit(
+                config,
+                trace_id=trace_id,
+                event_type="guarded_run.workspace_created",
+                decision=Decision.ALLOW,
+                allowed=True,
+                severity=Severity.LOW,
+                reason="Guarded workspace created.",
+                metadata=_worktree_metadata(worktree, backend_name, containment_verified),
+            )
 
             _audit(
                 config,
                 trace_id=trace_id,
-                event_type="guarded_run.patch_classified",
-                decision=Decision.ALLOW if patch_decision.allowed else Decision.BLOCK,
-                allowed=patch_decision.allowed,
-                severity=(
-                    Severity.CRITICAL
-                    if patch_decision.risk_level == RiskLevel.CRITICAL
-                    else Severity.HIGH
-                    if patch_decision.risk_level == RiskLevel.HIGH
-                    else Severity.MEDIUM
-                    if patch_decision.risk_level == RiskLevel.MEDIUM
-                    else Severity.LOW
-                ),
-                reason=patch_decision.reason,
+                event_type="guarded_run.command_started",
+                decision=Decision.ALLOW,
+                allowed=True,
+                severity=Severity.LOW,
+                reason="Guarded command started.",
                 metadata={
                     **_worktree_metadata(worktree, backend_name, containment_verified),
-                    "patch_risk": patch_decision.audit_summary,
+                    "command": _command_audit_summary(command),
+                    "timeout_seconds": config.timeout_seconds,
                 },
             )
 
-            if not patch_decision.allowed:
-                approval_required = patch_decision.risk_level == RiskLevel.HIGH
-                status = (
-                    GuardedRunStatus.APPROVAL_REQUIRED
-                    if approval_required
-                    else GuardedRunStatus.BLOCKED
-                )
-                blocked_reason = patch_decision.reason
-                warnings.append(patch_decision.reason)
+            command_result = command_backend.run(
+                command,
+                cwd=worktree.workspace_path,
+                timeout_seconds=config.timeout_seconds,
+            )
 
-                if approval_required:
-                    try:
-                        approval_request = create_patch_approval_request(
-                            patch_diff,
-                            risk_report=change_risk_report,
-                            requested_by=config.user_id,
-                            agent_id=config.agent_id,
-                            environment=config.environment,
-                            trace_id=trace_id,
-                        )
-                    except PatchApprovalError as exc:
-                        approval_required = False
-                        status = GuardedRunStatus.BLOCKED
-                        blocked_reason = f"Failed to create guarded patch approval request: {exc}"
-                        warnings.append(blocked_reason)
+            if command_result.timed_out:
+                status = GuardedRunStatus.TIMED_OUT
+                event_type = "guarded_run.command_timed_out"
+                event_reason = "Guarded command timed out."
+                event_severity = Severity.HIGH
+                event_decision = Decision.BLOCK
+                event_allowed = False
+            elif command_result.exit_code == 0:
+                status = GuardedRunStatus.COMPLETED
+                event_type = "guarded_run.command_completed"
+                event_reason = "Guarded command completed successfully."
+                event_severity = Severity.LOW
+                event_decision = Decision.ALLOW
+                event_allowed = True
+            else:
+                status = GuardedRunStatus.FAILED
+                event_type = "guarded_run.command_failed"
+                event_reason = "Guarded command exited with a non-zero status."
+                event_severity = Severity.MEDIUM
+                event_decision = Decision.BLOCK
+                event_allowed = False
+
+            _audit(
+                config,
+                trace_id=trace_id,
+                event_type=event_type,
+                decision=event_decision,
+                allowed=event_allowed,
+                severity=event_severity,
+                reason=event_reason,
+                metadata={
+                    **_worktree_metadata(worktree, backend_name, containment_verified),
+                    **_command_metadata(command_result),
+                },
+            )
+
+            changed_file_report = detect_changed_files(
+                worktree.workspace_path,
+                worktree.baseline_commit_sha,
+            )
+
+            _audit(
+                config,
+                trace_id=trace_id,
+                event_type="guarded_run.changed_files_detected",
+                decision=Decision.ALLOW,
+                allowed=True,
+                severity=Severity.LOW,
+                reason="Guarded workspace changed files detected.",
+                metadata={
+                    **_worktree_metadata(worktree, backend_name, containment_verified),
+                    "changed_file_count": len(changed_file_report.files),
+                    "ignored_file_count": len(changed_file_report.ignored_files),
+                    "changed_paths": tuple(file.path for file in changed_file_report.files),
+                    "ignored_paths": tuple(file.path for file in changed_file_report.ignored_files),
+                },
+            )
+
+            if changed_file_report.files:
+                patch_diff = generate_patch_diff_from_report(changed_file_report)
+                patch_decision = classify_and_decide_patch(patch_diff)
+                change_risk_report = patch_decision.report
 
                 _audit(
                     config,
                     trace_id=trace_id,
-                    event_type=(
-                        "guarded_run.patch_approval_required"
-                        if approval_required
-                        else "guarded_run.patch_blocked"
-                    ),
-                    decision=Decision.REQUIRE_APPROVAL if approval_required else Decision.BLOCK,
-                    allowed=False,
+                    event_type="guarded_run.patch_classified",
+                    decision=Decision.ALLOW if patch_decision.allowed else Decision.BLOCK,
+                    allowed=patch_decision.allowed,
                     severity=(
                         Severity.CRITICAL
                         if patch_decision.risk_level == RiskLevel.CRITICAL
                         else Severity.HIGH
+                        if patch_decision.risk_level == RiskLevel.HIGH
+                        else Severity.MEDIUM
+                        if patch_decision.risk_level == RiskLevel.MEDIUM
+                        else Severity.LOW
                     ),
-                    reason=blocked_reason or patch_decision.reason,
+                    reason=patch_decision.reason,
                     metadata={
                         **_worktree_metadata(worktree, backend_name, containment_verified),
                         "patch_risk": patch_decision.audit_summary,
-                        "approval_request": (
-                            approval_request.model_dump(mode="json")
-                            if approval_request is not None
-                            else None
-                        ),
                     },
                 )
 
-        _audit(
-            config,
-            trace_id=trace_id,
-            event_type="guarded_run.patch_generated",
-            decision=Decision.ALLOW,
-            allowed=True,
-            severity=Severity.LOW,
-            reason="Guarded workspace patch metadata generated.",
-            metadata={
-                **_worktree_metadata(worktree, backend_name, containment_verified),
-                "patch_generated": patch_diff is not None,
-                "patch": patch_diff.audit_summary if patch_diff is not None else None,
-            },
-        )
+                if not patch_decision.allowed:
+                    approval_required = patch_decision.risk_level == RiskLevel.HIGH
+                    status = (
+                        GuardedRunStatus.APPROVAL_REQUIRED
+                        if approval_required
+                        else GuardedRunStatus.BLOCKED
+                    )
+                    blocked_reason = patch_decision.reason
+                    warnings.append(patch_decision.reason)
 
-    except (GuardedWorktreeError, GuardedCommandExecutionError) as exc:
-        blocked_reason = str(exc)
-        status = GuardedRunStatus.FAILED
-        warnings.append(blocked_reason)
-        _audit(
-            config,
-            trace_id=trace_id,
-            event_type="guarded_run.command_failed",
-            decision=Decision.BLOCK,
-            allowed=False,
-            severity=Severity.HIGH,
-            reason=blocked_reason,
-            metadata={
-                "backend_name": backend_name,
-                "containment_verified": containment_verified,
-                "workspace_path": worktree.workspace_path.as_posix() if worktree else None,
-                "baseline_commit_sha": worktree.baseline_commit_sha if worktree else None,
-            },
-        )
-    except (
-        ChangedFileDetectionError,
-        PatchDiffGenerationError,
-        ChangeRiskClassificationError,
-    ) as exc:
-        blocked_reason = str(exc)
-        status = GuardedRunStatus.FAILED
-        warnings.append(blocked_reason)
-        _audit(
-            config,
-            trace_id=trace_id,
-            event_type="guarded_run.patch_generated",
-            decision=Decision.BLOCK,
-            allowed=False,
-            severity=Severity.HIGH,
-            reason=blocked_reason,
-            metadata={
-                "backend_name": backend_name,
-                "containment_verified": containment_verified,
-                "workspace_path": worktree.workspace_path.as_posix() if worktree else None,
-                "baseline_commit_sha": worktree.baseline_commit_sha if worktree else None,
-            },
-        )
-    finally:
-        if worktree is not None:
-            if config.preserve_workspace:
-                warnings.append("Guarded workspace was preserved by explicit configuration.")
-                cleanup_result = CleanupResult(
-                    status=CleanupStatus.RESET_SUCCESS,
-                    message="Workspace preserved by explicit configuration.",
-                )
-                _audit(
-                    config,
-                    trace_id=trace_id,
-                    event_type="guarded_run.cleanup_completed",
-                    decision=Decision.ALLOW,
-                    allowed=True,
-                    severity=Severity.LOW,
-                    reason="Guarded workspace preserved by explicit configuration.",
-                    metadata={
-                        **_worktree_metadata(worktree, backend_name, containment_verified),
-                        "cleanup_performed": False,
-                        "cleanup_status": "preserved",
-                    },
-                )
-            else:
-                cleanup_performed = True
-                _audit(
-                    config,
-                    trace_id=trace_id,
-                    event_type="guarded_run.cleanup_started",
-                    decision=Decision.ALLOW,
-                    allowed=True,
-                    severity=Severity.LOW,
-                    reason="Guarded workspace cleanup started.",
-                    metadata=_worktree_metadata(worktree, backend_name, containment_verified),
-                )
+                    if approval_required:
+                        try:
+                            approval_request = create_patch_approval_request(
+                                patch_diff,
+                                risk_report=change_risk_report,
+                                requested_by=config.user_id,
+                                agent_id=config.agent_id,
+                                environment=config.environment,
+                                trace_id=trace_id,
+                            )
+                        except PatchApprovalError as exc:
+                            approval_required = False
+                            status = GuardedRunStatus.BLOCKED
+                            blocked_reason = (
+                                f"Failed to create guarded patch approval request: {exc}"
+                            )
+                            warnings.append(blocked_reason)
 
-                cleanup_result = destroy_worktree(worktree, worktree_config)
-
-                if cleanup_result.status == CleanupStatus.CLEANUP_FAILED:
-                    status = GuardedRunStatus.CLEANUP_FAILED
-                    warnings.append(cleanup_result.message)
                     _audit(
                         config,
                         trace_id=trace_id,
-                        event_type="guarded_run.cleanup_failed",
-                        decision=Decision.BLOCK,
+                        event_type=(
+                            "guarded_run.patch_approval_required"
+                            if approval_required
+                            else "guarded_run.patch_blocked"
+                        ),
+                        decision=Decision.REQUIRE_APPROVAL if approval_required else Decision.BLOCK,
                         allowed=False,
-                        severity=Severity.HIGH,
-                        reason=cleanup_result.message,
+                        severity=(
+                            Severity.CRITICAL
+                            if patch_decision.risk_level == RiskLevel.CRITICAL
+                            else Severity.HIGH
+                        ),
+                        reason=blocked_reason or patch_decision.reason,
                         metadata={
                             **_worktree_metadata(worktree, backend_name, containment_verified),
-                            "cleanup_status": cleanup_result.status.value,
-                            "cleanup_message": cleanup_result.message,
+                            "patch_risk": patch_decision.audit_summary,
+                            "approval_request": (
+                                approval_request.model_dump(mode="json")
+                                if approval_request is not None
+                                else None
+                            ),
                         },
                     )
-                else:
+
+            _audit(
+                config,
+                trace_id=trace_id,
+                event_type="guarded_run.patch_generated",
+                decision=Decision.ALLOW,
+                allowed=True,
+                severity=Severity.LOW,
+                reason="Guarded workspace patch metadata generated.",
+                metadata={
+                    **_worktree_metadata(worktree, backend_name, containment_verified),
+                    "patch_generated": patch_diff is not None,
+                    "patch": patch_diff.audit_summary if patch_diff is not None else None,
+                },
+            )
+
+        except (GuardedWorktreeError, GuardedCommandExecutionError) as exc:
+            blocked_reason = str(exc)
+            status = GuardedRunStatus.FAILED
+            warnings.append(blocked_reason)
+            _audit(
+                config,
+                trace_id=trace_id,
+                event_type="guarded_run.command_failed",
+                decision=Decision.BLOCK,
+                allowed=False,
+                severity=Severity.HIGH,
+                reason=blocked_reason,
+                metadata={
+                    "backend_name": backend_name,
+                    "containment_verified": containment_verified,
+                    "workspace_path": worktree.workspace_path.as_posix() if worktree else None,
+                    "baseline_commit_sha": worktree.baseline_commit_sha if worktree else None,
+                },
+            )
+        except (
+            ChangedFileDetectionError,
+            PatchDiffGenerationError,
+            ChangeRiskClassificationError,
+        ) as exc:
+            blocked_reason = str(exc)
+            status = GuardedRunStatus.FAILED
+            warnings.append(blocked_reason)
+            _audit(
+                config,
+                trace_id=trace_id,
+                event_type="guarded_run.patch_generated",
+                decision=Decision.BLOCK,
+                allowed=False,
+                severity=Severity.HIGH,
+                reason=blocked_reason,
+                metadata={
+                    "backend_name": backend_name,
+                    "containment_verified": containment_verified,
+                    "workspace_path": worktree.workspace_path.as_posix() if worktree else None,
+                    "baseline_commit_sha": worktree.baseline_commit_sha if worktree else None,
+                },
+            )
+        finally:
+            if worktree is not None:
+                if config.preserve_workspace:
+                    warnings.append("Guarded workspace was preserved by explicit configuration.")
+                    cleanup_result = CleanupResult(
+                        status=CleanupStatus.RESET_SUCCESS,
+                        message="Workspace preserved by explicit configuration.",
+                    )
                     _audit(
                         config,
                         trace_id=trace_id,
@@ -691,34 +855,81 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
                         decision=Decision.ALLOW,
                         allowed=True,
                         severity=Severity.LOW,
-                        reason=cleanup_result.message,
+                        reason="Guarded workspace preserved by explicit configuration.",
                         metadata={
                             **_worktree_metadata(worktree, backend_name, containment_verified),
-                            "cleanup_status": cleanup_result.status.value,
-                            "cleanup_message": cleanup_result.message,
+                            "cleanup_performed": False,
+                            "cleanup_status": "preserved",
                         },
                     )
+                else:
+                    cleanup_performed = True
+                    _audit(
+                        config,
+                        trace_id=trace_id,
+                        event_type="guarded_run.cleanup_started",
+                        decision=Decision.ALLOW,
+                        allowed=True,
+                        severity=Severity.LOW,
+                        reason="Guarded workspace cleanup started.",
+                        metadata=_worktree_metadata(worktree, backend_name, containment_verified),
+                    )
 
-    return GuardedRunResult(
-        status=status,
-        run_id=worktree.run_id if worktree else None,
-        trusted_repo_path=trusted_repo.as_posix(),
-        workspace_path=worktree.workspace_path.as_posix() if worktree else None,
-        baseline_commit_sha=worktree.baseline_commit_sha if worktree else None,
-        backend_name=backend_name,
-        backend_safe_by_default=backend_safe_by_default,
-        containment_verified=containment_verified,
-        cleanup_performed=cleanup_performed,
-        cleanup_status=cleanup_result.status.value if cleanup_result else None,
-        command_result=command_result,
-        changed_file_report=changed_file_report,
-        patch_diff=patch_diff,
-        change_risk_report=change_risk_report,
-        blocked_reason=blocked_reason,
-        warnings=tuple(warnings),
-        approval_request=approval_request,
-        containment_features=containment_features,
-    )
+                    cleanup_result = destroy_worktree(worktree, worktree_config)
+
+                    if cleanup_result.status == CleanupStatus.CLEANUP_FAILED:
+                        status = GuardedRunStatus.CLEANUP_FAILED
+                        warnings.append(cleanup_result.message)
+                        _audit(
+                            config,
+                            trace_id=trace_id,
+                            event_type="guarded_run.cleanup_failed",
+                            decision=Decision.BLOCK,
+                            allowed=False,
+                            severity=Severity.HIGH,
+                            reason=cleanup_result.message,
+                            metadata={
+                                **_worktree_metadata(worktree, backend_name, containment_verified),
+                                "cleanup_status": cleanup_result.status.value,
+                                "cleanup_message": cleanup_result.message,
+                            },
+                        )
+                    else:
+                        _audit(
+                            config,
+                            trace_id=trace_id,
+                            event_type="guarded_run.cleanup_completed",
+                            decision=Decision.ALLOW,
+                            allowed=True,
+                            severity=Severity.LOW,
+                            reason=cleanup_result.message,
+                            metadata={
+                                **_worktree_metadata(worktree, backend_name, containment_verified),
+                                "cleanup_status": cleanup_result.status.value,
+                                "cleanup_message": cleanup_result.message,
+                            },
+                        )
+
+        return GuardedRunResult(
+            status=status,
+            run_id=worktree.run_id if worktree else None,
+            trusted_repo_path=trusted_repo.as_posix(),
+            workspace_path=worktree.workspace_path.as_posix() if worktree else None,
+            baseline_commit_sha=worktree.baseline_commit_sha if worktree else None,
+            backend_name=backend_name,
+            backend_safe_by_default=backend_safe_by_default,
+            containment_verified=containment_verified,
+            cleanup_performed=cleanup_performed,
+            cleanup_status=cleanup_result.status.value if cleanup_result else None,
+            command_result=command_result,
+            changed_file_report=changed_file_report,
+            patch_diff=patch_diff,
+            change_risk_report=change_risk_report,
+            blocked_reason=blocked_reason,
+            warnings=tuple(warnings),
+            approval_request=approval_request,
+            containment_features=containment_features,
+        )
 
 
 def classify_and_decide_patch(patch_diff: PatchDiff) -> PatchRiskDecision:

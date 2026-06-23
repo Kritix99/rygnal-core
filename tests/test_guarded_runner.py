@@ -1,3 +1,4 @@
+import os
 import shutil
 import subprocess
 import sys
@@ -5,12 +6,14 @@ from pathlib import Path
 
 import pytest
 
+import rygnal.guarded_runner as guarded_runner
 from rygnal.audit_logger import AuditLogger
 from rygnal.execution_backend import HostBackendCapabilities
 from rygnal.guarded_runner import (
     UNSAFE_LOCAL_WARNING,
     GuardedRunConfig,
     GuardedRunStatus,
+    _guarded_run_concurrency_lock_path,
     run_guarded,
 )
 from rygnal.risk_engine import RiskLevel
@@ -127,6 +130,87 @@ def bwrap_probe_available() -> bool:
         timeout=3,
     )
     return result.returncode == 0
+
+
+def test_guarded_run_concurrency_lock_fails_closed(tmp_path: Path) -> None:
+    repo = create_repo(tmp_path / "repo")
+    audit_path = tmp_path / "audit.jsonl"
+    audit = AuditLogger(audit_path)
+    config = unsafe_config(
+        repo,
+        py_command("print('should not run')"),
+        audit_logger=audit,
+    )
+
+    lock_path = _guarded_run_concurrency_lock_path(repo, config.rygnal_run_root)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text(f"pid={os.getpid()}\n", encoding="utf-8")
+
+    result = run_guarded(config)
+
+    assert result.status == GuardedRunStatus.BLOCKED
+    assert result.workspace_path is None
+    assert result.command_result is None
+    assert result.blocked_reason is not None
+    assert "guarded_run_concurrency_conflict" in result.blocked_reason
+    assert "guarded_run.concurrency_blocked" in audit_actions(audit)
+
+    audit_body = audit_text(audit_path)
+    assert lock_path.as_posix() in audit_body
+    assert lock_path.stem in audit_body
+
+    lock_path.unlink()
+
+
+def test_guarded_run_recovers_stale_concurrency_lock(tmp_path: Path) -> None:
+    repo = create_repo(tmp_path / "repo")
+    audit_path = tmp_path / "audit.jsonl"
+    audit = AuditLogger(audit_path)
+    config = unsafe_config(repo, py_command("print('ok')"), audit_logger=audit)
+    lock_path = _guarded_run_concurrency_lock_path(repo, config.rygnal_run_root)
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text("pid=0\ntrace_id=stale\n", encoding="utf-8")
+
+    result = run_guarded(config)
+
+    assert result.status == GuardedRunStatus.COMPLETED
+    assert not lock_path.exists()
+    assert "guarded_run.stale_lock_recovered" in audit_actions(audit)
+
+    audit_body = audit_text(audit_path)
+    assert lock_path.as_posix() in audit_body
+    assert lock_path.stem in audit_body
+
+
+def test_guarded_run_concurrency_lock_released_after_unhandled_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = create_repo(tmp_path / "repo")
+    config = unsafe_config(repo, py_command("print('ok')"))
+    lock_path = _guarded_run_concurrency_lock_path(repo, config.rygnal_run_root)
+
+    def raise_after_command(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("forced guarded runner crash")
+
+    monkeypatch.setattr(guarded_runner, "detect_changed_files", raise_after_command)
+
+    with pytest.raises(RuntimeError, match="forced guarded runner crash"):
+        run_guarded(config)
+
+    assert not lock_path.exists()
+
+
+def test_guarded_run_concurrency_lock_is_released_after_run(tmp_path: Path) -> None:
+    repo = create_repo(tmp_path / "repo")
+    config = unsafe_config(repo, py_command("print('ok')"))
+    lock_path = _guarded_run_concurrency_lock_path(repo, config.rygnal_run_root)
+
+    result = run_guarded(config)
+
+    assert result.status == GuardedRunStatus.COMPLETED
+    assert not lock_path.exists()
 
 
 def test_empty_command_is_blocked(tmp_path: Path) -> None:
