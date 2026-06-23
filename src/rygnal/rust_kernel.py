@@ -90,6 +90,7 @@ class RustCriticalityInput:
     action_type: CriticalityActionType
     old_code: str = ""
     new_code: str = ""
+    elevated: bool = False
 
 
 @dataclass(frozen=True)
