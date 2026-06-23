@@ -37,6 +37,17 @@ def test_rygnal_from_defaults_honors_production_safe_policy_mode(tmp_path: Path)
     assert rygnal.policy_engine.default_decision == Decision.REQUIRE_APPROVAL
 
 
+def test_rygnal_from_defaults_default_mode_does_not_load_production_safe_policy(
+    tmp_path: Path,
+) -> None:
+    rygnal = Rygnal.from_defaults(
+        audit_log_path=tmp_path / "audit_log.jsonl",
+    )
+
+    assert rygnal.runtime_mode != RuntimeMode.PRODUCTION_SAFE
+    assert rygnal.policy_engine.default_decision == Decision.BLOCK
+
+
 def test_load_default_policy_engine_uses_production_safe_policy() -> None:
     engine = load_default_policy_engine(RuntimeMode.PRODUCTION_SAFE)
 

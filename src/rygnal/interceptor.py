@@ -9,6 +9,7 @@ from rygnal.approval import ApprovalWorkflow
 from rygnal.audit_logger import AuditLogger
 from rygnal.models import (
     ApprovalDecision,
+    AuditEvent,
     Decision,
     ExecutionStatus,
     InterceptorResult,
@@ -21,10 +22,12 @@ from rygnal.models import (
 )
 from rygnal.policy_engine import PolicyEngine
 from rygnal.risk_engine import RiskEngine
+from rygnal.security import redact_sensitive_value
 from rygnal.tool_executor import ToolExecutor
 
 GLOBAL_FAIL_CLOSED_POLICY_ID = "global-fail-closed"
 GLOBAL_FAIL_CLOSED_POLICY_VERSION = "global-fail-closed.v1"
+FAIL_CLOSED_RUNTIME_ERRORS = (RuntimeError, ValueError, OSError, LookupError)
 
 
 class RygnalInterceptor:
@@ -50,7 +53,7 @@ class RygnalInterceptor:
         """Assess risk, evaluate policy, audit, and optionally execute a tool request."""
         try:
             risk_assessment = self.risk_engine.assess(request)
-        except Exception as exc:
+        except FAIL_CLOSED_RUNTIME_ERRORS as exc:
             return self._fail_closed_result(
                 request=request,
                 reason_code="risk_assessment_failed",
@@ -64,7 +67,7 @@ class RygnalInterceptor:
                 request,
                 risk_assessment=risk_assessment,
             )
-        except Exception as exc:
+        except FAIL_CLOSED_RUNTIME_ERRORS as exc:
             return self._fail_closed_result(
                 request=request,
                 reason_code="policy_evaluation_failed",
@@ -89,14 +92,16 @@ class RygnalInterceptor:
                     policy_decision=policy_decision,
                     risk_assessment=risk_metadata,
                 )
-            except Exception as exc:
+            except FAIL_CLOSED_RUNTIME_ERRORS as exc:
                 return self._fail_closed_result(
                     request=request,
                     reason_code="approval_workflow_failed",
                     exc=exc,
                     risk_metadata=risk_metadata,
                     extra_metadata={
-                        "original_policy_decision": policy_decision.model_dump(mode="json"),
+                        "unconfirmed_pre_approval_decision": policy_decision.model_dump(
+                            mode="json"
+                        ),
                     },
                 )
             audit_metadata["approval"] = {
@@ -143,13 +148,14 @@ class RygnalInterceptor:
         risk_metadata: dict[str, Any] | None = None,
         extra_metadata: dict[str, Any] | None = None,
     ) -> InterceptorResult:
-        reason = f"global_fail_closed:{reason_code}: {type(exc).__name__}: {exc}"
+        error_type = type(exc).__name__
+        reason = f"global_fail_closed:{reason_code}:{error_type}"
         safe_risk_metadata = dict(risk_metadata or {})
 
         policy_decision = PolicyDecision(
             decision=Decision.BLOCK,
             allowed=False,
-            severity=Severity.CRITICAL,
+            severity=Severity.HIGH,
             reason=reason,
             policy_id=GLOBAL_FAIL_CLOSED_POLICY_ID,
             explanation=PolicyExplanation(
@@ -168,8 +174,8 @@ class RygnalInterceptor:
             "runtime_mode": self.runtime_mode.value,
             "fail_closed": True,
             "fail_closed_reason_code": reason_code,
-            "error_type": type(exc).__name__,
-            "error": str(exc),
+            "error_type": error_type,
+            "error_summary": f"{error_type} during {reason_code}",
             "policy_explanation": policy_decision.explanation.model_dump(mode="json")
             if policy_decision.explanation is not None
             else None,
@@ -178,7 +184,7 @@ class RygnalInterceptor:
         if extra_metadata:
             audit_metadata.update(extra_metadata)
 
-        audit_event = self.audit_logger.log_decision(
+        audit_event = self._log_or_synthesize_fail_closed_audit_event(
             request=request,
             policy_decision=policy_decision,
             metadata=audit_metadata,
@@ -196,6 +202,45 @@ class RygnalInterceptor:
             ),
             approval_decision=None,
         )
+
+    def _log_or_synthesize_fail_closed_audit_event(
+        self,
+        *,
+        request: ToolRequest,
+        policy_decision: PolicyDecision,
+        metadata: dict[str, Any],
+    ) -> AuditEvent:
+        try:
+            return self.audit_logger.log_decision(
+                request=request,
+                policy_decision=policy_decision,
+                metadata=metadata,
+            )
+        except FAIL_CLOSED_RUNTIME_ERRORS as audit_exc:
+            audit_error_type = type(audit_exc).__name__
+            fallback_metadata = {
+                **metadata,
+                "audit_write_failed": True,
+                "audit_error_type": audit_error_type,
+                "audit_error_summary": f"{audit_error_type} while writing fail-closed audit event",
+            }
+
+            return AuditEvent(
+                trace_id=str(request.metadata.get("trace_id") or ""),
+                user_id=request.user_id,
+                agent_id=request.agent_id,
+                environment=request.environment,
+                tool_name=request.tool_name,
+                action=request.action,
+                target=redact_sensitive_value(request.target),
+                input=redact_sensitive_value(request.input),
+                decision=policy_decision.decision,
+                allowed=policy_decision.allowed,
+                severity=policy_decision.severity,
+                policy_id=policy_decision.policy_id,
+                reason=policy_decision.reason,
+                metadata=redact_sensitive_value(fallback_metadata),
+            )
 
     def _execute_with_decision(
         self,
