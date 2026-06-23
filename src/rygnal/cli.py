@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import argparse
 import sys
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from rygnal.cli_run import default_guarded_run_root, run_guarded_cli
 from rygnal.policy_engine import PolicyEngine
+from rygnal.version import package_version
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -176,14 +176,6 @@ def run_demo(args: argparse.Namespace) -> int:
     outcomes = runner.run_all()
     print(render_run_report(outcomes))
     return 0
-
-
-def package_version() -> str:
-    """Return installed package version with local fallback."""
-    try:
-        return version("rygnal-core")
-    except PackageNotFoundError:
-        return "0.1.0"
 
 
 if __name__ == "__main__":
