@@ -135,5 +135,11 @@ class AuditLogger:
     def _calculate_event_hash(event: AuditEvent) -> str:
         data = event.model_dump(mode="json")
         data["event_hash"] = None
+
+        # audit.v1 existed before package-version stamping. Keep v1 verification
+        # compatible by hashing only the fields that existed in that schema.
+        if data.get("schema_version") == "audit.v1":
+            data.pop("rygnal_package_version", None)
+
         payload = json.dumps(data, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()

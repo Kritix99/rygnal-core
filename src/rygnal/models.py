@@ -241,8 +241,8 @@ class ApprovalDecision(BaseModel):
 class AuditEvent(BaseModel):
     """Tamper-evident audit event for an AI-agent tool decision."""
 
-    schema_version: str = "audit.v1"
-    rygnal_engine_version: str = Field(default_factory=package_version, min_length=1)
+    schema_version: str = "audit.v2"
+    rygnal_package_version: str = Field(default_factory=package_version, min_length=1)
     event_id: str = Field(default_factory=new_event_id)
     timestamp: str = Field(default_factory=utc_now_iso)
     trace_id: str = Field(default_factory=new_trace_id)
