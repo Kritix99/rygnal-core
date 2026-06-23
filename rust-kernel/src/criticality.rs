@@ -17,6 +17,58 @@ use std::collections::BTreeMap;
 const MAX_CRITICALITY: f64 = 10.0;
 const MAX_TEXT_FALLBACK_LINE_BYTES: usize = 1_000;
 const MAX_TEXT_FALLBACK_LINES: usize = 20_000;
+const AST_GUARD_FALLBACK_RISK_MODIFIER: f64 = 2.0;
+
+#[derive(Debug, Clone, PartialEq)]
+enum AstGuardFallback {
+    SourceTooLarge {
+        source_bytes: usize,
+        limit: usize,
+    },
+    ParseTimedOut {
+        timeout_micros: u64,
+    },
+    AstTooLarge {
+        named_node_count: usize,
+        limit: usize,
+    },
+}
+
+impl AstGuardFallback {
+    fn risk_modifier(&self) -> f64 {
+        AST_GUARD_FALLBACK_RISK_MODIFIER
+    }
+
+    fn reason_code(&self) -> &'static str {
+        match self {
+            AstGuardFallback::SourceTooLarge { .. } => "ast_source_too_large",
+            AstGuardFallback::ParseTimedOut { .. } => "ast_parse_timed_out",
+            AstGuardFallback::AstTooLarge { .. } => "ast_named_node_limit_exceeded",
+        }
+    }
+
+    fn detail(&self) -> String {
+        match self {
+            AstGuardFallback::SourceTooLarge {
+                source_bytes,
+                limit,
+            } => format!("source bytes {source_bytes} exceeded limit {limit}"),
+            AstGuardFallback::ParseTimedOut { timeout_micros } => {
+                format!("parse exceeded timeout {timeout_micros} microseconds")
+            }
+            AstGuardFallback::AstTooLarge {
+                named_node_count,
+                limit,
+            } => format!("named node count {named_node_count} exceeded limit {limit}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SemanticEvaluation {
+    metrics: SemanticMetrics,
+    ast_guard_fallback: Option<AstGuardFallback>,
+}
 
 #[derive(Debug)]
 pub enum CriticalityError {
@@ -62,7 +114,8 @@ pub fn evaluate_criticality(
     let sensitivity = path_safety::classify_path_sensitivity(&normalized_path)?;
     let path_category = path_category_from_str(&sensitivity.category)?;
     let path_severity = path_severity_from_str(&sensitivity.severity)?;
-    let semantic_metrics = semantic_metrics_for_input(input, &normalized_path)?;
+    let semantic_evaluation = semantic_metrics_for_input(input, &normalized_path)?;
+    let semantic_metrics = semantic_evaluation.metrics;
 
     let path_base = path_base_score(path_category);
     let action_modifier = action_modifier(input.action_type);
@@ -74,9 +127,18 @@ pub fn evaluate_criticality(
     let destructive_sinks = detect_destructive_sinks(&normalized_path, &input.new_code);
     let destructive_modifier = destructive_sink_score_modifier(&destructive_sinks);
     let elevated_modifier = elevated_risk_modifier(input);
+    let ast_guard_modifier = semantic_evaluation
+        .ast_guard_fallback
+        .as_ref()
+        .map_or(0.0, AstGuardFallback::risk_modifier);
 
     let criticality_index = clamp_criticality(
-        path_base + action_modifier + semantic_modifier + elevated_modifier + destructive_modifier,
+        path_base
+            + action_modifier
+            + semantic_modifier
+            + elevated_modifier
+            + destructive_modifier
+            + ast_guard_modifier,
     );
     let risk_level = risk_level_for_score(criticality_index);
 
@@ -91,6 +153,8 @@ pub fn evaluate_criticality(
         elevated_field_present: input.elevated.is_some(),
         destructive_sinks: &destructive_sinks,
         destructive_modifier,
+        ast_guard_fallback: semantic_evaluation.ast_guard_fallback.as_ref(),
+        ast_guard_modifier,
         risk_level,
         used_python_ast: is_python_path(&normalized_path),
     });
@@ -108,22 +172,58 @@ pub fn evaluate_criticality(
 fn semantic_metrics_for_input(
     input: &CriticalityInput,
     normalized_path: &str,
-) -> Result<SemanticMetrics, CriticalityError> {
+) -> Result<SemanticEvaluation, CriticalityError> {
     if input.old_code.trim().is_empty() && input.new_code.trim().is_empty() {
-        return Ok(empty_semantic_metrics());
+        return Ok(SemanticEvaluation {
+            metrics: empty_semantic_metrics(),
+            ast_guard_fallback: None,
+        });
     }
 
     if is_python_path(normalized_path) {
         return match analyze_python_survival(&input.old_code, &input.new_code) {
-            Ok(metrics) => Ok(metrics),
+            Ok(metrics) => Ok(SemanticEvaluation {
+                metrics,
+                ast_guard_fallback: None,
+            }),
             Err(AstError::ParseFailed) | Err(AstError::SyntaxErrorNodes { .. }) => {
-                Ok(text_survival_metrics(&input.old_code, &input.new_code))
+                Ok(SemanticEvaluation {
+                    metrics: text_survival_metrics(&input.old_code, &input.new_code),
+                    ast_guard_fallback: None,
+                })
             }
+            Err(AstError::ParseTimedOut { timeout_micros }) => Ok(SemanticEvaluation {
+                metrics: text_survival_metrics(&input.old_code, &input.new_code),
+                ast_guard_fallback: Some(AstGuardFallback::ParseTimedOut { timeout_micros }),
+            }),
+            Err(AstError::SourceTooLarge {
+                source_bytes,
+                limit,
+            }) => Ok(SemanticEvaluation {
+                metrics: text_survival_metrics(&input.old_code, &input.new_code),
+                ast_guard_fallback: Some(AstGuardFallback::SourceTooLarge {
+                    source_bytes,
+                    limit,
+                }),
+            }),
+            Err(AstError::AstTooLarge {
+                named_node_count,
+                limit,
+            }) => Ok(SemanticEvaluation {
+                metrics: text_survival_metrics(&input.old_code, &input.new_code),
+                ast_guard_fallback: Some(AstGuardFallback::AstTooLarge {
+                    named_node_count,
+                    limit,
+                }),
+            }),
             Err(err) => Err(CriticalityError::from(err)),
         };
     }
 
-    Ok(text_survival_metrics(&input.old_code, &input.new_code))
+    Ok(SemanticEvaluation {
+        metrics: text_survival_metrics(&input.old_code, &input.new_code),
+        ast_guard_fallback: None,
+    })
 }
 
 fn text_survival_metrics(old_code: &str, new_code: &str) -> SemanticMetrics {
@@ -321,6 +421,8 @@ struct CriticalityReasonContext<'a> {
     elevated_field_present: bool,
     destructive_sinks: &'a [DestructiveSinkMatch],
     destructive_modifier: f64,
+    ast_guard_fallback: Option<&'a AstGuardFallback>,
+    ast_guard_modifier: f64,
     risk_level: CriticalityRiskLevel,
     used_python_ast: bool,
 }
@@ -389,6 +491,21 @@ fn build_reasons(context: CriticalityReasonContext<'_>) -> Vec<String> {
         reasons.push(format!(
             "Destructive sink rules increase criticality by {:.1}.",
             context.destructive_modifier
+        ));
+    }
+
+    if let Some(ast_guard_fallback) = context.ast_guard_fallback {
+        reasons.push(format!(
+            "AST guard fallback reason code {}: {}.",
+            ast_guard_fallback.reason_code(),
+            ast_guard_fallback.detail()
+        ));
+    }
+
+    if context.ast_guard_modifier > 0.0 {
+        reasons.push(format!(
+            "AST guard fallback increases criticality by {:.1}.",
+            context.ast_guard_modifier
         ));
     }
 
@@ -899,5 +1016,37 @@ mod hardening_regression_tests {
             .expect("large multi-byte lines should not panic or hang");
 
         assert!((0.0..=1.0).contains(&assessment.semantic_metrics.survival_ratio));
+    }
+}
+
+#[cfg(test)]
+mod ast_dos_criticality_regression_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_python_ast_input_uses_text_fallback() {
+        let huge = format!("value = '{}'", "x".repeat(1_000_001));
+
+        let assessment = evaluate_criticality(&CriticalityInput {
+            file_path: "src/huge.py".to_string(),
+            action_type: FileActionType::Modified,
+            old_code: huge.clone(),
+            new_code: huge,
+            elevated: None,
+        })
+        .expect("oversized Python source should fall back instead of failing");
+
+        assert_eq!(assessment.semantic_metrics.old_node_count, 0);
+        assert_eq!(assessment.semantic_metrics.new_node_count, 0);
+        assert_eq!(assessment.semantic_metrics.survival_ratio, 1.0);
+        assert!(assessment.criticality_index > 3.0);
+        assert!(assessment
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("ast_source_too_large")));
+        assert!(assessment
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("AST guard fallback increases criticality")));
     }
 }
