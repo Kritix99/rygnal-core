@@ -3,6 +3,10 @@ use std::collections::BTreeMap;
 use tree_sitter::{Node, Parser};
 
 const MAX_AST_NAMED_NODES: usize = 50_000;
+const DEFAULT_MAX_AST_SOURCE_BYTES: usize = 1_000_000;
+const DEFAULT_TREE_SITTER_PARSE_TIMEOUT_MICROS: u64 = 2_000_000;
+const MAX_AST_SOURCE_BYTES_ENV: &str = "RYGNAL_AST_MAX_SOURCE_BYTES";
+const TREE_SITTER_PARSE_TIMEOUT_MICROS_ENV: &str = "RYGNAL_TREE_SITTER_PARSE_TIMEOUT_MICROS";
 // Any Tree-Sitter error or missing node means the recovered AST is not
 // trustworthy enough for semantic-destruction math. Fall back to text.
 const MAX_TRUSTED_AST_ERROR_NODES: usize = 0;
@@ -11,6 +15,13 @@ const MAX_TRUSTED_AST_ERROR_NODES: usize = 0;
 pub enum AstError {
     LanguageLoad(String),
     ParseFailed,
+    ParseTimedOut {
+        timeout_micros: u64,
+    },
+    SourceTooLarge {
+        source_bytes: usize,
+        limit: usize,
+    },
     SyntaxErrorNodes {
         error_node_count: usize,
         limit: usize,
@@ -29,6 +40,17 @@ impl std::fmt::Display for AstError {
                 write!(formatter, "failed to load Python grammar: {message}")
             }
             AstError::ParseFailed => write!(formatter, "tree-sitter failed to parse Python code"),
+            AstError::ParseTimedOut { timeout_micros } => write!(
+                formatter,
+                "tree-sitter Python parse timed out after {timeout_micros} microseconds"
+            ),
+            AstError::SourceTooLarge {
+                source_bytes,
+                limit,
+            } => write!(
+                formatter,
+                "Python source is {source_bytes} bytes, exceeding Tree-Sitter limit {limit}"
+            ),
             AstError::SyntaxErrorNodes {
                 error_node_count,
                 limit,
@@ -99,15 +121,43 @@ pub fn analyze_python_survival(
     })
 }
 
+fn configured_max_ast_source_bytes() -> usize {
+    std::env::var(MAX_AST_SOURCE_BYTES_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_AST_SOURCE_BYTES)
+}
+
+fn configured_tree_sitter_parse_timeout_micros() -> u64 {
+    std::env::var(TREE_SITTER_PARSE_TIMEOUT_MICROS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_TREE_SITTER_PARSE_TIMEOUT_MICROS)
+}
+
 fn extract_python_features(code: &str) -> Result<SyntaxFeatures, AstError> {
+    let source_limit = configured_max_ast_source_bytes();
+    if code.len() > source_limit {
+        return Err(AstError::SourceTooLarge {
+            source_bytes: code.len(),
+            limit: source_limit,
+        });
+    }
+
     let mut parser = Parser::new();
     let language = tree_sitter_python::language();
 
     parser
         .set_language(language)
         .map_err(|err| AstError::LanguageLoad(err.to_string()))?;
+    let timeout_micros = configured_tree_sitter_parse_timeout_micros();
+    parser.set_timeout_micros(timeout_micros);
 
-    let tree = parser.parse(code, None).ok_or(AstError::ParseFailed)?;
+    let tree = parser
+        .parse(code, None)
+        .ok_or(AstError::ParseTimedOut { timeout_micros })?;
     let root = tree.root_node();
 
     let untrusted_syntax_count = count_untrusted_syntax_nodes(root);
@@ -459,5 +509,58 @@ def load_message():
             }
             other => panic!("expected SyntaxErrorNodes, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod ast_dos_hardening_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_python_source_is_rejected_before_tree_sitter() {
+        let code = format!("x = '{}'", "a".repeat(DEFAULT_MAX_AST_SOURCE_BYTES + 1));
+
+        let err = extract_python_features(&code).expect_err("oversized source should be rejected");
+
+        assert!(matches!(
+            err,
+            AstError::SourceTooLarge {
+                source_bytes,
+                limit
+            } if source_bytes > limit && limit == DEFAULT_MAX_AST_SOURCE_BYTES
+        ));
+    }
+
+    #[test]
+    fn python_source_size_boundary_is_inclusive() {
+        let prefix = "x = '";
+        let suffix = "'\n";
+        let filler_len = DEFAULT_MAX_AST_SOURCE_BYTES - prefix.len() - suffix.len();
+        let at_limit = format!("{prefix}{}{suffix}", "a".repeat(filler_len));
+
+        assert_eq!(at_limit.len(), DEFAULT_MAX_AST_SOURCE_BYTES);
+        extract_python_features(&at_limit).expect("source exactly at limit should parse");
+
+        let over_limit = format!("{at_limit}x");
+        let err = extract_python_features(&over_limit)
+            .expect_err("source one byte over limit should be rejected");
+
+        assert!(matches!(
+            err,
+            AstError::SourceTooLarge {
+                source_bytes,
+                limit
+            } if source_bytes == DEFAULT_MAX_AST_SOURCE_BYTES + 1
+                && limit == DEFAULT_MAX_AST_SOURCE_BYTES
+        ));
+    }
+
+    #[test]
+    fn normal_python_still_parses_with_timeout_configured() {
+        let features = extract_python_features("def ok():\n    return 1\n")
+            .expect("normal Python should still parse");
+
+        assert!(features.named_node_count > 0);
+        assert!(features.semantic_tokens.contains_key("function:ok"));
     }
 }
