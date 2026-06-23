@@ -45,6 +45,36 @@ class StaticRiskEngine:
         }
 
 
+class FailingRiskEngine:
+    def assess(self, _request: ToolRequest) -> dict[str, Any]:
+        raise RuntimeError("risk engine failed")
+
+
+class FailingPolicyEngine:
+    def evaluate(
+        self,
+        _request: ToolRequest,
+        risk_assessment: Any | None = None,
+    ) -> PolicyDecision:
+        raise RuntimeError("policy engine failed")
+
+
+class FailingAuditLogger(AuditLogger):
+    def log_decision(self, *args: object, **kwargs: object):
+        raise OSError("audit path /private/sensitive/location failed")
+
+
+class FailingApprovalWorkflow:
+    def request_approval(
+        self,
+        *,
+        request: ToolRequest,
+        policy_decision: PolicyDecision,
+        risk_assessment: dict[str, Any],
+    ):
+        raise RuntimeError("approval workflow failed")
+
+
 class SpyTool:
     def __init__(self) -> None:
         self.calls: list[ToolRequest] = []
@@ -109,6 +139,129 @@ def assert_audit_is_written(interceptor: RygnalInterceptor, result) -> None:
     assert events[0].metadata["risk_score"] == 42
     assert events[0].metadata["risk_level"] == "medium"
     assert interceptor.audit_logger.verify_integrity() is True
+
+
+def test_risk_assessment_failure_fails_closed_before_policy_or_execution(tmp_path):
+    spy_tool = SpyTool()
+    executor = ToolExecutor()
+    executor.register("branch_test_tool", spy_tool)
+    policy_engine = StaticPolicyEngine(make_policy_decision(Decision.ALLOW))
+
+    interceptor = RygnalInterceptor(
+        policy_engine=policy_engine,  # type: ignore[arg-type]
+        audit_logger=AuditLogger(tmp_path / "audit_log.jsonl"),
+        tool_executor=executor,
+        risk_engine=FailingRiskEngine(),  # type: ignore[arg-type]
+    )
+
+    result = interceptor.intercept(make_request())
+
+    assert policy_engine.calls == []
+    assert spy_tool.calls == []
+    assert result.policy_decision.decision == Decision.BLOCK
+    assert result.policy_decision.allowed is False
+    assert result.policy_decision.severity == Severity.HIGH
+    assert result.policy_decision.policy_id == "global-fail-closed"
+    assert "risk_assessment_failed" in result.policy_decision.reason
+    assert "risk engine failed" not in result.policy_decision.reason
+    assert result.execution.status == ExecutionStatus.SKIPPED
+    assert result.execution.executed is False
+    assert result.audit_event.metadata["fail_closed"] is True
+    assert result.audit_event.metadata["fail_closed_reason_code"] == "risk_assessment_failed"
+    events = interceptor.audit_logger.read_events()
+    assert len(events) == 1
+    assert events[0].event_id == result.audit_event.event_id
+    assert events[0].metadata["fail_closed_reason_code"] == "risk_assessment_failed"
+
+
+def test_policy_evaluation_failure_fails_closed_before_execution(tmp_path):
+    spy_tool = SpyTool()
+    executor = ToolExecutor()
+    executor.register("branch_test_tool", spy_tool)
+
+    interceptor = RygnalInterceptor(
+        policy_engine=FailingPolicyEngine(),  # type: ignore[arg-type]
+        audit_logger=AuditLogger(tmp_path / "audit_log.jsonl"),
+        tool_executor=executor,
+        risk_engine=StaticRiskEngine(),  # type: ignore[arg-type]
+    )
+
+    result = interceptor.intercept(make_request())
+
+    assert spy_tool.calls == []
+    assert result.risk_assessment["risk_score"] == 42
+    assert result.policy_decision.decision == Decision.BLOCK
+    assert result.policy_decision.allowed is False
+    assert result.policy_decision.severity == Severity.HIGH
+    assert result.policy_decision.policy_id == "global-fail-closed"
+    assert "policy_evaluation_failed" in result.policy_decision.reason
+    assert "policy engine failed" not in result.policy_decision.reason
+    assert result.execution.status == ExecutionStatus.SKIPPED
+    assert result.execution.executed is False
+    assert result.audit_event.metadata["fail_closed"] is True
+    assert result.audit_event.metadata["fail_closed_reason_code"] == "policy_evaluation_failed"
+    assert_audit_is_written(interceptor, result)
+
+
+def test_approval_workflow_failure_fails_closed_before_execution(tmp_path):
+    spy_tool = SpyTool()
+    executor = ToolExecutor()
+    executor.register("branch_test_tool", spy_tool)
+    policy_decision = make_policy_decision(Decision.REQUIRE_APPROVAL, allowed=False)
+
+    interceptor = RygnalInterceptor(
+        policy_engine=StaticPolicyEngine(policy_decision),  # type: ignore[arg-type]
+        audit_logger=AuditLogger(tmp_path / "audit_log.jsonl"),
+        tool_executor=executor,
+        risk_engine=StaticRiskEngine(),  # type: ignore[arg-type]
+        approval_workflow=FailingApprovalWorkflow(),  # type: ignore[arg-type]
+    )
+
+    result = interceptor.intercept(make_request())
+
+    assert spy_tool.calls == []
+    assert result.risk_assessment["risk_score"] == 42
+    assert result.policy_decision.decision == Decision.BLOCK
+    assert result.policy_decision.allowed is False
+    assert result.policy_decision.severity == Severity.HIGH
+    assert result.policy_decision.policy_id == "global-fail-closed"
+    assert "approval_workflow_failed" in result.policy_decision.reason
+    assert "approval workflow failed" not in result.policy_decision.reason
+    assert result.execution.status == ExecutionStatus.SKIPPED
+    assert result.execution.executed is False
+    assert result.audit_event.metadata["fail_closed"] is True
+    assert result.audit_event.metadata["fail_closed_reason_code"] == "approval_workflow_failed"
+    assert (
+        result.audit_event.metadata["unconfirmed_pre_approval_decision"]["decision"]
+        == "require_approval"
+    )
+    assert_audit_is_written(interceptor, result)
+
+
+def test_fail_closed_still_returns_block_when_audit_write_fails(tmp_path):
+    executor = ToolExecutor()
+    policy_engine = StaticPolicyEngine(make_policy_decision(Decision.ALLOW))
+
+    interceptor = RygnalInterceptor(
+        policy_engine=policy_engine,  # type: ignore[arg-type]
+        audit_logger=FailingAuditLogger(tmp_path / "audit_log.jsonl"),
+        tool_executor=executor,
+        risk_engine=FailingRiskEngine(),  # type: ignore[arg-type]
+    )
+
+    result = interceptor.intercept(make_request())
+
+    assert result.policy_decision.decision == Decision.BLOCK
+    assert result.policy_decision.allowed is False
+    assert result.policy_decision.severity == Severity.HIGH
+    assert result.execution.status == ExecutionStatus.SKIPPED
+    assert result.execution.executed is False
+    assert result.audit_event.metadata["fail_closed"] is True
+    assert result.audit_event.metadata["fail_closed_reason_code"] == "risk_assessment_failed"
+    assert result.audit_event.metadata["audit_write_failed"] is True
+    assert result.audit_event.metadata["audit_error_type"] == "OSError"
+    assert "sensitive/location" not in str(result.audit_event.metadata)
+    assert "risk engine failed" not in result.policy_decision.reason
 
 
 def test_enforce_allow_branch_executes_registered_tool(tmp_path):

@@ -9,16 +9,25 @@ from rygnal.approval import ApprovalWorkflow
 from rygnal.audit_logger import AuditLogger
 from rygnal.models import (
     ApprovalDecision,
+    AuditEvent,
     Decision,
     ExecutionStatus,
     InterceptorResult,
+    PolicyDecision,
+    PolicyExplanation,
     RuntimeMode,
+    Severity,
     ToolExecutionResult,
     ToolRequest,
 )
 from rygnal.policy_engine import PolicyEngine
 from rygnal.risk_engine import RiskEngine
+from rygnal.security import redact_sensitive_value
 from rygnal.tool_executor import ToolExecutor
+
+GLOBAL_FAIL_CLOSED_POLICY_ID = "global-fail-closed"
+GLOBAL_FAIL_CLOSED_POLICY_VERSION = "global-fail-closed.v1"
+FAIL_CLOSED_RUNTIME_ERRORS = (RuntimeError, ValueError, OSError, LookupError)
 
 
 class RygnalInterceptor:
@@ -42,10 +51,29 @@ class RygnalInterceptor:
 
     def intercept(self, request: ToolRequest) -> InterceptorResult:
         """Assess risk, evaluate policy, audit, and optionally execute a tool request."""
-        risk_assessment = self.risk_engine.assess(request)
+        try:
+            risk_assessment = self.risk_engine.assess(request)
+        except FAIL_CLOSED_RUNTIME_ERRORS as exc:
+            return self._fail_closed_result(
+                request=request,
+                reason_code="risk_assessment_failed",
+                exc=exc,
+            )
+
         risk_metadata = self._risk_metadata(risk_assessment)
 
-        policy_decision = self.policy_engine.evaluate(request, risk_assessment=risk_assessment)
+        try:
+            policy_decision = self.policy_engine.evaluate(
+                request,
+                risk_assessment=risk_assessment,
+            )
+        except FAIL_CLOSED_RUNTIME_ERRORS as exc:
+            return self._fail_closed_result(
+                request=request,
+                reason_code="policy_evaluation_failed",
+                exc=exc,
+                risk_metadata=risk_metadata,
+            )
         approval_decision: ApprovalDecision | None = None
 
         # Flatten risk metadata to top level for backward compatibility
@@ -58,11 +86,24 @@ class RygnalInterceptor:
 
         if policy_decision.decision == Decision.REQUIRE_APPROVAL:
             approval_workflow = self.approval_workflow or ApprovalWorkflow()
-            approval_request, approval_decision = approval_workflow.request_approval(
-                request=request,
-                policy_decision=policy_decision,
-                risk_assessment=risk_metadata,
-            )
+            try:
+                approval_request, approval_decision = approval_workflow.request_approval(
+                    request=request,
+                    policy_decision=policy_decision,
+                    risk_assessment=risk_metadata,
+                )
+            except FAIL_CLOSED_RUNTIME_ERRORS as exc:
+                return self._fail_closed_result(
+                    request=request,
+                    reason_code="approval_workflow_failed",
+                    exc=exc,
+                    risk_metadata=risk_metadata,
+                    extra_metadata={
+                        "unconfirmed_pre_approval_decision": policy_decision.model_dump(
+                            mode="json"
+                        ),
+                    },
+                )
             audit_metadata["approval"] = {
                 "approval_id": approval_request.approval_id,
                 "status": approval_decision.status,
@@ -97,6 +138,109 @@ class RygnalInterceptor:
     def handle(self, request: ToolRequest) -> InterceptorResult:
         """Alias for intercept."""
         return self.intercept(request)
+
+    def _fail_closed_result(
+        self,
+        *,
+        request: ToolRequest,
+        reason_code: str,
+        exc: Exception,
+        risk_metadata: dict[str, Any] | None = None,
+        extra_metadata: dict[str, Any] | None = None,
+    ) -> InterceptorResult:
+        error_type = type(exc).__name__
+        reason = f"global_fail_closed:{reason_code}:{error_type}"
+        safe_risk_metadata = dict(risk_metadata or {})
+
+        policy_decision = PolicyDecision(
+            decision=Decision.BLOCK,
+            allowed=False,
+            severity=Severity.HIGH,
+            reason=reason,
+            policy_id=GLOBAL_FAIL_CLOSED_POLICY_ID,
+            explanation=PolicyExplanation(
+                policy_version=GLOBAL_FAIL_CLOSED_POLICY_VERSION,
+                matched=False,
+                matched_rule_id=None,
+                matched_rule_priority=None,
+                matched_conditions=[reason_code],
+                evaluated_rule_ids=[],
+                default_decision=False,
+            ),
+        )
+
+        audit_metadata: dict[str, Any] = {
+            **safe_risk_metadata,
+            "runtime_mode": self.runtime_mode.value,
+            "fail_closed": True,
+            "fail_closed_reason_code": reason_code,
+            "error_type": error_type,
+            "error_summary": f"{error_type} during {reason_code}",
+            "policy_explanation": policy_decision.explanation.model_dump(mode="json")
+            if policy_decision.explanation is not None
+            else None,
+        }
+
+        if extra_metadata:
+            audit_metadata.update(extra_metadata)
+
+        audit_event = self._log_or_synthesize_fail_closed_audit_event(
+            request=request,
+            policy_decision=policy_decision,
+            metadata=audit_metadata,
+        )
+
+        return InterceptorResult(
+            request=request,
+            risk_assessment=safe_risk_metadata,
+            policy_decision=policy_decision,
+            audit_event=audit_event,
+            execution=ToolExecutionResult(
+                status=ExecutionStatus.SKIPPED,
+                executed=False,
+                error=reason,
+            ),
+            approval_decision=None,
+        )
+
+    def _log_or_synthesize_fail_closed_audit_event(
+        self,
+        *,
+        request: ToolRequest,
+        policy_decision: PolicyDecision,
+        metadata: dict[str, Any],
+    ) -> AuditEvent:
+        try:
+            return self.audit_logger.log_decision(
+                request=request,
+                policy_decision=policy_decision,
+                metadata=metadata,
+            )
+        except FAIL_CLOSED_RUNTIME_ERRORS as audit_exc:
+            audit_error_type = type(audit_exc).__name__
+            fallback_metadata = {
+                **metadata,
+                "audit_write_failed": True,
+                "audit_error_type": audit_error_type,
+                "audit_error_summary": f"{audit_error_type} while writing fail-closed audit event",
+            }
+
+            return AuditEvent(
+                trace_id=str(request.metadata.get("trace_id") or ""),
+                user_id=request.user_id,
+                agent_id=request.agent_id,
+                environment=request.environment,
+                tool_name=request.tool_name,
+                action=request.action,
+                target=redact_sensitive_value(request.target),
+                input=redact_sensitive_value(request.input),
+                decision=policy_decision.decision,
+                allowed=policy_decision.allowed,
+                severity=policy_decision.severity,
+                policy_id=policy_decision.policy_id,
+                reason=policy_decision.reason,
+                metadata=redact_sensitive_value(fallback_metadata),
+            )
 
     def _execute_with_decision(
         self,
