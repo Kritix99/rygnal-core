@@ -1,6 +1,9 @@
 #![allow(dead_code)] // Task 2 adds the evaluator; Task 3 exposes it through PyO3.
 
 use crate::ast::{analyze_python_survival, AstError};
+use crate::destructive_rules::{
+    destructive_sink_score_modifier, detect_destructive_sinks, DestructiveSinkMatch,
+};
 use crate::models::ELEVATED_RISK_WEIGHT_ENV;
 use crate::models::{
     CriticalityAssessment, CriticalityInput, CriticalityRiskLevel, FileActionType,
@@ -68,10 +71,13 @@ pub fn evaluate_criticality(
         semantic_metrics.survival_ratio,
         &input.old_code,
     );
+    let destructive_sinks = detect_destructive_sinks(&normalized_path, &input.new_code);
+    let destructive_modifier = destructive_sink_score_modifier(&destructive_sinks);
     let elevated_modifier = elevated_risk_modifier(input);
 
-    let criticality_index =
-        clamp_criticality(path_base + action_modifier + semantic_modifier + elevated_modifier);
+    let criticality_index = clamp_criticality(
+        path_base + action_modifier + semantic_modifier + elevated_modifier + destructive_modifier,
+    );
     let risk_level = risk_level_for_score(criticality_index);
 
     let reasons = build_reasons(CriticalityReasonContext {
@@ -83,6 +89,8 @@ pub fn evaluate_criticality(
         semantic_modifier,
         elevated_modifier,
         elevated_field_present: input.elevated.is_some(),
+        destructive_sinks: &destructive_sinks,
+        destructive_modifier,
         risk_level,
         used_python_ast: is_python_path(&normalized_path),
     });
@@ -311,6 +319,8 @@ struct CriticalityReasonContext<'a> {
     semantic_modifier: f64,
     elevated_modifier: f64,
     elevated_field_present: bool,
+    destructive_sinks: &'a [DestructiveSinkMatch],
+    destructive_modifier: f64,
     risk_level: CriticalityRiskLevel,
     used_python_ast: bool,
 }
@@ -363,6 +373,22 @@ fn build_reasons(context: CriticalityReasonContext<'_>) -> Vec<String> {
         reasons.push(format!(
             "Python elevated risk signal increases criticality by {:.1}.",
             context.elevated_modifier
+        ));
+    }
+
+    for sink_match in context.destructive_sinks.iter().take(3) {
+        reasons.push(format!(
+            "Detected {} destructive sink rule {} for {}.",
+            sink_match.severity.as_str(),
+            sink_match.rule_id,
+            sink_match.language.as_str()
+        ));
+    }
+
+    if context.destructive_modifier > 0.0 {
+        reasons.push(format!(
+            "Destructive sink rules increase criticality by {:.1}.",
+            context.destructive_modifier
         ));
     }
 
@@ -711,6 +737,35 @@ mod tests {
             parse_elevated_risk_weight(Some("not-a-number")),
             DEFAULT_ELEVATED_RISK_WEIGHT
         );
+    }
+
+    #[test]
+    fn destructive_sink_rules_increase_criticality_score() {
+        let safe = evaluate_criticality(&input(
+            "tools/cleanup.py",
+            FileActionType::Modified,
+            "print('safe')\n",
+            "print('safe')\n",
+        ))
+        .expect("valid safe assessment");
+
+        let destructive = evaluate_criticality(&input(
+            "tools/cleanup.py",
+            FileActionType::Modified,
+            "import shutil\nshutil.rmtree('./build')\n",
+            "import shutil\nshutil.rmtree('./build')\n",
+        ))
+        .expect("valid destructive assessment");
+
+        assert!(destructive.criticality_index > safe.criticality_index);
+        assert!(destructive
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("python-shutil-rmtree")));
+        assert!(destructive
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("Destructive sink rules increase criticality")));
     }
 
     #[test]
