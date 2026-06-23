@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from rygnal.models import Decision, ToolRequest
-from rygnal.policy_engine import PolicyEngine, load_default_policy_engine
+from rygnal.policy_engine import PolicyEngine, PolicyLoadError, load_default_policy_engine
 
 
 def test_policy_engine_loads_default_policy():
@@ -279,3 +279,101 @@ rules:
 
     with pytest.raises(ValueError, match="Duplicate policy rule id"):
         PolicyEngine.from_file(policy_file)
+
+
+def test_policy_file_rejects_oversized_regex_pattern(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("RYGNAL_POLICY_REGEX_MAX_PATTERN_BYTES", "8")
+
+    policy_file = tmp_path / "oversized_regex_policy.yaml"
+    policy_file.write_text(
+        """
+policy_version: policy.v2
+default_decision: block
+rules:
+  - id: oversized-regex
+    priority: 10
+    tool_name: file_read
+    target_matches: "aaaaaaaaa"
+    decision: allow
+    severity: low
+    reason: Oversized regex should be rejected before runtime.
+"""
+    )
+
+    with pytest.raises(PolicyLoadError, match="policy_regex_pattern_too_large"):
+        PolicyEngine.from_file(policy_file)
+
+
+def test_policy_regex_target_length_guard_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("RYGNAL_POLICY_REGEX_MAX_TARGET_BYTES", "8")
+
+    policy_file = tmp_path / "runtime_regex_guard_policy.yaml"
+    policy_file.write_text(
+        """
+policy_version: policy.v2
+default_decision: allow
+rules:
+  - id: guarded-regex-rule
+    priority: 10
+    tool_name: file_read
+    target_matches: "README"
+    decision: allow
+    severity: low
+    reason: This rule would allow short README targets.
+"""
+    )
+
+    engine = PolicyEngine.from_file(policy_file)
+    result = engine.evaluate(
+        ToolRequest(
+            tool_name="file_read",
+            action="read_file",
+            target="README-with-very-long-name.md",
+        )
+    )
+
+    assert result.decision == Decision.BLOCK
+    assert result.allowed is False
+    assert result.policy_id == "guarded-regex-rule"
+    assert "policy_regex_target_too_large" in result.reason
+    assert result.explanation is not None
+    assert result.explanation.matched_rule_id == "guarded-regex-rule"
+    assert "policy_regex_target_too_large" in result.explanation.matched_conditions
+
+
+def test_policy_regex_resource_guard_env_values_fall_back_to_defaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("RYGNAL_POLICY_REGEX_MAX_PATTERN_BYTES", "0")
+    monkeypatch.setenv("RYGNAL_POLICY_REGEX_MAX_TARGET_BYTES", "not-an-int")
+
+    policy_file = tmp_path / "fallback_regex_limits_policy.yaml"
+    policy_file.write_text(
+        """
+policy_version: policy.v2
+default_decision: block
+rules:
+  - id: normal-regex
+    priority: 10
+    tool_name: file_read
+    target_matches: 'README\\.md'
+    decision: allow
+    severity: low
+    reason: Normal regex should still work with invalid env values.
+"""
+    )
+
+    engine = PolicyEngine.from_file(policy_file)
+    result = engine.evaluate(
+        ToolRequest(tool_name="file_read", action="read_file", target="README.md")
+    )
+
+    assert result.decision == Decision.ALLOW
+    assert result.policy_id == "normal-regex"

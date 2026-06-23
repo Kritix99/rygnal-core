@@ -4,6 +4,7 @@ The policy engine decides whether an AI-agent tool request should be
 allowed, blocked, simulated, or sent for human approval.
 """
 
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,9 +26,71 @@ from rygnal.models import (
 DEFAULT_POLICY_PATH = Path("policies/default_policy.yaml")
 PRODUCTION_SAFE_POLICY_PATH = Path("policies/production_safe_policy.yaml")
 
+DEFAULT_POLICY_REGEX_MAX_PATTERN_BYTES = 2_048
+DEFAULT_POLICY_REGEX_MAX_TARGET_BYTES = 8_192
+POLICY_REGEX_MAX_PATTERN_BYTES_ENV = "RYGNAL_POLICY_REGEX_MAX_PATTERN_BYTES"
+POLICY_REGEX_MAX_TARGET_BYTES_ENV = "RYGNAL_POLICY_REGEX_MAX_TARGET_BYTES"
+
 
 class PolicyLoadError(ValueError):
     """Raised when a policy file violates a safety invariant."""
+
+
+class PolicyRuntimeGuardError(ValueError):
+    """Raised when runtime policy evaluation hits a resource guard."""
+
+    def __init__(
+        self,
+        *,
+        rule_id: str,
+        field_name: str,
+        value_bytes: int,
+        limit: int,
+    ) -> None:
+        self.rule_id = rule_id
+        self.field_name = field_name
+        self.value_bytes = value_bytes
+        self.limit = limit
+        self.reason_code = "policy_regex_target_too_large"
+        super().__init__(
+            f"{self.reason_code}: policy rule {rule_id!r} field {field_name!r} "
+            f"target is {value_bytes} bytes, exceeding limit {limit}"
+        )
+
+
+def _configured_positive_int(env_name: str, default: int) -> int:
+    raw_value = os.environ.get(env_name)
+
+    if raw_value is None:
+        return default
+
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return default
+
+    if value <= 0:
+        return default
+
+    return value
+
+
+def _utf8_len(value: str) -> int:
+    return len(value.encode("utf-8"))
+
+
+def _policy_regex_max_pattern_bytes() -> int:
+    return _configured_positive_int(
+        POLICY_REGEX_MAX_PATTERN_BYTES_ENV,
+        DEFAULT_POLICY_REGEX_MAX_PATTERN_BYTES,
+    )
+
+
+def _policy_regex_max_target_bytes() -> int:
+    return _configured_positive_int(
+        POLICY_REGEX_MAX_TARGET_BYTES_ENV,
+        DEFAULT_POLICY_REGEX_MAX_TARGET_BYTES,
+    )
 
 
 @dataclass(frozen=True)
@@ -117,12 +180,11 @@ class PolicyEngine:
                 if pattern is None:
                     continue
 
-                try:
-                    re.compile(pattern)
-                except re.error as exc:
-                    raise PolicyLoadError(
-                        f"Invalid regex in policy rule '{rule.id}' field '{field_name}': {exc}"
-                    ) from exc
+                PolicyEngine._validate_policy_regex_pattern(
+                    rule_id=rule.id,
+                    field_name=field_name,
+                    pattern=pattern,
+                )
 
         if validation_profile is None:
             return
@@ -199,7 +261,27 @@ class PolicyEngine:
         for rule in self.rules:
             evaluated_rule_ids.append(rule.id)
 
-            if self._matches(rule, request, risk_context):
+            try:
+                matched = self._matches(rule, request, risk_context)
+            except PolicyRuntimeGuardError as exc:
+                return PolicyDecision(
+                    decision=Decision.BLOCK,
+                    allowed=False,
+                    severity=Severity.HIGH,
+                    reason=str(exc),
+                    policy_id=rule.id,
+                    explanation=PolicyExplanation(
+                        policy_version=self.policy_version,
+                        matched=False,
+                        matched_rule_id=rule.id,
+                        matched_rule_priority=rule.priority,
+                        matched_conditions=[exc.reason_code, exc.field_name],
+                        evaluated_rule_ids=evaluated_rule_ids,
+                        default_decision=False,
+                    ),
+                )
+
+            if matched:
                 return PolicyDecision(
                     decision=rule.decision,
                     allowed=self._is_allowed(rule.decision),
@@ -257,10 +339,20 @@ class PolicyEngine:
         if rule.target_contains and rule.target_contains not in target:
             return False
 
-        if rule.target_matches and not re.search(rule.target_matches, target):
+        if rule.target_matches and not self._safe_policy_regex_search(
+            rule=rule,
+            field_name="target_matches",
+            pattern=rule.target_matches,
+            value=target,
+        ):
             return False
 
-        if rule.target_not_matches and re.search(rule.target_not_matches, target):
+        if rule.target_not_matches and self._safe_policy_regex_search(
+            rule=rule,
+            field_name="target_not_matches",
+            pattern=rule.target_not_matches,
+            value=target,
+        ):
             return False
 
         if rule.input_equals is not None and rule.input_equals != request.input:
@@ -290,6 +382,51 @@ class PolicyEngine:
                 return False
 
         return True
+
+    @staticmethod
+    def _validate_policy_regex_pattern(
+        *,
+        rule_id: str,
+        field_name: str,
+        pattern: str,
+    ) -> None:
+        pattern_bytes = _utf8_len(pattern)
+        pattern_limit = _policy_regex_max_pattern_bytes()
+
+        if pattern_bytes > pattern_limit:
+            raise PolicyLoadError(
+                "policy_regex_pattern_too_large: "
+                f"policy rule {rule_id!r} field {field_name!r} regex is "
+                f"{pattern_bytes} bytes, exceeding limit {pattern_limit}"
+            )
+
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise PolicyLoadError(
+                f"Invalid regex in policy rule '{rule_id}' field '{field_name}': {exc}"
+            ) from exc
+
+    @staticmethod
+    def _safe_policy_regex_search(
+        *,
+        rule: PolicyRule,
+        field_name: str,
+        pattern: str,
+        value: str,
+    ) -> bool:
+        value_bytes = _utf8_len(value)
+        value_limit = _policy_regex_max_target_bytes()
+
+        if value_bytes > value_limit:
+            raise PolicyRuntimeGuardError(
+                rule_id=rule.id,
+                field_name=field_name,
+                value_bytes=value_bytes,
+                limit=value_limit,
+            )
+
+        return re.search(pattern, value) is not None
 
     @staticmethod
     def _metadata_equals(
