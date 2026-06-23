@@ -7,6 +7,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from rygnal.version import package_version
+
 
 def utc_now_iso() -> str:
     """Return current UTC timestamp in ISO-8601 format."""
@@ -240,6 +242,7 @@ class AuditEvent(BaseModel):
     """Tamper-evident audit event for an AI-agent tool decision."""
 
     schema_version: str = "audit.v1"
+    rygnal_engine_version: str = Field(default_factory=package_version, min_length=1)
     event_id: str = Field(default_factory=new_event_id)
     timestamp: str = Field(default_factory=utc_now_iso)
     trace_id: str = Field(default_factory=new_trace_id)

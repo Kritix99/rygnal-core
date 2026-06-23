@@ -2,6 +2,7 @@ import json
 
 from rygnal.audit_logger import AuditLogger
 from rygnal.models import Decision, PolicyDecision, Severity, ToolRequest
+from rygnal.version import package_version
 
 
 def test_audit_logger_writes_jsonl_event(tmp_path):
@@ -35,6 +36,9 @@ def test_audit_logger_writes_jsonl_event(tmp_path):
     assert saved_event["decision"] == "block"
     assert saved_event["allowed"] is False
     assert saved_event["policy_id"] == "block-env-read"
+    assert saved_event["reason"] == "Reading environment secret files is not allowed."
+    assert saved_event["schema_version"] == "audit.v1"
+    assert saved_event["rygnal_engine_version"] == package_version()
     assert saved_event["event_hash"]
 
 
@@ -185,3 +189,46 @@ def test_audit_logger_detects_prev_hash_link_tampering(tmp_path):
     )
 
     assert logger.verify_integrity() is False
+
+
+def test_audit_logger_engine_version_is_part_of_integrity_hash(tmp_path):
+    log_path = tmp_path / "audit_log.jsonl"
+    logger = AuditLogger(log_path)
+
+    decision = PolicyDecision(
+        decision=Decision.ALLOW,
+        allowed=True,
+        severity=Severity.LOW,
+        reason="Allowed with exact forensic reason.",
+    )
+
+    logger.log_decision(ToolRequest(tool_name="file_read", target="README.md"), decision)
+
+    assert logger.verify_integrity() is True
+
+    saved_event = json.loads(log_path.read_text().splitlines()[0])
+    saved_event["rygnal_engine_version"] = "tampered-version"
+    log_path.write_text(json.dumps(saved_event, sort_keys=True) + "\n", encoding="utf-8")
+
+    assert logger.verify_integrity() is False
+
+
+def test_audit_event_preserves_exact_decision_reason(tmp_path):
+    log_path = tmp_path / "audit_log.jsonl"
+    logger = AuditLogger(log_path)
+    reason = "Exact deny reason: policy=block-env-read; target=.env"
+
+    decision = PolicyDecision(
+        decision=Decision.BLOCK,
+        allowed=False,
+        severity=Severity.HIGH,
+        policy_id="block-env-read",
+        reason=reason,
+    )
+
+    event = logger.log_decision(ToolRequest(tool_name="file_read", target=".env"), decision)
+    saved_event = json.loads(log_path.read_text().splitlines()[0])
+
+    assert event.reason == reason
+    assert saved_event["reason"] == reason
+    assert saved_event["rygnal_engine_version"] == package_version()
