@@ -1,5 +1,6 @@
 mod ast;
 mod criticality;
+mod destructive_rules;
 mod models;
 mod path_safety;
 mod subjective;
