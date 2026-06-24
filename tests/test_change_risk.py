@@ -101,6 +101,149 @@ def test_dependency_manifest_changes_are_high_risk(tmp_path: Path) -> None:
     assert any(reason.code == "dependency-file-change" for reason in file_risk.reasons)
 
 
+def test_dependency_manifest_changes_surface_governance_controls(
+    tmp_path: Path,
+) -> None:
+    repo = create_repo(tmp_path)
+    (repo / "pyproject.toml").write_text("[project]\nname = 'demo'\n", encoding="utf-8")
+
+    report = classify_repo_changes(repo)
+
+    governance_reason = next(
+        reason
+        for reason in report.report_reasons
+        if reason.code == "dependency-governance-required"
+    )
+    evidence = dict(governance_reason.evidence)
+
+    assert report.overall_risk_level == RiskLevel.HIGH
+    assert governance_reason.risk_level == RiskLevel.HIGH
+    assert evidence["workspace_count"] == 1
+    assert evidence["workspace_targets"] == (".:python:python_pyproject",)
+    assert evidence["manifest_count"] == 1
+    assert evidence["lockfile_count"] == 0
+    assert evidence["private_registry_config_count"] == 0
+    assert evidence["resolver_environment_required"] is True
+    assert evidence["resolver_environment_must_be_separate_from_host"] is True
+    assert evidence["resolver_environment_must_be_separate_from_runtime_workspace"] is True
+    assert evidence["shared_writable_cache_allowed"] is False
+    assert evidence["per_run_writable_cache_allowed"] is True
+    assert evidence["shared_readonly_cache_requires_hash_verification"] is True
+    assert evidence["transitive_dependency_delta_required"] is True
+    assert evidence["vulnerability_scan_required"] is True
+    assert evidence["network_resolution_requires_approval"] is True
+    assert evidence["private_registry_access_requires_approval"] is True
+    assert evidence["new_dependency_tree_requires_approval"] is True
+    assert evidence["audit_secret_redaction_required"] is True
+    assert evidence["has_possible_manifest_lock_desync"] is True
+
+
+def test_lockfile_only_change_surfaces_governance_controls(tmp_path: Path) -> None:
+    repo = create_repo(tmp_path)
+    (repo / "poetry.lock").write_text("# lockfile\n", encoding="utf-8")
+
+    report = classify_repo_changes(repo)
+
+    governance_reason = next(
+        reason
+        for reason in report.report_reasons
+        if reason.code == "dependency-governance-required"
+    )
+    evidence = dict(governance_reason.evidence)
+
+    assert governance_reason.risk_level == RiskLevel.HIGH
+    assert evidence["workspace_targets"] == (".:python:python_pyproject",)
+    assert evidence["manifest_count"] == 0
+    assert evidence["lockfile_count"] == 1
+    assert evidence["resolver_environment_required"] is True
+    assert evidence["vulnerability_scan_required"] is True
+    assert evidence["has_possible_manifest_lock_desync"] is True
+
+
+def test_monorepo_dependency_changes_surface_all_governance_targets(
+    tmp_path: Path,
+) -> None:
+    repo = create_repo(tmp_path)
+
+    api = repo / "api"
+    api.mkdir()
+    (api / "pyproject.toml").write_text(
+        "[project]\nname = 'api'\n",
+        encoding="utf-8",
+    )
+
+    ui = repo / "ui"
+    ui.mkdir()
+    (ui / "package.json").write_text(
+        '{"name": "ui"}\n',
+        encoding="utf-8",
+    )
+
+    report = classify_repo_changes(repo)
+
+    governance_reason = next(
+        reason
+        for reason in report.report_reasons
+        if reason.code == "dependency-governance-required"
+    )
+    evidence = dict(governance_reason.evidence)
+
+    assert governance_reason.risk_level == RiskLevel.HIGH
+    assert evidence["workspace_count"] == 2
+    assert evidence["workspace_targets"] == (
+        "api:python:python_pyproject",
+        "ui:node:node_npm",
+    )
+    assert evidence["manifest_count"] == 2
+    assert evidence["lockfile_count"] == 0
+    assert evidence["resolver_environment_required"] is True
+    assert evidence["vulnerability_scan_required"] is True
+    assert evidence["network_resolution_requires_approval"] is True
+
+
+def test_private_registry_config_change_surfaces_redaction_and_approval_controls(
+    tmp_path: Path,
+) -> None:
+    repo = create_repo(tmp_path)
+    (repo / ".npmrc").write_text(
+        "@scope:registry=https://registry.example.invalid/\n",
+        encoding="utf-8",
+    )
+
+    report = classify_repo_changes(repo)
+
+    governance_reason = next(
+        reason
+        for reason in report.report_reasons
+        if reason.code == "dependency-governance-required"
+    )
+    evidence = dict(governance_reason.evidence)
+
+    assert governance_reason.risk_level == RiskLevel.HIGH
+    assert evidence["workspace_targets"] == (".:node:node_npm",)
+    assert evidence["manifest_count"] == 0
+    assert evidence["lockfile_count"] == 0
+    assert evidence["private_registry_config_count"] == 1
+    assert evidence["resolver_environment_required"] is False
+    assert evidence["vulnerability_scan_required"] is False
+    assert evidence["network_resolution_requires_approval"] is False
+    assert evidence["private_registry_access_requires_approval"] is True
+    assert evidence["audit_secret_redaction_required"] is True
+
+
+def test_non_dependency_change_does_not_emit_dependency_governance_reason(
+    tmp_path: Path,
+) -> None:
+    repo = create_repo(tmp_path)
+    docs = repo / "docs"
+    docs.mkdir()
+    (docs / "usage.md").write_text("Usage\n", encoding="utf-8")
+
+    report = classify_repo_changes(repo)
+
+    assert all(reason.code != "dependency-governance-required" for reason in report.report_reasons)
+
+
 def test_ci_workflow_changes_are_high_risk(tmp_path: Path) -> None:
     repo = create_repo(tmp_path)
     workflow = repo / ".github" / "workflows"

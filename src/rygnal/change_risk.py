@@ -19,6 +19,11 @@ from functools import cached_property
 from pathlib import Path, PurePosixPath
 
 from rygnal.changed_files import ChangedFileKind, normalize_repo_relative_path
+from rygnal.dependency_governance import (
+    DependencyGovernancePlan,
+    WorkspaceDependencyTarget,
+    build_dependency_governance_plan,
+)
 from rygnal.diff_limits import (
     DEFAULT_DIFF_LIMIT_POLICY,
     DiffLimitPolicy,
@@ -525,7 +530,12 @@ def classify_patch_risk(
             policy=diff_limit_policy,
         ).reasons
     )
-    report_reasons = (*tuple(validation_reasons), *diff_limit_reasons)
+    dependency_governance_reasons = _dependency_governance_reasons_for_patch(patch_diff)
+    report_reasons = (
+        *tuple(validation_reasons),
+        *diff_limit_reasons,
+        *dependency_governance_reasons,
+    )
 
     return ChangeRiskReport(
         baseline_commit_sha=patch_diff.baseline_commit_sha,
@@ -533,6 +543,84 @@ def classify_patch_risk(
         files=files,
         report_reasons=report_reasons,
     )
+
+
+def _dependency_governance_reasons_for_patch(
+    patch_diff: PatchDiff,
+) -> tuple[ChangeRiskReason, ...]:
+    plan = build_dependency_governance_plan(file_diff.path for file_diff in patch_diff.files)
+    return _dependency_governance_reasons(plan)
+
+
+def _dependency_governance_reasons(
+    plan: DependencyGovernancePlan,
+) -> tuple[ChangeRiskReason, ...]:
+    if not plan.dependency_changes_detected:
+        return ()
+
+    return (
+        _reason(
+            "dependency-governance-required",
+            _dependency_governance_risk_level(plan),
+            (
+                "Dependency governance checks are required before applying "
+                "dependency-related changes."
+            ),
+            _dependency_governance_evidence(plan),
+        ),
+    )
+
+
+def _dependency_governance_risk_level(plan: DependencyGovernancePlan) -> RiskLevel:
+    approval_required = (
+        plan.vulnerability_scan_required
+        or plan.network_resolution_requires_approval
+        or plan.private_registry_access_requires_approval
+        or plan.new_dependency_tree_requires_approval
+    )
+    return RiskLevel.HIGH if approval_required else RiskLevel.MEDIUM
+
+
+def _dependency_governance_evidence(
+    plan: DependencyGovernancePlan,
+) -> dict[str, object]:
+    return {
+        "workspace_count": len(plan.workspaces),
+        "workspace_targets": tuple(
+            _dependency_workspace_target_id(workspace) for workspace in plan.workspaces
+        ),
+        "manifest_count": sum(len(workspace.manifests) for workspace in plan.workspaces),
+        "lockfile_count": sum(len(workspace.lockfiles) for workspace in plan.workspaces),
+        "private_registry_config_count": sum(
+            len(workspace.private_registry_configs) for workspace in plan.workspaces
+        ),
+        "resolver_environment_required": plan.resolver_environment_required,
+        "resolver_environment_must_be_separate_from_host": (
+            plan.resolver_environment_must_be_separate_from_host
+        ),
+        "resolver_environment_must_be_separate_from_runtime_workspace": (
+            plan.resolver_environment_must_be_separate_from_runtime_workspace
+        ),
+        "shared_writable_cache_allowed": plan.shared_writable_cache_allowed,
+        "per_run_writable_cache_allowed": plan.per_run_writable_cache_allowed,
+        "shared_readonly_cache_requires_hash_verification": (
+            plan.shared_readonly_cache_requires_hash_verification
+        ),
+        "transitive_dependency_delta_required": (plan.transitive_dependency_delta_required),
+        "vulnerability_scan_required": plan.vulnerability_scan_required,
+        "network_resolution_requires_approval": (plan.network_resolution_requires_approval),
+        "private_registry_access_requires_approval": (
+            plan.private_registry_access_requires_approval
+        ),
+        "new_dependency_tree_requires_approval": (plan.new_dependency_tree_requires_approval),
+        "audit_secret_redaction_required": plan.audit_secret_redaction_required,
+        "has_possible_manifest_lock_desync": plan.has_possible_manifest_lock_desync,
+    }
+
+
+def _dependency_workspace_target_id(workspace: WorkspaceDependencyTarget) -> str:
+    directory = workspace.directory or "."
+    return f"{directory}:{workspace.ecosystem.value}:{workspace.toolchain.value}"
 
 
 def _attach_criticality_shadow(
