@@ -18,6 +18,11 @@ from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path, PurePosixPath
 
+from rygnal.action_intent import (
+    ActionIntentReport,
+    ActionIntentSeverity,
+    classify_action_intent,
+)
 from rygnal.changed_files import ChangedFileKind, normalize_repo_relative_path
 from rygnal.dependency_governance import (
     DependencyGovernancePlan,
@@ -531,10 +536,15 @@ def classify_patch_risk(
         ).reasons
     )
     dependency_governance_reasons = _dependency_governance_reasons_for_patch(patch_diff)
+    action_intent_reasons = _action_intent_reasons_for_patch(
+        patch_diff,
+        added_lines_by_path=added_lines_by_path,
+    )
     report_reasons = (
         *tuple(validation_reasons),
         *diff_limit_reasons,
         *dependency_governance_reasons,
+        *action_intent_reasons,
     )
 
     return ChangeRiskReport(
@@ -621,6 +631,67 @@ def _dependency_governance_evidence(
 def _dependency_workspace_target_id(workspace: WorkspaceDependencyTarget) -> str:
     directory = workspace.directory or "."
     return f"{directory}:{workspace.ecosystem.value}:{workspace.toolchain.value}"
+
+
+def _action_intent_reasons_for_patch(
+    patch_diff: PatchDiff,
+    *,
+    added_lines_by_path: dict[str, tuple[str, ...]],
+) -> tuple[ChangeRiskReason, ...]:
+    report = classify_action_intent(
+        changed_paths=(file_diff.path for file_diff in patch_diff.files),
+        added_lines_by_path=added_lines_by_path,
+    )
+    return _action_intent_report_reasons(report)
+
+
+def _action_intent_report_reasons(
+    report: ActionIntentReport,
+) -> tuple[ChangeRiskReason, ...]:
+    reasons: list[ChangeRiskReason] = []
+
+    for intent in report.intents:
+        risk_level = _risk_level_for_action_intent_severity(intent.severity)
+        if RISK_LEVEL_ORDER[risk_level] < RISK_LEVEL_ORDER[RiskLevel.HIGH]:
+            continue
+
+        reasons.append(
+            _reason(
+                f"action-intent-{intent.code.value}",
+                risk_level,
+                intent.reason,
+                {
+                    "intent_code": intent.code.value,
+                    "confidence": intent.confidence,
+                    "recommended_action": intent.recommendation.value,
+                    "evidence_count": len(intent.evidence),
+                    "evidence": tuple(
+                        {
+                            "source": evidence.source.value,
+                            "signal": evidence.signal,
+                            "subject": evidence.subject,
+                            "detail": evidence.detail,
+                            "confidence_weight": evidence.confidence_weight,
+                        }
+                        for evidence in intent.evidence[:8]
+                    ),
+                },
+            )
+        )
+
+    return tuple(reasons)
+
+
+def _risk_level_for_action_intent_severity(
+    severity: ActionIntentSeverity,
+) -> RiskLevel:
+    if severity == ActionIntentSeverity.CRITICAL:
+        return RiskLevel.CRITICAL
+    if severity == ActionIntentSeverity.HIGH:
+        return RiskLevel.HIGH
+    if severity == ActionIntentSeverity.MEDIUM:
+        return RiskLevel.MEDIUM
+    return RiskLevel.LOW
 
 
 def _attach_criticality_shadow(
