@@ -1316,3 +1316,39 @@ def test_bubblewrap_backend_blocks_outside_workspace_writes(
     assert result.status == GuardedRunStatus.COMPLETED
     assert result.command_result is not None
     assert "outside-write-blocked" in result.command_result.stdout
+
+
+def test_guarded_run_audits_command_intent_before_execution_for_dirty_repo(
+    tmp_path: Path,
+) -> None:
+    repo = create_repo(tmp_path / "repo")
+    audit = AuditLogger(tmp_path / "audit.jsonl")
+    (repo / "README.md").write_text("# dirty\n", encoding="utf-8")
+
+    result = run_guarded(
+        unsafe_config(
+            repo,
+            ("rm", "-rf", "tmp"),
+            audit_logger=audit,
+        )
+    )
+
+    actions = audit_actions(audit)
+    intent_event = next(
+        event
+        for event in audit.read_events()
+        if event.action == "guarded_run.command_intent_classified"
+    )
+
+    assert result.status == GuardedRunStatus.BLOCKED
+    assert result.command_result is None
+    assert "guarded_run.command_intent_classified" in actions
+    assert "guarded_run.command_started" not in actions
+    assert actions.index("guarded_run.command_intent_classified") < actions.index(
+        "guarded_run.blocked"
+    )
+    assert "filesystem_destructive" in intent_event.metadata["intent_codes"]
+    assert intent_event.metadata["max_severity"] == "critical"
+    assert intent_event.metadata["recommended_action"] == "block"
+    assert intent_event.metadata["intents"]
+    assert audit.verify_integrity()
