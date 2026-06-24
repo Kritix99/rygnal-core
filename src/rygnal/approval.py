@@ -12,6 +12,7 @@ from rygnal.approval_authorization import (
     ApprovalAuthorizationResult,
     ApprovalReviewerPermission,
 )
+from rygnal.approval_receipt import attach_approval_receipt
 from rygnal.models import (
     ApprovalDecision,
     ApprovalRequest,
@@ -95,9 +96,14 @@ class ApprovalWorkflow:
             approval_decision=approval_decision,
         )
 
-        return approval_request, _apply_authorization_result(
+        authorized_decision = _apply_authorization_result(
             approval_decision=approval_decision,
             authorization_result=authorization_result,
+        )
+
+        return approval_request, attach_approval_receipt(
+            approval_request,
+            authorized_decision,
         )
 
 

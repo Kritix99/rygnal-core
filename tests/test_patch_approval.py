@@ -5,6 +5,12 @@ from pathlib import Path
 
 import pytest
 
+from rygnal.approval_receipt import (
+    APPROVAL_RECEIPT_HASH_KEY,
+    APPROVAL_RECEIPT_SCHEMA_VERSION_KEY,
+    ReceiptStatus,
+    verify_approval_receipt,
+)
 from rygnal.audit_logger import AuditLogger
 from rygnal.change_risk import ChangeRiskReason, classify_patch_risk
 from rygnal.patch_approval import (
@@ -229,6 +235,8 @@ def test_approved_decision_carries_request_baseline_binding(tmp_path: Path) -> N
 
     assert approved.metadata["patch_sha256"] == patch.patch_sha256
     assert approved.metadata["baseline_commit_sha"] == patch.baseline_commit_sha
+    assert approved.metadata[APPROVAL_RECEIPT_HASH_KEY]
+    assert verify_approval_receipt(request, approved) == ReceiptStatus.VALID
 
 
 def test_stale_patch_approval_is_rejected(tmp_path: Path) -> None:
@@ -307,3 +315,76 @@ def test_malformed_pending_approval_decision_is_rejected_as_invalid_transition(
 
     with pytest.raises(PatchApprovalError, match="Invalid approval state transition"):
         assert_patch_approval_granted(request, malformed_decision, patch)
+
+
+def test_patch_approval_receipt_tampering_is_rejected(tmp_path: Path) -> None:
+    guarded, _trusted = clone_fixture(tmp_path)
+    src = guarded / "src"
+    src.mkdir()
+    (src / "app.py").write_text("print('hello')\n", encoding="utf-8")
+
+    patch = generate_patch_diff(guarded, baseline_sha(guarded))
+    request = create_patch_approval_request(patch, requested_by="test_user")
+    approved = approve_patch_request(
+        request,
+        decided_by="reviewer",
+        patch_sha256=patch.patch_sha256,
+    )
+
+    tampered = approved.model_copy(update={"reason": "Tampered approval reason."})
+
+    assert verify_approval_receipt(request, approved) == ReceiptStatus.VALID
+    assert verify_approval_receipt(request, tampered) == ReceiptStatus.TAMPERED
+
+    with pytest.raises(PatchApprovalError, match="receipt hash"):
+        assert_patch_approval_granted(request, tampered, patch)
+
+
+def test_rejected_patch_decision_does_not_get_receipt_hash(tmp_path: Path) -> None:
+    guarded, _trusted = clone_fixture(tmp_path)
+    src = guarded / "src"
+    src.mkdir()
+    (src / "app.py").write_text("print('hello')\n", encoding="utf-8")
+
+    patch = generate_patch_diff(guarded, baseline_sha(guarded))
+    request = create_patch_approval_request(patch, requested_by="test_user")
+    rejected = reject_patch_request(
+        request,
+        decided_by="reviewer",
+        patch_sha256=patch.patch_sha256,
+    )
+
+    assert rejected.approved is False
+    assert APPROVAL_RECEIPT_HASH_KEY not in rejected.metadata
+
+
+def test_approved_patch_decision_without_receipt_is_rejected(tmp_path: Path) -> None:
+    guarded, _trusted = clone_fixture(tmp_path)
+    src = guarded / "src"
+    src.mkdir()
+    (src / "app.py").write_text("print('hello')\n", encoding="utf-8")
+
+    patch = generate_patch_diff(guarded, baseline_sha(guarded))
+    request = create_patch_approval_request(patch, requested_by="test_user")
+    approved = approve_patch_request(
+        request,
+        decided_by="reviewer",
+        patch_sha256=patch.patch_sha256,
+    )
+
+    legacy_metadata = {
+        key: value
+        for key, value in approved.metadata.items()
+        if key
+        not in {
+            APPROVAL_RECEIPT_HASH_KEY,
+            APPROVAL_RECEIPT_SCHEMA_VERSION_KEY,
+        }
+    }
+    legacy_approved = approved.model_copy(update={"metadata": legacy_metadata})
+
+    assert legacy_approved.approved is True
+    assert verify_approval_receipt(request, legacy_approved) == ReceiptStatus.MISSING
+
+    with pytest.raises(PatchApprovalError, match="receipt hash"):
+        assert_patch_approval_granted(request, legacy_approved, patch)

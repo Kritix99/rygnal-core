@@ -7,6 +7,11 @@ from datetime import UTC, datetime
 from functools import cached_property
 from typing import Any
 
+from rygnal.approval_receipt import (
+    ApprovalReceiptError,
+    assert_approval_receipt_valid,
+    attach_approval_receipt,
+)
 from rygnal.approval_state import ApprovalStateMachine
 from rygnal.audit_logger import AuditLogger
 from rygnal.change_gate import GuardedChangeGateDecision, evaluate_guarded_change_gate
@@ -171,7 +176,7 @@ def approve_patch_request(
 ) -> ApprovalDecision:
     _validate_decision_context(approval_request, patch_sha256=patch_sha256)
 
-    return ApprovalDecision(
+    decision = ApprovalDecision(
         approval_id=approval_request.approval_id,
         status=ApprovalStatus.APPROVED,
         approved=True,
@@ -180,6 +185,8 @@ def approve_patch_request(
         reason=str(redact_sensitive_value(reason)),
         metadata=_decision_binding_metadata(approval_request),
     )
+
+    return attach_approval_receipt(approval_request, decision)
 
 
 def reject_patch_request(
@@ -243,6 +250,11 @@ def assert_patch_approval_granted(
 
     if approval_decision.status != ApprovalStatus.APPROVED or not approval_decision.approved:
         raise PatchApprovalError("Patch approval was not granted.")
+
+    try:
+        assert_approval_receipt_valid(approval_request, approval_decision)
+    except ApprovalReceiptError as exc:
+        raise PatchApprovalError(str(exc)) from exc
 
 
 def write_patch_approval_request_audit_event(
