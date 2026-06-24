@@ -173,6 +173,52 @@ def test_engine_api_approval_required_summary_includes_risk_block(
     assert not (repo / "pyproject.toml").exists()
 
 
+def test_engine_api_approval_required_wins_over_agent_failure(tmp_path: Path) -> None:
+    repo = _create_repo(tmp_path / "trusted")
+    request = {
+        "protocol_version": "rygnal.engine.v1",
+        "action": "guarded_run.start",
+        "request_id": "approval-required-agent-failure-test",
+        "trusted_repo_path": repo.as_posix(),
+        "command": [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "from pathlib import Path; "
+                "Path('pyproject.toml').write_text("
+                "'[project]\\nname = \\\"changed\\\"\\n'"
+                "); "
+                "sys.exit(7)"
+            ),
+        ],
+        "unsafe_local_requested": True,
+        "run_root": (tmp_path / "runs").as_posix(),
+    }
+
+    completed = _run_engine_api(json.dumps(request) + "\n")
+
+    assert completed.returncode == 0
+    assert completed.stderr == ""
+
+    events = _parse_ndjson(completed.stdout)
+    event_names = [event["event"] for event in events]
+    approval_event = next(event for event in events if event["event"] == "approval.required")
+    final = events[-1]
+
+    assert event_names.index("approval.required") < event_names.index("run.completed")
+    assert approval_event["status"] == "approval_required"
+
+    assert final["event"] == "run.completed"
+    assert final["ok"] is True
+    assert final["status"] == "approval_required"
+    assert final["data"]["status"] == "approval_required"
+    assert final["data"]["command"]["exit_code"] == 7
+    assert final["data"]["approval"]["required"] is True
+    assert final["data"]["risk"]["present"] is True
+    assert "dependency-file-change" in final["data"]["risk"]["reasons"]
+
+
 def test_engine_api_treats_agent_failure_as_successful_engine_run(tmp_path: Path) -> None:
     repo = _create_repo(tmp_path / "trusted")
     request = {

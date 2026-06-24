@@ -1,7 +1,9 @@
+import sqlite3
+
 from fastapi.testclient import TestClient
 
 from rygnal.api import create_app
-from rygnal.approval_queue import InMemoryApprovalQueue
+from rygnal.approval_queue import InMemoryApprovalQueue, SQLiteApprovalQueue
 from rygnal.audit_logger import AuditLogger
 from rygnal.models import ApprovalRequest, Severity
 
@@ -256,3 +258,74 @@ def test_local_api_approval_queue_denied_self_approval_does_not_write_audit_even
 
     assert response.status_code == 403
     assert audit_logger.read_events() == []
+
+
+def test_sqlite_approval_queue_persists_pending_requests_across_restart(tmp_path):
+    db_path = tmp_path / "approval_queue.db"
+    first_client = TestClient(create_app(approval_queue=SQLiteApprovalQueue(db_path)))
+
+    create_response = first_client.post(
+        "/v1/approvals", json=make_request().model_dump(mode="json")
+    )
+    assert create_response.status_code == 201
+    approval_id = create_response.json()["approval"]["approval_id"]
+
+    second_client = TestClient(create_app(approval_queue=SQLiteApprovalQueue(db_path)))
+    fetched = second_client.get(f"/v1/approvals/{approval_id}")
+    listed = second_client.get("/v1/approvals")
+
+    assert fetched.status_code == 200
+    assert fetched.json()["approval"]["approval_id"] == approval_id
+    assert fetched.json()["approval"]["status"] == "pending"
+    assert listed.json()["returned_count"] == 1
+    assert listed.json()["approvals"][0]["approval_id"] == approval_id
+
+
+def test_create_app_approval_queue_db_path_persists_decisions_across_restart(tmp_path):
+    db_path = tmp_path / "approval_queue.db"
+    first_client = TestClient(create_app(approval_queue_db_path=db_path))
+
+    create_response = first_client.post(
+        "/v1/approvals", json=make_request().model_dump(mode="json")
+    )
+    assert create_response.status_code == 201
+    approval_id = create_response.json()["approval"]["approval_id"]
+
+    approve_response = first_client.post(
+        f"/v1/approvals/{approval_id}/approve",
+        json={
+            "decided_by": "human_reviewer",
+            "reason": "Looks safe after review.",
+        },
+    )
+    assert approve_response.status_code == 200
+
+    second_client = TestClient(create_app(approval_queue_db_path=db_path))
+    fetched = second_client.get(f"/v1/approvals/{approval_id}")
+    second_decision = second_client.post(
+        f"/v1/approvals/{approval_id}/reject",
+        json={
+            "decided_by": "another_reviewer",
+            "reason": "Changed mind after restart.",
+        },
+    )
+
+    assert fetched.status_code == 200
+    assert fetched.json()["approval"]["status"] == "approved"
+    assert fetched.json()["approval"]["approval_decision"]["status"] == "approved"
+    assert second_decision.status_code == 409
+    assert second_decision.json()["error"]["code"] == "approval_state_conflict"
+
+
+def test_sqlite_approval_queue_persists_redacted_request_payload(tmp_path):
+    db_path = tmp_path / "approval_queue.db"
+    queue = SQLiteApprovalQueue(db_path)
+    queue.submit(make_request())
+
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute("SELECT request_json FROM approval_queue").fetchone()
+
+    assert row is not None
+    request_json = row[0]
+    assert "sk-live-super-secret-token" not in request_json
+    assert "[REDACTED]" in request_json

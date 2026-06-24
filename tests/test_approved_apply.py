@@ -7,6 +7,7 @@ import pytest
 import rygnal.approved_apply as approved_apply_module
 from rygnal.approved_apply import ApprovedPatchApplyError, apply_approved_patch
 from rygnal.audit_logger import AuditLogger
+from rygnal.audit_storage import SQLiteAuditStore
 from rygnal.models import (
     ApprovalDecision,
     ApprovalRequest,
@@ -97,6 +98,29 @@ def test_applies_approved_source_patch_to_trusted_repo(tmp_path: Path) -> None:
     assert events[0].decision == "allow"
     assert events[0].policy_id == "guarded-workspace-approved-patch-apply"
     assert logger.verify_integrity() is True
+
+
+def test_approved_apply_requires_audit_logger_for_durable_replay_protection(
+    tmp_path: Path,
+) -> None:
+    guarded, trusted = clone_fixture(tmp_path)
+    patch = make_source_patch(guarded)
+    request = create_patch_approval_request(patch, requested_by="test_user")
+    decision = approve_patch_request(
+        request,
+        decided_by="reviewer",
+        patch_sha256=patch.patch_sha256,
+    )
+
+    with pytest.raises(ApprovedPatchApplyError, match="audit logger"):
+        apply_approved_patch(
+            patch,
+            trusted,
+            approval_request=request,
+            approval_decision=decision,
+        )
+
+    assert not (trusted / "src" / "app.py").exists()
 
 
 def test_rejected_approval_does_not_apply_patch(tmp_path: Path) -> None:
@@ -309,11 +333,14 @@ def test_reused_approval_is_rejected_before_second_apply(tmp_path: Path) -> None
         patch_sha256=patch.patch_sha256,
     )
 
+    logger = AuditLogger(tmp_path / "audit.jsonl")
+
     first_result = apply_approved_patch(
         patch,
         trusted,
         approval_request=request,
         approval_decision=decision,
+        logger=logger,
     )
 
     assert first_result.applied is True
@@ -324,6 +351,48 @@ def test_reused_approval_is_rejected_before_second_apply(tmp_path: Path) -> None
             second_trusted,
             approval_request=request,
             approval_decision=decision,
+            logger=logger,
+        )
+
+    assert not (second_trusted / "src" / "app.py").exists()
+
+
+def test_reused_approval_is_rejected_from_sqlite_audit_storage_after_restart(
+    tmp_path: Path,
+) -> None:
+    guarded, trusted = clone_fixture(tmp_path)
+    second_trusted = tmp_path / "second_trusted"
+    shutil.copytree(trusted, second_trusted)
+
+    patch = make_source_patch(guarded)
+    request = create_patch_approval_request(patch, requested_by="test_user")
+    decision = approve_patch_request(
+        request,
+        decided_by="reviewer",
+        patch_sha256=patch.patch_sha256,
+    )
+    store = SQLiteAuditStore(tmp_path / "audit.db")
+    first_logger = AuditLogger(tmp_path / "first-audit.jsonl", storage_backend=store)
+
+    first_result = apply_approved_patch(
+        patch,
+        trusted,
+        approval_request=request,
+        approval_decision=decision,
+        logger=first_logger,
+    )
+    assert first_result.applied is True
+
+    approved_apply_module._USED_PATCH_APPROVALS.clear()
+    second_logger = AuditLogger(tmp_path / "second-audit.jsonl", storage_backend=store)
+
+    with pytest.raises(ApprovedPatchApplyError, match="already been used|reused"):
+        apply_approved_patch(
+            patch,
+            second_trusted,
+            approval_request=request,
+            approval_decision=decision,
+            logger=second_logger,
         )
 
     assert not (second_trusted / "src" / "app.py").exists()

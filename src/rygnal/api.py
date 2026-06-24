@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -18,6 +19,7 @@ from rygnal.approval_queue import (
     ApprovalNotFoundError,
     ApprovalStateConflictError,
     InMemoryApprovalQueue,
+    SQLiteApprovalQueue,
 )
 from rygnal.audit_logger import AuditLogger
 from rygnal.audit_query import AuditQuery, AuditQueryError, query_audit_events
@@ -124,6 +126,7 @@ def create_app(
     risk_engine: RiskEngine | None = None,
     audit_logger: AuditLogger | None = None,
     approval_queue: InMemoryApprovalQueue | None = None,
+    approval_queue_db_path: str | Path | None = None,
 ) -> FastAPI:
     """Create the local Rygnal FastAPI app."""
     app = FastAPI(
@@ -135,7 +138,12 @@ def create_app(
     active_policy_engine = policy_engine or load_default_policy_engine()
     active_risk_engine = risk_engine or RiskEngine()
     active_audit_logger = audit_logger
-    active_approval_queue = approval_queue or InMemoryApprovalQueue()
+    if approval_queue is not None:
+        active_approval_queue = approval_queue
+    elif approval_queue_db_path is not None:
+        active_approval_queue = SQLiteApprovalQueue(approval_queue_db_path)
+    else:
+        active_approval_queue = InMemoryApprovalQueue()
 
     @app.middleware("http")
     async def attach_request_id(request: Request, call_next):  # type: ignore[no-untyped-def]

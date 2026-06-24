@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import sqlite3
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from rygnal.approval_authorization import ApprovalAuthorizationEngine
@@ -70,7 +73,7 @@ class InMemoryApprovalQueue:
 
     def submit(self, approval_request: ApprovalRequest) -> ApprovalRequest:
         """Add an approval request to the queue."""
-        self._items[approval_request.approval_id] = QueuedApproval(request=approval_request)
+        self._store_item(QueuedApproval(request=approval_request))
         return approval_request
 
     def list(self, *, status: ApprovalStatus | None = None) -> tuple[QueuedApproval, ...]:
@@ -145,8 +148,116 @@ class InMemoryApprovalQueue:
             raise ApprovalDeniedError(authorization.reason)
 
         updated = QueuedApproval(request=item.request, status=status, decision=decision)
-        self._items[approval_id] = updated
+        self._store_item(updated)
         return updated
+
+    def _store_item(self, item: QueuedApproval) -> None:
+        self._items[item.approval_id] = item
+
+
+class SQLiteApprovalQueue(InMemoryApprovalQueue):
+    """SQLite-backed approval queue with the same API as the in-memory queue."""
+
+    def __init__(
+        self,
+        db_path: str | Path = "logs/approval_queue.db",
+        *,
+        authorization_engine: ApprovalAuthorizationEngine | None = None,
+    ) -> None:
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        super().__init__(authorization_engine=authorization_engine)
+        self._initialize()
+        self._load_items()
+
+    def _store_item(self, item: QueuedApproval) -> None:
+        self._persist_item(item)
+        self._items[item.approval_id] = item
+
+    def _initialize(self) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS approval_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    approval_id TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    decision_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_approval_queue_status ON approval_queue(status)"
+            )
+
+    def _load_items(self) -> None:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT status, request_json, decision_json
+                FROM approval_queue
+                ORDER BY id ASC
+                """
+            ).fetchall()
+
+        self._items = {}
+        for row in rows:
+            request = ApprovalRequest(**json.loads(row["request_json"]))
+            decision_json = row["decision_json"]
+            decision = (
+                ApprovalDecision(**json.loads(decision_json)) if decision_json is not None else None
+            )
+            item = QueuedApproval(
+                request=request,
+                status=ApprovalStatus(row["status"]),
+                decision=decision,
+            )
+            self._items[item.approval_id] = item
+
+    def _persist_item(self, item: QueuedApproval) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO approval_queue (
+                    approval_id,
+                    status,
+                    request_json,
+                    decision_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(approval_id) DO UPDATE SET
+                    status = excluded.status,
+                    request_json = excluded.request_json,
+                    decision_json = excluded.decision_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    item.approval_id,
+                    item.status.value,
+                    _redacted_model_json(item.request),
+                    _redacted_model_json(item.decision) if item.decision is not None else None,
+                    item.request.created_at,
+                    utc_now_iso(),
+                ),
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.db_path)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+
+def _redacted_model_json(model: ApprovalRequest | ApprovalDecision) -> str:
+    payload = redact_sensitive_value(model.model_dump(mode="json"))
+    if not isinstance(payload, dict):
+        raise ApprovalQueueError("Approval queue persistence redaction returned invalid data.")
+
+    return json.dumps(payload, sort_keys=True)
 
 
 __all__ = [
@@ -156,4 +267,5 @@ __all__ = [
     "ApprovalStateConflictError",
     "InMemoryApprovalQueue",
     "QueuedApproval",
+    "SQLiteApprovalQueue",
 ]

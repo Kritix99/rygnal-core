@@ -132,6 +132,85 @@ def bwrap_probe_available() -> bool:
     return result.returncode == 0
 
 
+def test_macos_without_verified_backend_blocks_as_guarded_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = create_repo(tmp_path / "repo")
+    audit = AuditLogger(tmp_path / "audit.jsonl")
+
+    def macos_capabilities(*, env=None):
+        unsafe_requested = (env or {}).get("RYGNAL_UNSAFE_LOCAL") == "1"
+        return HostBackendCapabilities(
+            os_name="darwin",
+            configured_container_backend=None,
+            verified_rootless_container_available=False,
+            unsafe_local_requested=unsafe_requested,
+        )
+
+    monkeypatch.setattr(
+        guarded_runner,
+        "detect_host_backend_capabilities",
+        macos_capabilities,
+    )
+
+    result = run_guarded(
+        GuardedRunConfig(
+            trusted_repo_path=repo,
+            command=py_command(
+                "from pathlib import Path; Path('should_not_run.txt').write_text('should not run')"
+            ),
+            rygnal_run_root=tmp_path / "runs",
+            trace_id="trace_macos_blocked",
+            audit_logger=audit,
+        )
+    )
+
+    assert result.status == GuardedRunStatus.BLOCKED
+    assert result.workspace_path is None
+    assert result.command_result is None
+    assert result.patch_diff is None
+    assert result.change_risk_report is None
+    assert result.blocked_reason is not None
+    assert "macOS is recognized" in result.blocked_reason
+    assert "Seatbelt containment is planned" in result.blocked_reason
+    assert "verified rootless container backend" in result.blocked_reason
+    assert "supported Linux backend" in result.blocked_reason
+    assert not (repo / "should_not_run.txt").exists()
+    assert "guarded_run.backend_blocked" in audit_actions(audit)
+    assert audit.verify_integrity()
+
+
+def test_macos_explicit_unsafe_local_escape_hatch_still_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = create_repo(tmp_path / "repo")
+
+    def macos_capabilities(*, env=None):
+        unsafe_requested = (env or {}).get("RYGNAL_UNSAFE_LOCAL") == "1"
+        return HostBackendCapabilities(
+            os_name="darwin",
+            configured_container_backend=None,
+            verified_rootless_container_available=False,
+            unsafe_local_requested=unsafe_requested,
+        )
+
+    monkeypatch.setattr(
+        guarded_runner,
+        "detect_host_backend_capabilities",
+        macos_capabilities,
+    )
+
+    result = run_guarded(unsafe_config(repo, py_command("print('ok')")))
+
+    assert result.status == GuardedRunStatus.COMPLETED
+    assert result.backend_name == "unsafe_local"
+    assert result.backend_safe_by_default is False
+    assert result.containment_verified is False
+    assert UNSAFE_LOCAL_WARNING in result.warnings
+
+
 def test_guarded_run_concurrency_lock_fails_closed(tmp_path: Path) -> None:
     repo = create_repo(tmp_path / "repo")
     audit_path = tmp_path / "audit.jsonl"
@@ -431,6 +510,86 @@ def test_unsupported_selected_backend_blocks(
     assert "not implemented" in result.blocked_reason
 
 
+@pytest.mark.parametrize(
+    ("expected_backend_name", "capability_kwargs"),
+    (
+        (
+            "linux_bubblewrap_helper",
+            {
+                "os_name": "linux",
+                "bwrap_namespace_probe_passed": False,
+                "signed_sandbox_helper_probe_passed": True,
+                "has_systemd_run": False,
+                "verified_rootless_container_available": False,
+            },
+        ),
+        (
+            "linux_systemd_user",
+            {
+                "os_name": "linux",
+                "bwrap_namespace_probe_passed": False,
+                "signed_sandbox_helper_probe_passed": False,
+                "has_systemd_run": True,
+                "verified_rootless_container_available": False,
+            },
+        ),
+        (
+            "configured_container",
+            {
+                "os_name": "linux",
+                "bwrap_namespace_probe_passed": False,
+                "signed_sandbox_helper_probe_passed": False,
+                "has_systemd_run": False,
+                "configured_container_backend": "podman",
+                "verified_rootless_container_available": True,
+            },
+        ),
+    ),
+)
+def test_unimplemented_selected_safe_backends_block_before_command_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    expected_backend_name: str,
+    capability_kwargs: dict[str, object],
+) -> None:
+    repo = create_repo(tmp_path / "repo")
+    audit = AuditLogger(tmp_path / "audit.jsonl")
+
+    def selected_capabilities(*, env=None):
+        unsafe_requested = (env or {}).get("RYGNAL_UNSAFE_LOCAL") == "1"
+        return HostBackendCapabilities(
+            unsafe_local_requested=unsafe_requested,
+            **capability_kwargs,
+        )
+
+    monkeypatch.setattr(
+        guarded_runner,
+        "detect_host_backend_capabilities",
+        selected_capabilities,
+    )
+
+    result = run_guarded(
+        GuardedRunConfig(
+            trusted_repo_path=repo,
+            command=py_command(
+                "from pathlib import Path; Path('should_not_run.txt').write_text('ran')"
+            ),
+            rygnal_run_root=tmp_path / "runs",
+            trace_id=f"trace_{expected_backend_name}",
+            audit_logger=audit,
+        )
+    )
+
+    assert result.status == GuardedRunStatus.BLOCKED
+    assert result.backend_name == expected_backend_name
+    assert result.command_result is None
+    assert result.workspace_path is None
+    assert "not implemented" in (result.blocked_reason or "")
+    assert not (repo / "should_not_run.txt").exists()
+    assert "guarded_run.backend_blocked" in audit_actions(audit)
+    assert audit.verify_integrity()
+
+
 def test_unsafe_local_requires_explicit_opt_in(tmp_path: Path) -> None:
     repo = create_repo(tmp_path / "repo")
 
@@ -683,6 +842,32 @@ def test_blocked_run_is_audited(tmp_path: Path) -> None:
     assert result.status == GuardedRunStatus.BLOCKED
     assert "guarded_run.blocked" in actions
     assert audit.verify_integrity()
+
+
+def test_bubblewrap_workspace_bind_uses_workspace_mount_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rygnal.guarded_runner as guarded_runner_module
+
+    monkeypatch.setattr(
+        guarded_runner_module.shutil,
+        "which",
+        lambda name: "/usr/bin/bwrap" if name == "bwrap" else None,
+    )
+
+    command = guarded_runner_module._build_bubblewrap_command(
+        ("python", "-c", "print('ok')"),
+        tmp_path,
+    )
+
+    writable_binds = [
+        tuple(command[index + 1 : index + 3])
+        for index, item in enumerate(command)
+        if item == "--bind"
+    ]
+
+    assert writable_binds == [(tmp_path.resolve().as_posix(), "/workspace")]
 
 
 @pytest.mark.skipif(

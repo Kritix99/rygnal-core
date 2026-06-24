@@ -43,6 +43,8 @@ class ApprovedPatchApplyOutcome(StrEnum):
     APPLIED = "applied"
 
 
+APPROVED_PATCH_APPLY_POLICY_ID = "guarded-workspace-approved-patch-apply"
+
 _USED_PATCH_APPROVALS: set[tuple[str, str, str]] = set()
 _USED_PATCH_APPROVALS_LOCK = Lock()
 
@@ -188,7 +190,7 @@ def write_approved_patch_apply_audit_event(
         allowed=True,
         severity=_coerce_severity(approval_request.severity),
         reason="Approved guarded workspace patch applied to trusted repository.",
-        policy_id="guarded-workspace-approved-patch-apply",
+        policy_id=APPROVED_PATCH_APPLY_POLICY_ID,
     )
 
     return logger.log_decision(request, decision, metadata=result.audit_summary)
@@ -222,21 +224,59 @@ def _ensure_approval_not_previously_applied(
     key: tuple[str, str, str],
 ) -> None:
     if logger is None:
-        return
+        raise ApprovedPatchApplyError(
+            "Approved patch apply requires an audit logger for durable replay protection."
+        )
 
-    approval_id, patch_sha256, baseline_commit_sha = key
-
-    for event in logger.read_events():
-        if event.policy_id != "guarded-workspace-approved-patch-apply":
-            continue
-
-        metadata = event.metadata
-        if (
-            metadata.get("approval_id") == approval_id
-            and metadata.get("patch_sha256") == patch_sha256
-            and metadata.get("baseline_commit_sha") == baseline_commit_sha
-        ):
+    for event in _read_approved_patch_apply_audit_events(logger):
+        if _approved_patch_apply_event_matches_key(event, key):
             raise ApprovedPatchApplyError("Approval has already been used for this guarded patch.")
+
+
+def _read_approved_patch_apply_audit_events(logger: AuditLogger) -> tuple[Any, ...]:
+    storage_backend = getattr(logger, "storage_backend", None)
+
+    if storage_backend is not None:
+        try:
+            return _read_approved_patch_apply_events_from_storage(storage_backend)
+        except ApprovedPatchApplyError:
+            raise
+        except Exception as exc:
+            raise ApprovedPatchApplyError(
+                "Could not verify durable approval replay history."
+            ) from exc
+
+    return tuple(
+        event for event in logger.read_events() if event.policy_id == APPROVED_PATCH_APPLY_POLICY_ID
+    )
+
+
+def _read_approved_patch_apply_events_from_storage(
+    storage_backend: Any,
+) -> tuple[Any, ...]:
+    read_events = getattr(storage_backend, "read_events", None)
+    if not callable(read_events):
+        raise ApprovedPatchApplyError(
+            "Audit storage backend cannot read durable approval replay history."
+        )
+
+    return tuple(
+        event for event in read_events() if event.policy_id == APPROVED_PATCH_APPLY_POLICY_ID
+    )
+
+
+def _approved_patch_apply_event_matches_key(
+    event: Any,
+    key: tuple[str, str, str],
+) -> bool:
+    approval_id, patch_sha256, baseline_commit_sha = key
+    metadata = getattr(event, "metadata", {}) or {}
+
+    return (
+        metadata.get("approval_id") == approval_id
+        and metadata.get("patch_sha256") == patch_sha256
+        and metadata.get("baseline_commit_sha") == baseline_commit_sha
+    )
 
 
 def _validate_request_for_apply(approval_request: ApprovalRequest) -> None:
