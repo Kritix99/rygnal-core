@@ -236,20 +236,21 @@ def _build_guarded_config(request: EngineRequest) -> GuardedRunConfig:
 
 
 def _engine_status_for_guarded_result(result: GuardedRunResult) -> EngineStatus:
-    if result.command_result is not None:
-        if result.command_result.timed_out:
-            return EngineStatus.TIMED_OUT
-        if result.command_result.exit_code not in (None, 0):
-            return EngineStatus.COMMAND_FAILED
+    if result.command_result is not None and result.command_result.timed_out:
+        return EngineStatus.TIMED_OUT
+
+    # Approval-required patches must not be hidden by a non-zero agent exit.
+    if result.status == GuardedRunStatus.APPROVAL_REQUIRED:
+        return EngineStatus.APPROVAL_REQUIRED
+
+    if result.command_result is not None and result.command_result.exit_code not in (None, 0):
+        return EngineStatus.COMMAND_FAILED
 
     if result.status == GuardedRunStatus.COMPLETED:
         return EngineStatus.COMPLETED
 
     if result.status == GuardedRunStatus.TIMED_OUT:
         return EngineStatus.TIMED_OUT
-
-    if result.status == GuardedRunStatus.APPROVAL_REQUIRED:
-        return EngineStatus.APPROVAL_REQUIRED
 
     if result.status == GuardedRunStatus.BLOCKED:
         return EngineStatus.BLOCKED
