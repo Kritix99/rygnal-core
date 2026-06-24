@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from rygnal.change_risk import FileRiskClassification
 from rygnal.changed_files import ChangedFileKind
 from rygnal.patch_diff import PatchFileDiff
 from rygnal.risk_engine import RiskLevel
@@ -16,6 +17,7 @@ from rygnal.subjective_risk import (
     DEFAULT_UNKNOWN_OWNERSHIP_RATIO,
     SubjectiveRiskCollectionError,
     SubjectiveRiskFileAssessment,
+    collect_subjective_patch_reasons,
     collect_subjective_risk_input,
     subjective_assessment_to_reason,
 )
@@ -163,6 +165,52 @@ def test_collect_subjective_risk_input_rejects_missing_modified_file(tmp_path: P
             system_risk=2.0,
             now=_commit_timestamp(repo, baseline),
         )
+
+
+def test_collect_subjective_patch_reasons_uses_normalized_path_for_low_risk_skip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _init_repo(tmp_path)
+    source = repo / "src" / "service.py"
+    source.parent.mkdir()
+    source.write_text("def service():\n    return 1\n", encoding="utf-8")
+    baseline = _commit_all(repo, "initial service")
+
+    source.write_text("def service():\n    return 2\n", encoding="utf-8")
+
+    def fail_evaluate_subjective_risk(_risk_input: object) -> object:
+        raise AssertionError("subjective evaluation should be skipped for normalized low-risk file")
+
+    monkeypatch.setattr(
+        "rygnal.subjective_risk.evaluate_subjective_risk",
+        fail_evaluate_subjective_risk,
+    )
+
+    reasons = collect_subjective_patch_reasons(
+        workspace_path=repo,
+        baseline_commit_sha=baseline,
+        files=(
+            PatchFileDiff(
+                path="./src/service.py",
+                kind=ChangedFileKind.MODIFIED,
+                additions=1,
+                deletions=1,
+            ),
+        ),
+        system_risk_by_path={"src/service.py": 9.0},
+        file_risk_by_path={
+            "src/service.py": FileRiskClassification(
+                path="src/service.py",
+                kind=ChangedFileKind.MODIFIED,
+                risk_level=RiskLevel.LOW,
+                reasons=(),
+            )
+        },
+        now=_commit_timestamp(repo, baseline),
+    )
+
+    assert reasons == ()
 
 
 def test_subjective_assessment_to_reason_returns_none_for_allow() -> None:

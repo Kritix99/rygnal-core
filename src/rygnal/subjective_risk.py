@@ -289,7 +289,8 @@ def collect_subjective_patch_reasons(
     reasons: list[ChangeRiskReason] = []
 
     for file_diff in files:
-        system_risk = system_risk_by_path.get(file_diff.path, 0.0)
+        normalized_path = normalize_repo_relative_path(file_diff.path)
+        system_risk = system_risk_by_path.get(normalized_path, 0.0)
 
         risk_input = collect_subjective_risk_input(
             workspace_path=workspace_path,
@@ -304,7 +305,7 @@ def collect_subjective_patch_reasons(
             reasons.append(locked_file_change_to_reason(risk_input.file_path))
             continue
 
-        file_risk = (file_risk_by_path or {}).get(file_diff.path)
+        file_risk = (file_risk_by_path or {}).get(normalized_path)
         if file_risk is not None and file_risk.risk_level == RiskLevel.LOW:
             continue
 
