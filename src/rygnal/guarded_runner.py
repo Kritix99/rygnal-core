@@ -58,6 +58,7 @@ from rygnal.subjective_risk import (
 )
 from rygnal.untracked_files import UntrackedFilePolicy
 from rygnal.workspace_cleanup import CleanupResult, CleanupStatus, destroy_worktree
+from rygnal.workspace_mounts import MountContract, MountKind, WorkspaceMountPlan
 
 UNSAFE_LOCAL_WARNING = "Unsafe local execution is not a containment backend."
 # Keep timeout cleanup bounded. This is lifecycle cleanup, not verified containment.
@@ -1447,17 +1448,38 @@ def _build_bubblewrap_command(command: tuple[str, ...], workspace_path: Path) ->
         if Path(runtime_file).exists():
             args.extend(["--ro-bind", runtime_file, runtime_file])
 
+    args.extend(_bubblewrap_workspace_mount_args(workspace))
     args.extend(
         [
-            "--bind",
-            workspace.as_posix(),
-            _SANDBOX_WORKSPACE.as_posix(),
             "--chdir",
             _SANDBOX_WORKSPACE.as_posix(),
             "--",
             *command,
         ]
     )
+
+    return args
+
+
+def _bubblewrap_workspace_mount_args(workspace: Path) -> list[str]:
+    plan = WorkspaceMountPlan(
+        mounts=(
+            MountContract(
+                sandbox_path=_SANDBOX_WORKSPACE.as_posix(),
+                kind=MountKind.WRITABLE_BIND,
+                host_source=workspace.as_posix(),
+            ),
+        )
+    )
+
+    args: list[str] = []
+    for mount in plan.mounts:
+        if mount.kind != MountKind.WRITABLE_BIND or mount.host_source is None:
+            raise GuardedCommandExecutionError(
+                "Workspace mount plan must contain only writable workspace bind mounts."
+            )
+
+        args.extend(["--bind", mount.host_source, mount.sandbox_path])
 
     return args
 

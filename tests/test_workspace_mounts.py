@@ -85,3 +85,23 @@ def test_mount_plan_rejects_duplicate_sandbox_paths() -> None:
 
     with pytest.raises(MountSecurityError):
         WorkspaceMountPlan(mounts=(first, second))
+
+
+def test_writable_bind_requires_host_source() -> None:
+    with pytest.raises(MountSecurityError):
+        MountContract(
+            sandbox_path="/workspace",
+            kind=MountKind.WRITABLE_BIND,
+        )
+
+
+def test_writable_bind_accepts_workspace_root() -> None:
+    mount = MountContract(
+        sandbox_path="/workspace",
+        kind=MountKind.WRITABLE_BIND,
+        host_source="/repo",
+    )
+
+    assert mount.sandbox_path == "/workspace"
+    assert mount.kind == MountKind.WRITABLE_BIND
+    assert mount.host_source == "/repo"

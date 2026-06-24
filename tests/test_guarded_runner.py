@@ -764,6 +764,32 @@ def test_blocked_run_is_audited(tmp_path: Path) -> None:
     assert audit.verify_integrity()
 
 
+def test_bubblewrap_workspace_bind_uses_workspace_mount_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rygnal.guarded_runner as guarded_runner_module
+
+    monkeypatch.setattr(
+        guarded_runner_module.shutil,
+        "which",
+        lambda name: "/usr/bin/bwrap" if name == "bwrap" else None,
+    )
+
+    command = guarded_runner_module._build_bubblewrap_command(
+        ("python", "-c", "print('ok')"),
+        tmp_path,
+    )
+
+    writable_binds = [
+        tuple(command[index + 1 : index + 3])
+        for index, item in enumerate(command)
+        if item == "--bind"
+    ]
+
+    assert writable_binds == [(tmp_path.resolve().as_posix(), "/workspace")]
+
+
 @pytest.mark.skipif(
     not bwrap_probe_available(),
     reason="bubblewrap not installed or namespace probe unavailable",

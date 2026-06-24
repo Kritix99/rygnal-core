@@ -20,6 +20,7 @@ class MountSecurityError(ValueError):
 
 class MountKind(StrEnum):
     READ_ONLY_BIND = "read_only_bind"
+    WRITABLE_BIND = "writable_bind"
     EPHEMERAL_TMPFS = "ephemeral_tmpfs"
     MASKED_PATH = "masked_path"
 
@@ -39,9 +40,9 @@ class MountContract:
         kind = MountKind(self.kind)
         object.__setattr__(self, "kind", kind)
 
-        if kind == MountKind.READ_ONLY_BIND:
+        if kind in {MountKind.READ_ONLY_BIND, MountKind.WRITABLE_BIND}:
             if self.host_source is None or not str(self.host_source).strip():
-                raise MountSecurityError("Read-only bind mounts require host_source.")
+                raise MountSecurityError(f"{kind.value} mounts require host_source.")
             return
 
         if self.host_source is not None:
