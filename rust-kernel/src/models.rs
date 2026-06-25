@@ -9,9 +9,31 @@ pub struct FileChange {
 
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
+pub struct PatchManifest {
+    pub expected_change_count: usize,
+    pub expected_paths: Vec<String>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct GitPatch {
     pub sha256: String,
+    pub manifest: PatchManifest,
     pub changes: Vec<FileChange>,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+pub struct PatchRiskAssessment {
+    pub status: String,
+    pub risk_level: String,
+    pub error_code: Option<String>,
+    pub reason: String,
+    pub expected_change_count: usize,
+    pub received_change_count: usize,
+    pub files_analyzed: usize,
+    pub high_risk_deletions: usize,
+    pub missing_paths: Vec<String>,
+    pub unexpected_paths: Vec<String>,
 }
 
 #[derive(Deserialize, Debug)]
