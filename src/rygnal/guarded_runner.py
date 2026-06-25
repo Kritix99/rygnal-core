@@ -18,6 +18,7 @@ from rygnal.action_intent import (
     ActionIntentSeverity,
     classify_command_intent,
 )
+from rygnal.approval_queue import ApprovalQueueError, InMemoryApprovalQueue
 from rygnal.audit_logger import AuditLogger
 from rygnal.change_risk import (
     ChangeRiskClassificationError,
@@ -121,6 +122,7 @@ class GuardedRunConfig:
     agent_id: str = "local_agent"
     trace_id: str | None = None
     audit_logger: AuditLogger | None = None
+    approval_queue: InMemoryApprovalQueue | None = None
 
 
 @dataclass(frozen=True)
@@ -761,6 +763,7 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
                                 environment=config.environment,
                                 trace_id=trace_id,
                             )
+                            _submit_patch_approval_request(config, approval_request)
                         except PatchApprovalError as exc:
                             approval_required = False
                             status = GuardedRunStatus.BLOCKED
@@ -943,6 +946,21 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
             approval_request=approval_request,
             containment_features=containment_features,
         )
+
+
+def _submit_patch_approval_request(
+    config: GuardedRunConfig,
+    approval_request: ApprovalRequest,
+) -> None:
+    if config.approval_queue is None:
+        return
+
+    try:
+        config.approval_queue.submit(approval_request)
+    except ApprovalQueueError as exc:
+        raise PatchApprovalError(
+            f"Approval request could not be stored in shared approval queue: {exc}"
+        ) from exc
 
 
 def classify_and_decide_patch(patch_diff: PatchDiff) -> PatchRiskDecision:

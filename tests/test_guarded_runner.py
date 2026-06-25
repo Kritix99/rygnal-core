@@ -5,8 +5,11 @@ import sys
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 
 import rygnal.guarded_runner as guarded_runner
+from rygnal.api import create_app
+from rygnal.approval_queue import InMemoryApprovalQueue, SQLiteApprovalQueue
 from rygnal.audit_logger import AuditLogger
 from rygnal.execution_backend import HostBackendCapabilities
 from rygnal.guarded_runner import (
@@ -16,6 +19,7 @@ from rygnal.guarded_runner import (
     _guarded_run_concurrency_lock_path,
     run_guarded,
 )
+from rygnal.models import ApprovalStatus
 from rygnal.risk_engine import RiskLevel
 from rygnal.untracked_files import UntrackedFilePolicy
 from rygnal.workspace_cleanup import CleanupResult, CleanupStatus
@@ -56,6 +60,7 @@ def unsafe_config(
     command: tuple[str, ...],
     *,
     audit_logger: AuditLogger | None = None,
+    approval_queue: InMemoryApprovalQueue | None = None,
     preserve_workspace: bool = False,
     timeout_seconds: int = 5,
     allow_dirty_override: bool = False,
@@ -72,6 +77,7 @@ def unsafe_config(
         unsafe_local_requested=True,
         trace_id="trace_test",
         audit_logger=audit_logger,
+        approval_queue=approval_queue,
     )
 
 
@@ -941,6 +947,80 @@ def test_high_risk_dependency_patch_requires_approval_before_completion(tmp_path
     assert result.cleanup_performed is True
     assert not Path(result.workspace_path).exists()
     assert audit.verify_integrity()
+
+
+def test_high_risk_dependency_patch_submits_approval_to_configured_queue(
+    tmp_path: Path,
+) -> None:
+    repo = create_repo(tmp_path / "repo")
+    queue = InMemoryApprovalQueue()
+
+    result = run_guarded(
+        unsafe_config(
+            repo,
+            py_command(
+                "from pathlib import Path; "
+                "Path('pyproject.toml').write_text('[project]\\nname = \"changed\"\\n')"
+            ),
+            approval_queue=queue,
+        )
+    )
+
+    assert result.status == GuardedRunStatus.APPROVAL_REQUIRED
+    assert result.approval_request is not None
+
+    queued = queue.get(result.approval_request.approval_id)
+    assert queued.status == ApprovalStatus.PENDING
+    assert queued.request == result.approval_request
+
+
+def test_api_can_approve_guarded_run_request_from_shared_sqlite_queue(
+    tmp_path: Path,
+) -> None:
+    repo = create_repo(tmp_path / "repo")
+    db_path = tmp_path / "approval_queue.db"
+    client = TestClient(create_app(approval_queue_db_path=db_path))
+
+    result = run_guarded(
+        unsafe_config(
+            repo,
+            py_command(
+                "from pathlib import Path; "
+                "Path('pyproject.toml').write_text('[project]\\nname = \"changed\"\\n')"
+            ),
+            approval_queue=SQLiteApprovalQueue(db_path),
+        )
+    )
+
+    assert result.status == GuardedRunStatus.APPROVAL_REQUIRED
+    assert result.approval_request is not None
+
+    approval_id = result.approval_request.approval_id
+
+    get_response = client.get(f"/v1/approvals/{approval_id}")
+    assert get_response.status_code == 200
+    pending = get_response.json()["approval"]
+    assert pending["approval_id"] == approval_id
+    assert pending["status"] == ApprovalStatus.PENDING.value
+    assert pending["request"]["approval_id"] == approval_id
+
+    approve_response = client.post(
+        f"/v1/approvals/{approval_id}/approve",
+        json={
+            "decided_by": "security_reviewer",
+            "reason": "Reviewed guarded patch through shared approval queue.",
+        },
+    )
+    assert approve_response.status_code == 200
+    approved = approve_response.json()["approval"]
+    assert approved["approval_id"] == approval_id
+    assert approved["status"] == ApprovalStatus.APPROVED.value
+    assert approved["approval_decision"]["approval_id"] == approval_id
+
+    reloaded = SQLiteApprovalQueue(db_path).get(approval_id)
+    assert reloaded.status == ApprovalStatus.APPROVED
+    assert reloaded.decision is not None
+    assert reloaded.decision.decided_by == "security_reviewer"
 
 
 def test_critical_secret_patch_is_blocked_before_completion(tmp_path: Path) -> None:

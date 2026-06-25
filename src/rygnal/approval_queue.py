@@ -13,6 +13,8 @@ from rygnal.approval_state import ApprovalStateMachine
 from rygnal.models import ApprovalDecision, ApprovalRequest, ApprovalStatus, utc_now_iso
 from rygnal.security import redact_sensitive_value
 
+APPROVAL_QUEUE_DB_PATH_ENV = "RYGNAL_APPROVAL_QUEUE_DB_PATH"
+
 
 class ApprovalQueueError(RuntimeError):
     """Base class for approval queue errors."""
@@ -169,6 +171,31 @@ class SQLiteApprovalQueue(InMemoryApprovalQueue):
         super().__init__(authorization_engine=authorization_engine)
         self._initialize()
         self._load_items()
+
+    def submit(self, approval_request: ApprovalRequest) -> ApprovalRequest:
+        """Add an approval request after refreshing durable queue state."""
+        self._load_items()
+        return super().submit(approval_request)
+
+    def list(self, *, status: ApprovalStatus | None = None) -> tuple[QueuedApproval, ...]:
+        """Return queued approvals after refreshing durable queue state."""
+        self._load_items()
+        return super().list(status=status)
+
+    def get(self, approval_id: str) -> QueuedApproval:
+        """Return one queued approval after refreshing durable queue state."""
+        self._load_items()
+        return super().get(approval_id)
+
+    def approve(self, approval_id: str, *, decided_by: str, reason: str) -> QueuedApproval:
+        """Approve a pending approval request after refreshing durable queue state."""
+        self._load_items()
+        return super().approve(approval_id, decided_by=decided_by, reason=reason)
+
+    def reject(self, approval_id: str, *, decided_by: str, reason: str) -> QueuedApproval:
+        """Reject a pending approval request after refreshing durable queue state."""
+        self._load_items()
+        return super().reject(approval_id, decided_by=decided_by, reason=reason)
 
     def _store_item(self, item: QueuedApproval) -> None:
         self._persist_item(item)
