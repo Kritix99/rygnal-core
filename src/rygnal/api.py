@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Mapping
 from pathlib import Path
@@ -15,6 +16,7 @@ from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from rygnal.approval_queue import (
+    APPROVAL_QUEUE_DB_PATH_ENV,
     ApprovalDeniedError,
     ApprovalNotFoundError,
     ApprovalStateConflictError,
@@ -138,10 +140,14 @@ def create_app(
     active_policy_engine = policy_engine or load_default_policy_engine()
     active_risk_engine = risk_engine or RiskEngine()
     active_audit_logger = audit_logger
+    configured_approval_queue_db_path = approval_queue_db_path
+    if configured_approval_queue_db_path is None:
+        configured_approval_queue_db_path = os.environ.get(APPROVAL_QUEUE_DB_PATH_ENV) or None
+
     if approval_queue is not None:
         active_approval_queue = approval_queue
-    elif approval_queue_db_path is not None:
-        active_approval_queue = SQLiteApprovalQueue(approval_queue_db_path)
+    elif configured_approval_queue_db_path is not None:
+        active_approval_queue = SQLiteApprovalQueue(configured_approval_queue_db_path)
     else:
         active_approval_queue = InMemoryApprovalQueue()
 

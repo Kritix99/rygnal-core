@@ -1529,3 +1529,83 @@ def test_rust_criticality_shadow_rejects_stripped_content_above_analysis_limit(
     assert shadow["available"] is False
     assert shadow["error_code"] == "file-too-large"
     assert shadow["error_reason"] == "file size exceeds shadow mode criticality limits"
+
+
+def test_action_intent_report_reasons_surface_secret_and_network_intents(
+    tmp_path: Path,
+) -> None:
+    repo = create_repo(tmp_path)
+    src = repo / "src"
+    src.mkdir()
+    (src / "client.py").write_text(
+        "API_KEY = 'sk-live-super-secret-token'\nBASE_URL = 'https://example.com/api'\n",
+        encoding="utf-8",
+    )
+
+    report = classify_repo_changes(repo)
+    reason_codes = {reason.code for reason in report.report_reasons}
+
+    assert "action-intent-secret_or_credential_access" in reason_codes
+    assert "action-intent-network_access" in reason_codes
+    assert report.overall_risk_level == RiskLevel.CRITICAL
+
+    secret_reason = next(
+        reason
+        for reason in report.report_reasons
+        if reason.code == "action-intent-secret_or_credential_access"
+    )
+    evidence = dict(secret_reason.evidence)
+
+    assert secret_reason.risk_level == RiskLevel.CRITICAL
+    assert evidence["intent_code"] == "secret_or_credential_access"
+    assert evidence["recommended_action"] == "block"
+    assert evidence["evidence_count"] >= 1
+
+
+def test_action_intent_report_reasons_surface_approval_bypass_intent(
+    tmp_path: Path,
+) -> None:
+    repo = create_repo(tmp_path)
+    src = repo / "src" / "rygnal"
+    src.mkdir(parents=True)
+    (src / "approval.py").write_text(
+        "# skip approval for local agent changes\n",
+        encoding="utf-8",
+    )
+
+    report = classify_repo_changes(repo)
+    reason_codes = {reason.code for reason in report.report_reasons}
+
+    assert "action-intent-approval_bypass_attempt" in reason_codes
+    assert report.overall_risk_level == RiskLevel.CRITICAL
+
+
+def test_action_intent_report_reasons_surface_ci_and_infra_intents(
+    tmp_path: Path,
+) -> None:
+    repo = create_repo(tmp_path)
+    workflow = repo / ".github" / "workflows"
+    workflow.mkdir(parents=True)
+    (workflow / "ci.yml").write_text("name: ci\n", encoding="utf-8")
+    (repo / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+
+    report = classify_repo_changes(repo)
+    reason_codes = {reason.code for reason in report.report_reasons}
+
+    assert "action-intent-deployment_or_ci_change" in reason_codes
+    assert "action-intent-container_or_infra_change" in reason_codes
+    assert report.overall_risk_level == RiskLevel.HIGH
+
+
+def test_action_intent_report_reasons_do_not_escalate_docs_only_patch(
+    tmp_path: Path,
+) -> None:
+    repo = create_repo(tmp_path)
+    docs = repo / "docs"
+    docs.mkdir()
+    (docs / "usage.md").write_text("Usage\n", encoding="utf-8")
+
+    report = classify_repo_changes(repo)
+
+    assert not any(reason.code.startswith("action-intent-") for reason in report.report_reasons)
+    assert report.overall_risk_level == RiskLevel.LOW

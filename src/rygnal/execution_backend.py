@@ -183,8 +183,12 @@ def select_execution_backend(
     if os_name == "darwin":
         raise ExecutionBackendSelectionError(
             "macOS is recognized, but Seatbelt containment is planned and not yet "
-            "active. Configure a verified rootless container backend or use a "
-            "supported Linux backend."
+            "active. Configure a verified rootless container backend before guarded "
+            "execution, for example RYGNAL_CONFIGURED_CONTAINER_BACKEND=docker "
+            "or RYGNAL_CONFIGURED_CONTAINER_BACKEND=podman with rootless container "
+            "support enabled. Alternatively run on a supported Linux backend with "
+            "Bubblewrap. Use --unsafe-local only as an explicit non-contained "
+            "development/test escape hatch."
         )
 
     if os_name == "windows":

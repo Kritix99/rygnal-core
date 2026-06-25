@@ -13,6 +13,12 @@ from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Protocol
 
+from rygnal.action_intent import (
+    ActionIntentReport,
+    ActionIntentSeverity,
+    classify_command_intent,
+)
+from rygnal.approval_queue import ApprovalQueueError, InMemoryApprovalQueue
 from rygnal.audit_logger import AuditLogger
 from rygnal.change_risk import (
     ChangeRiskClassificationError,
@@ -116,6 +122,7 @@ class GuardedRunConfig:
     agent_id: str = "local_agent"
     trace_id: str | None = None
     audit_logger: AuditLogger | None = None
+    approval_queue: InMemoryApprovalQueue | None = None
 
 
 @dataclass(frozen=True)
@@ -421,6 +428,7 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
             "unsafe_local_requested": config.unsafe_local_requested,
         },
     )
+    _audit_command_intent(config, trace_id=trace_id, command=command)
 
     try:
         trusted_repo = detect_trusted_repo_root(trusted_repo_input)
@@ -755,6 +763,7 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
                                 environment=config.environment,
                                 trace_id=trace_id,
                             )
+                            _submit_patch_approval_request(config, approval_request)
                         except PatchApprovalError as exc:
                             approval_required = False
                             status = GuardedRunStatus.BLOCKED
@@ -939,6 +948,21 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
         )
 
 
+def _submit_patch_approval_request(
+    config: GuardedRunConfig,
+    approval_request: ApprovalRequest,
+) -> None:
+    if config.approval_queue is None:
+        return
+
+    try:
+        config.approval_queue.submit(approval_request)
+    except ApprovalQueueError as exc:
+        raise PatchApprovalError(
+            f"Approval request could not be stored in shared approval queue: {exc}"
+        ) from exc
+
+
 def classify_and_decide_patch(patch_diff: PatchDiff) -> PatchRiskDecision:
     """Hard enforcement gate for guarded workspace patches.
 
@@ -1023,6 +1047,39 @@ def _system_risk_score_for_level(risk_level: RiskLevel) -> float:
     if risk_level == RiskLevel.MEDIUM:
         return 4.0
     return 2.0
+
+
+def _audit_command_intent(
+    config: GuardedRunConfig,
+    *,
+    trace_id: str,
+    command: tuple[str, ...],
+) -> ActionIntentReport:
+    report = classify_command_intent(command)
+    _audit(
+        config,
+        trace_id=trace_id,
+        event_type="guarded_run.command_intent_classified",
+        decision=Decision.ALLOW,
+        allowed=True,
+        severity=_severity_for_action_intent(report.max_severity),
+        reason="Guarded command intent classified before execution.",
+        metadata={
+            "command": _command_audit_summary(command),
+            **report.to_audit_metadata(),
+        },
+    )
+    return report
+
+
+def _severity_for_action_intent(severity: ActionIntentSeverity) -> Severity:
+    if severity == ActionIntentSeverity.CRITICAL:
+        return Severity.CRITICAL
+    if severity == ActionIntentSeverity.HIGH:
+        return Severity.HIGH
+    if severity == ActionIntentSeverity.MEDIUM:
+        return Severity.MEDIUM
+    return Severity.LOW
 
 
 def _select_backend(config: GuardedRunConfig) -> ExecutionBackendSelection:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import sys
 import tempfile
 from collections.abc import Iterable
@@ -11,6 +12,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from rygnal.approval_queue import APPROVAL_QUEUE_DB_PATH_ENV, SQLiteApprovalQueue
 from rygnal.audit_logger import AuditLogger
 from rygnal.guarded_runner import GuardedRunConfig, GuardedRunResult, GuardedRunStatus, run_guarded
 from rygnal.schemas import (
@@ -212,6 +214,14 @@ def _run_guarded_request(request: EngineRequest) -> None:
     )
 
 
+def _approval_queue_from_environment() -> SQLiteApprovalQueue | None:
+    db_path = os.environ.get(APPROVAL_QUEUE_DB_PATH_ENV)
+    if not db_path:
+        return None
+
+    return SQLiteApprovalQueue(Path(db_path))
+
+
 def _build_guarded_config(request: EngineRequest) -> GuardedRunConfig:
     audit_logger = (
         AuditLogger(request.audit_log_path) if request.audit_log_path is not None else None
@@ -232,6 +242,7 @@ def _build_guarded_config(request: EngineRequest) -> GuardedRunConfig:
         agent_id=request.agent_id,
         trace_id=request.request_id,
         audit_logger=audit_logger,
+        approval_queue=_approval_queue_from_environment(),
     )
 
 
