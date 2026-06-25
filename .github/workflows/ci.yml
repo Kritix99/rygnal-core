@@ -50,10 +50,10 @@ jobs:
         run: cargo fmt --manifest-path rust-kernel/Cargo.toml -- --check
 
       - name: Rust tests
-        run: cargo test --manifest-path rust-kernel/Cargo.toml
+        run: cargo test --manifest-path rust-kernel/Cargo.toml --no-default-features
 
       - name: Rust clippy
-        run: cargo clippy --manifest-path rust-kernel/Cargo.toml -- -D warnings
+        run: cargo clippy --manifest-path rust-kernel/Cargo.toml --no-default-features -- -D warnings
 
       - name: Build and install Rust kernel Python extension wheel
         run: |
