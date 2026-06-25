@@ -18,17 +18,25 @@ def test_rust_kernel_evaluates_patch_risk() -> None:
 
     payload = {
         "sha256": "abc123xyz",
+        "manifest": {
+            "expected_change_count": 2,
+            "expected_paths": ["src/main.py", "config/db.yml"],
+        },
         "changes": [
             {"path": "src/main.py", "kind": "modified"},
             {"path": "config/db.yml", "kind": "deleted"},
         ],
     }
 
-    result = rygnal_kernel.evaluate_patch_risk(json.dumps(payload))
+    result = json.loads(rygnal_kernel.evaluate_patch_risk(json.dumps(payload)))
 
-    assert result == (
-        "Kernel evaluated patch [abc123xyz]. Analyzed 2 files. High-risk deletions detected: 1"
-    )
+    assert result["status"] == "analyzed"
+    assert result["risk_level"] == "high"
+    assert result["error_code"] is None
+    assert result["expected_change_count"] == 2
+    assert result["received_change_count"] == 2
+    assert result["files_analyzed"] == 2
+    assert result["high_risk_deletions"] == 1
 
 
 def test_rust_kernel_rejects_invalid_patch_json() -> None:
@@ -36,8 +44,12 @@ def test_rust_kernel_rejects_invalid_patch_json() -> None:
 
     bad_payload = '{"missing_sha": true, "garbage_data": [1, 2, 3]}'
 
-    with pytest.raises(ValueError, match="Rust safety kernel failed to parse JSON"):
-        rygnal_kernel.evaluate_patch_risk(bad_payload)
+    result = json.loads(rygnal_kernel.evaluate_patch_risk(bad_payload))
+
+    assert result["status"] == "blocked"
+    assert result["risk_level"] == "critical"
+    assert result["error_code"] == "invalid-kernel-input"
+    assert result["files_analyzed"] == 0
 
 
 def test_rust_kernel_analyzes_python_code_structure() -> None:

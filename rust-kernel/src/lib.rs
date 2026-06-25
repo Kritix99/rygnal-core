@@ -6,13 +6,17 @@ mod path_safety;
 mod subjective;
 
 use crate::criticality::{evaluate_criticality as evaluate_criticality_inner, CriticalityError};
-use crate::models::{AgentAction, CriticalityInput, GitPatch, RiskAssessment, SubjectiveRiskInput};
+use crate::models::{
+    AgentAction, CriticalityInput, GitPatch, PatchRiskAssessment, RiskAssessment,
+    SubjectiveRiskInput,
+};
 use crate::path_safety::{PathSensitivity, PathValidationOutcome};
 use crate::subjective::evaluate_subjective_risk as evaluate_subjective_risk_inner;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use std::collections::BTreeMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use tree_sitter::Parser;
 
@@ -85,9 +89,29 @@ fn path_sensitivity_to_python(py: Python<'_>, sensitivity: PathSensitivity) -> P
 
 #[pyfunction]
 fn evaluate_patch_risk(json_payload: String) -> PyResult<String> {
-    let patch: GitPatch = serde_json::from_str(&json_payload).map_err(|err| {
-        PyValueError::new_err(format!("Rust safety kernel failed to parse JSON: {}", err))
-    })?;
+    let patch: GitPatch = match serde_json::from_str(&json_payload) {
+        Ok(patch) => patch,
+        Err(err) => {
+            return serialize_patch_risk_assessment(PatchRiskAssessment {
+                status: "blocked".to_string(),
+                risk_level: "critical".to_string(),
+                error_code: Some("invalid-kernel-input".to_string()),
+                reason: format!(
+                    "Safety analysis blocked because patch payload is malformed or incomplete: {err}"
+                ),
+                expected_change_count: 0,
+                received_change_count: 0,
+                files_analyzed: 0,
+                high_risk_deletions: 0,
+                missing_paths: Vec::new(),
+                unexpected_paths: Vec::new(),
+            });
+        }
+    };
+
+    if let Some(rejection) = patch_visibility_rejection(&patch) {
+        return serialize_patch_risk_assessment(rejection);
+    }
 
     let deleted_paths: Vec<&str> = patch
         .changes
@@ -96,12 +120,106 @@ fn evaluate_patch_risk(json_payload: String) -> PyResult<String> {
         .map(|change| change.path.as_str())
         .collect();
 
-    Ok(format!(
-        "Kernel evaluated patch [{}]. Analyzed {} files. High-risk deletions detected: {}",
-        patch.sha256,
-        patch.changes.len(),
-        deleted_paths.len()
-    ))
+    let risk_level = if deleted_paths.is_empty() {
+        "low"
+    } else {
+        "high"
+    };
+
+    serialize_patch_risk_assessment(PatchRiskAssessment {
+        status: "analyzed".to_string(),
+        risk_level: risk_level.to_string(),
+        error_code: None,
+        reason: format!(
+            "Kernel evaluated patch [{}] with complete change visibility",
+            patch.sha256
+        ),
+        expected_change_count: patch.manifest.expected_change_count,
+        received_change_count: patch.changes.len(),
+        files_analyzed: patch.changes.len(),
+        high_risk_deletions: deleted_paths.len(),
+        missing_paths: Vec::new(),
+        unexpected_paths: Vec::new(),
+    })
+}
+
+fn patch_visibility_rejection(patch: &GitPatch) -> Option<PatchRiskAssessment> {
+    let expected_count = patch.manifest.expected_change_count;
+    let received_count = patch.changes.len();
+
+    let expected_counts = count_paths(
+        patch
+            .manifest
+            .expected_paths
+            .iter()
+            .map(|path| path.as_str()),
+    );
+    let received_counts = count_paths(patch.changes.iter().map(|change| change.path.as_str()));
+
+    let missing_paths = path_multiset_difference(&expected_counts, &received_counts);
+    let unexpected_paths = path_multiset_difference(&received_counts, &expected_counts);
+
+    let manifest_count_mismatch = expected_count != patch.manifest.expected_paths.len();
+    let received_count_mismatch = expected_count != received_count;
+
+    if !manifest_count_mismatch
+        && !received_count_mismatch
+        && missing_paths.is_empty()
+        && unexpected_paths.is_empty()
+    {
+        return None;
+    }
+
+    Some(PatchRiskAssessment {
+        status: "blocked".to_string(),
+        risk_level: "critical".to_string(),
+        error_code: Some("incomplete-change-visibility".to_string()),
+        reason: format!(
+            "Safety analysis blocked because Rust received incomplete patch visibility: expected {expected_count} change(s), received {received_count} change detail(s)"
+        ),
+        expected_change_count: expected_count,
+        received_change_count: received_count,
+        files_analyzed: 0,
+        high_risk_deletions: 0,
+        missing_paths,
+        unexpected_paths,
+    })
+}
+
+fn count_paths<'a, I>(paths: I) -> BTreeMap<String, usize>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut counts = BTreeMap::new();
+
+    for path in paths {
+        *counts.entry(path.to_string()).or_insert(0) += 1;
+    }
+
+    counts
+}
+
+fn path_multiset_difference(
+    left: &BTreeMap<String, usize>,
+    right: &BTreeMap<String, usize>,
+) -> Vec<String> {
+    let mut difference = Vec::new();
+
+    for (path, left_count) in left {
+        let right_count = right.get(path).copied().unwrap_or(0);
+
+        for _ in 0..left_count.saturating_sub(right_count) {
+            difference.push(path.clone());
+        }
+    }
+
+    difference
+}
+
+fn serialize_patch_risk_assessment(assessment: PatchRiskAssessment) -> PyResult<String> {
+    serde_json::to_string(&assessment).map_err(|err| {
+        PyValueError::new_err(format!("Failed to serialize patch risk assessment: {err}"))
+    })
 }
 
 #[pyfunction]
@@ -349,5 +467,92 @@ mod criticality_boundary_hardening_tests {
             }
             other => panic!("expected InvalidPayload boundary error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn patch_risk_blocks_malformed_change_item_without_partial_analysis() {
+        let payload = r#"{
+            "sha256": "abc123",
+            "manifest": {
+                "expected_change_count": 2,
+                "expected_paths": [
+                    "src/app.py",
+                    "policies/default_policy.yaml"
+                ]
+            },
+            "changes": [
+                {"path": "src/app.py", "kind": "modified"},
+                {"path": "policies/default_policy.yaml"}
+            ]
+        }"#;
+
+        let raw = evaluate_patch_risk(payload.to_string()).expect("structured blocked result");
+        let result: serde_json::Value =
+            serde_json::from_str(&raw).expect("patch risk result should be JSON");
+
+        assert_eq!(result["status"], "blocked");
+        assert_eq!(result["risk_level"], "critical");
+        assert_eq!(result["error_code"], "invalid-kernel-input");
+        assert_eq!(result["files_analyzed"], 0);
+    }
+
+    #[test]
+    fn patch_risk_blocks_incomplete_manifest_visibility() {
+        let payload = r#"{
+            "sha256": "abc123",
+            "manifest": {
+                "expected_change_count": 3,
+                "expected_paths": [
+                    "src/app.py",
+                    "policies/default_policy.yaml",
+                    "README.md"
+                ]
+            },
+            "changes": [
+                {"path": "src/app.py", "kind": "modified"},
+                {"path": "README.md", "kind": "modified"}
+            ]
+        }"#;
+
+        let raw = evaluate_patch_risk(payload.to_string()).expect("structured blocked result");
+        let result: serde_json::Value =
+            serde_json::from_str(&raw).expect("patch risk result should be JSON");
+
+        assert_eq!(result["status"], "blocked");
+        assert_eq!(result["risk_level"], "critical");
+        assert_eq!(result["error_code"], "incomplete-change-visibility");
+        assert_eq!(result["expected_change_count"], 3);
+        assert_eq!(result["received_change_count"], 2);
+        assert_eq!(result["files_analyzed"], 0);
+        assert_eq!(result["missing_paths"][0], "policies/default_policy.yaml");
+    }
+
+    #[test]
+    fn patch_risk_analyzes_only_after_manifest_matches_received_changes() {
+        let payload = r#"{
+            "sha256": "abc123",
+            "manifest": {
+                "expected_change_count": 2,
+                "expected_paths": [
+                    "src/app.py",
+                    "README.md"
+                ]
+            },
+            "changes": [
+                {"path": "src/app.py", "kind": "modified"},
+                {"path": "README.md", "kind": "modified"}
+            ]
+        }"#;
+
+        let raw = evaluate_patch_risk(payload.to_string()).expect("structured analyzed result");
+        let result: serde_json::Value =
+            serde_json::from_str(&raw).expect("patch risk result should be JSON");
+
+        assert_eq!(result["status"], "analyzed");
+        assert_eq!(result["risk_level"], "low");
+        assert!(result["error_code"].is_null());
+        assert_eq!(result["expected_change_count"], 2);
+        assert_eq!(result["received_change_count"], 2);
+        assert_eq!(result["files_analyzed"], 2);
     }
 }
