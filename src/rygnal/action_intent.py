@@ -646,7 +646,7 @@ def _collect_command_evidence(
             ),
         )
 
-    if executable in _NETWORK_COMMANDS or _has_any_token(lowered, _NETWORK_SUBCOMMANDS):
+    if _is_network_command(executable, lowered):
         _add(
             buckets,
             ActionIntentCode.NETWORK_ACCESS,
@@ -820,7 +820,7 @@ def _collect_path_evidence(
             ),
         )
 
-    if _has_any_segment(lower_path, _AUDIT_APPROVAL_PATH_SEGMENTS):
+    if _is_audit_approval_control_path(lower_path, tuple(_segments(lower_path))):
         _add(
             buckets,
             ActionIntentCode.AUDIT_OR_APPROVAL_CHANGE,
@@ -910,6 +910,43 @@ def _collect_diff_evidence(
                 path,
                 "Added lines reference bypassing approval or audit controls.",
                 0.95,
+            ),
+        )
+
+    if _ENCODED_EXECUTION_RE.search(joined):
+        _add(
+            buckets,
+            ActionIntentCode.APPROVAL_BYPASS_ATTEMPT,
+            ActionIntentEvidence(
+                ActionIntentEvidenceSource.DIFF,
+                "encoded-execution-added",
+                path,
+                "Added lines decode or transform content before dynamic execution.",
+                0.95,
+            ),
+        )
+        _add(
+            buckets,
+            ActionIntentCode.UNKNOWN_OR_AMBIGUOUS,
+            ActionIntentEvidence(
+                ActionIntentEvidenceSource.DIFF,
+                "encoded-dynamic-execution-added",
+                path,
+                "Added encoded dynamic execution requires review.",
+                0.7,
+            ),
+        )
+
+    if _DYNAMIC_EXECUTION_RE.search(joined):
+        _add(
+            buckets,
+            ActionIntentCode.UNKNOWN_OR_AMBIGUOUS,
+            ActionIntentEvidence(
+                ActionIntentEvidenceSource.DIFF,
+                "dynamic-execution-added",
+                path,
+                "Added dynamic execution primitive requires review.",
+                0.7,
             ),
         )
 
@@ -1018,7 +1055,98 @@ def _is_secret_like_path(path: str) -> bool:
     return _matches_any(path, _SECRET_PATH_PATTERNS)
 
 
+def _is_audit_approval_control_path(
+    path: str,
+    segments: tuple[str, ...],
+) -> bool:
+    audit_approval_segments = {
+        "approval",
+        "approvals",
+        "audit",
+        "auditing",
+        "governance",
+        "policy",
+        "policies",
+    }
+    if not _has_any_token(segments, audit_approval_segments):
+        return False
+
+    normalized = _normalize_path(path)
+    parts = tuple(part for part in PurePosixPath(normalized).parts if part not in {"", "."})
+    if not parts:
+        return False
+
+    first = parts[0]
+    if first in {
+        "doc",
+        "docs",
+        "documentation",
+        "example",
+        "examples",
+        "sample",
+        "samples",
+    }:
+        return False
+
+    if first in {
+        ".github",
+        "config",
+        "configs",
+        "infra",
+        "k8s",
+        "policy",
+        "policies",
+        "scripts",
+        "src",
+        "terraform",
+    }:
+        return True
+
+    suffix = PurePosixPath(normalized).suffix.lower()
+    return suffix in {
+        ".py",
+        ".js",
+        ".ts",
+        ".tsx",
+        ".jsx",
+        ".go",
+        ".rs",
+        ".java",
+        ".yaml",
+        ".yml",
+        ".toml",
+    }
+
+
+def _is_non_source_document_or_output_path(path: str) -> bool:
+    normalized = _normalize_path(path)
+    parts = tuple(part for part in PurePosixPath(normalized).parts if part not in {"", "."})
+    if not parts:
+        return False
+
+    first = parts[0]
+    if first in {
+        "doc",
+        "docs",
+        "documentation",
+        "example",
+        "examples",
+        "sample",
+        "samples",
+    }:
+        return True
+
+    suffix = PurePosixPath(normalized).suffix.lower()
+    if suffix in {".md", ".rst", ".txt"}:
+        return True
+
+    return False
+
+
 def _is_source_path(path: str) -> bool:
+    if _is_non_source_document_or_output_path(path):
+        return False
+
     name = PurePosixPath(path).stem.lower()
     return _extension(path) in _SOURCE_EXTENSIONS or (
         _extension(path) in _DOC_EXTENSIONS and name not in _DOC_FILE_NAMES
@@ -1042,8 +1170,17 @@ def _command_has_mutation_tokens(tokens: tuple[str, ...]) -> bool:
             "clean",
             "delete",
             "destroy",
+            "fetch",
             "install",
+            "merge",
             "move",
+            "pull",
+            "push",
+            "rebase",
+            "reset",
+            "restore",
+            "stash",
+            "switch",
             "mv",
             "patch",
             "remove",
@@ -1068,6 +1205,15 @@ def _is_dependency_command(executable: str, tokens: tuple[str, ...]) -> bool:
     return executable in _DEPENDENCY_COMMANDS and _has_any_token(
         tokens[1:], _DEPENDENCY_SUBCOMMANDS
     )
+
+
+def _is_network_command(executable: str, tokens: tuple[str, ...]) -> bool:
+    direct_network_commands = _NETWORK_COMMANDS - {"git"}
+    if executable in direct_network_commands:
+        return True
+    if executable == "git":
+        return _has_any_token(tokens[1:], _NETWORK_SUBCOMMANDS)
+    return False
 
 
 def _is_destructive_command(executable: str, tokens: tuple[str, ...], command_text: str) -> bool:
