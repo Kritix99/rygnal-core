@@ -111,3 +111,40 @@ def test_audit_metadata_is_serializable_and_evidence_backed() -> None:
     assert metadata["recommended_action"] == "block"
     assert metadata["intents"]
     assert metadata["intents"][0]["evidence"]
+
+
+def test_privilege_escalation_command_blocks() -> None:
+    report = classify_command_intent(("sudo", "chmod", "+s", "/usr/bin/python"))
+
+    assert ActionIntentCode.PRIVILEGE_ESCALATION.value in report.intent_codes
+    assert report.max_severity == ActionIntentSeverity.CRITICAL
+    assert report.recommended_action == ActionIntentRecommendation.BLOCK
+
+
+def test_inline_destructive_command_keeps_ambiguous_signal_and_blocks() -> None:
+    report = classify_command_intent(("bash", "-c", "rm -rf tmp"))
+
+    assert ActionIntentCode.FILESYSTEM_DESTRUCTIVE.value in report.intent_codes
+    assert ActionIntentCode.UNKNOWN_OR_AMBIGUOUS.value in report.intent_codes
+    assert report.unknown_signals == ("bash:inline-execution",)
+    assert report.recommended_action == ActionIntentRecommendation.BLOCK
+
+
+def test_encoded_dynamic_execution_is_bypass_and_ambiguous() -> None:
+    report = classify_command_intent(("bash", "-c", "echo cm0gLXJmIHRtcA== | base64 -d | sh"))
+
+    assert ActionIntentCode.APPROVAL_BYPASS_ATTEMPT.value in report.intent_codes
+    assert ActionIntentCode.UNKNOWN_OR_AMBIGUOUS.value in report.intent_codes
+    assert "bash:encoded-dynamic-execution" in report.unknown_signals
+    assert "bash:inline-execution" in report.unknown_signals
+    assert report.max_severity == ActionIntentSeverity.CRITICAL
+    assert report.recommended_action == ActionIntentRecommendation.BLOCK
+
+
+def test_dynamic_execution_content_is_ambiguous_even_without_direct_destructive_signal() -> None:
+    report = classify_command_intent(("python", "-c", "import os; os.system(cmd)"))
+
+    assert ActionIntentCode.UNKNOWN_OR_AMBIGUOUS.value in report.intent_codes
+    assert "python:dynamic-execution" in report.unknown_signals
+    assert "python:inline-execution" in report.unknown_signals
+    assert report.recommended_action == ActionIntentRecommendation.REQUIRE_APPROVAL

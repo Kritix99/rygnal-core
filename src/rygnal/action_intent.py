@@ -28,6 +28,7 @@ class ActionIntentCode(StrEnum):
     DEPLOYMENT_OR_CI_CHANGE = "deployment_or_ci_change"
     CONTAINER_OR_INFRA_CHANGE = "container_or_infra_change"
     AUTH_OR_PERMISSION_CHANGE = "auth_or_permission_change"
+    PRIVILEGE_ESCALATION = "privilege_escalation"
     AUDIT_OR_APPROVAL_CHANGE = "audit_or_approval_change"
     APPROVAL_BYPASS_ATTEMPT = "approval_bypass_attempt"
     UNKNOWN_OR_AMBIGUOUS = "unknown_or_ambiguous"
@@ -217,6 +218,11 @@ _INTENT_PROFILES: dict[ActionIntentCode, _IntentProfile] = {
         ActionIntentRecommendation.REQUIRE_APPROVAL,
         "Action changes authentication, authorization, identity, or permission behavior.",
     ),
+    ActionIntentCode.PRIVILEGE_ESCALATION: _IntentProfile(
+        ActionIntentSeverity.CRITICAL,
+        ActionIntentRecommendation.BLOCK,
+        "Action attempts to elevate privileges or weaken least-privilege boundaries.",
+    ),
     ActionIntentCode.AUDIT_OR_APPROVAL_CHANGE: _IntentProfile(
         ActionIntentSeverity.HIGH,
         ActionIntentRecommendation.REQUIRE_APPROVAL,
@@ -309,6 +315,15 @@ _SECRET_COMMANDS = {
     "printenv",
     "security",
     "ssh",
+}
+_PRIVILEGE_COMMANDS = {
+    "chmod",
+    "chown",
+    "doas",
+    "runas",
+    "setcap",
+    "su",
+    "sudo",
 }
 _DEPENDENCY_COMMANDS = {
     "bundle",
@@ -508,7 +523,23 @@ _APPROVAL_BYPASS_RE = re.compile(
     r")\b"
 )
 _DESTRUCTIVE_LITERAL_RE = re.compile(
-    r"(?i)\b(rm\s+-[^\n]*r[^\n]*f|terraform\s+destroy|kubectl\s+delete|drop\s+database|truncate\s+table)\b"
+    r"(?i)\b("
+    r"rm\s+-[^\n]*r[^\n]*f|terraform\s+destroy|kubectl\s+delete|"
+    r"drop\s+database|truncate\s+table"
+    r")\b"
+)
+_PRIVILEGE_ESCALATION_RE = re.compile(
+    r"(?i)\b("
+    r"sudo|doas|runas|su\s+-|chmod\s+(\+s|[0-7]*[467][0-7]{2})|"
+    r"chown\s+root|setcap|assume-role|iam:passrole"
+    r")\b"
+)
+_ENCODED_EXECUTION_RE = re.compile(
+    r"(?i)\b(base64\s+(-d|--decode)|xxd\s+-r|openssl\s+enc)\b"
+    r".*(\|\s*(sh|bash|zsh|python|perl|ruby|node)\b|eval\b|exec\b)"
+)
+_DYNAMIC_EXECUTION_RE = re.compile(
+    r"(?i)\b(eval|exec|os\.system|subprocess\.|child_process\.|Runtime\.getRuntime)\b"
 )
 
 
@@ -536,22 +567,12 @@ def classify_action_intent(
         for code, evidence in sorted(buckets.items(), key=lambda item: item[0].value)
     )
 
-    if not intents and unknown_signals:
-        intents = (
-            _build_intent(
-                ActionIntentCode.UNKNOWN_OR_AMBIGUOUS,
-                tuple(
-                    ActionIntentEvidence(
-                        source=ActionIntentEvidenceSource.CONTEXT,
-                        signal="unknown-signal",
-                        subject=signal,
-                        detail="Signal could not be confidently mapped to a supported intent.",
-                        confidence_weight=0.5,
-                    )
-                    for signal in unknown_signals
-                ),
-            ),
+    if unknown_signals:
+        ambiguous_intent = _build_intent(
+            ActionIntentCode.UNKNOWN_OR_AMBIGUOUS,
+            _unknown_signal_evidence(unknown_signals),
         )
+        intents = (*intents, ambiguous_intent)
 
     return ActionIntentReport(intents=intents, unknown_signals=tuple(unknown_signals))
 
@@ -679,6 +700,19 @@ def _collect_command_evidence(
             ),
         )
 
+    if _PRIVILEGE_ESCALATION_RE.search(command_text) or executable in _PRIVILEGE_COMMANDS:
+        _add(
+            buckets,
+            ActionIntentCode.PRIVILEGE_ESCALATION,
+            ActionIntentEvidence(
+                ActionIntentEvidenceSource.COMMAND,
+                "privilege-escalation-command",
+                executable,
+                "Command can elevate privileges or modify privileged ownership/capabilities.",
+                0.95,
+            ),
+        )
+
     if _APPROVAL_BYPASS_RE.search(command_text):
         _add(
             buckets,
@@ -691,6 +725,23 @@ def _collect_command_evidence(
                 0.95,
             ),
         )
+
+    if _ENCODED_EXECUTION_RE.search(command_text):
+        _add(
+            buckets,
+            ActionIntentCode.APPROVAL_BYPASS_ATTEMPT,
+            ActionIntentEvidence(
+                ActionIntentEvidenceSource.COMMAND,
+                "encoded-execution-wrapper",
+                executable,
+                "Command decodes or transforms content before dynamic execution.",
+                0.95,
+            ),
+        )
+        unknown_signals.append(f"{executable}:encoded-dynamic-execution")
+
+    if _DYNAMIC_EXECUTION_RE.search(command_text):
+        unknown_signals.append(f"{executable}:dynamic-execution")
 
     if executable in {"bash", "sh", "zsh", "python", "python3", "node", "ruby", "perl"}:
         if any(token in {"-c", "--eval", "-e"} for token in lowered):
@@ -861,6 +912,21 @@ def _collect_diff_evidence(
                 0.95,
             ),
         )
+
+
+def _unknown_signal_evidence(
+    unknown_signals: Iterable[str],
+) -> tuple[ActionIntentEvidence, ...]:
+    return tuple(
+        ActionIntentEvidence(
+            source=ActionIntentEvidenceSource.CONTEXT,
+            signal="unknown-signal",
+            subject=signal,
+            detail="Signal could not be confidently mapped to a fully supported intent.",
+            confidence_weight=0.5,
+        )
+        for signal in unknown_signals
+    )
 
 
 def _build_intent(
