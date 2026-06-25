@@ -164,8 +164,14 @@ def test_invalid_container_env_on_macos_still_gets_tailored_platform_error() -> 
             )
         )
 
-    assert "macOS is recognized" in str(exc_info.value)
-    assert "Seatbelt containment is planned" in str(exc_info.value)
+    message = str(exc_info.value)
+
+    assert "macOS is recognized" in message
+    assert "Seatbelt containment is planned" in message
+    assert "RYGNAL_CONFIGURED_CONTAINER_BACKEND=docker" in message
+    assert "RYGNAL_CONFIGURED_CONTAINER_BACKEND=podman" in message
+    assert "supported Linux backend with Bubblewrap" in message
+    assert "--unsafe-local only as an explicit non-contained" in message
 
 
 def test_invalid_container_env_on_windows_still_gets_tailored_platform_error() -> None:
