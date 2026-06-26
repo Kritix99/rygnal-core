@@ -154,3 +154,23 @@ def test_text_loader_rejects_large_document() -> None:
         load_intent_contract_from_json_text("x" * (DEFAULT_INTENT_MAX_BYTES + 1))
 
     assert exc_info.value.code == "intent_text_too_large"
+
+
+def test_loader_accepts_prompt_plan_evidence_fields() -> None:
+    contract = load_intent_contract_from_mapping(
+        {
+            "source": "yaml",
+            "task_objective": "Update docs",
+            "human_prompt": "Please update docs.",
+            "ai_plan": "Edit docs only.",
+            "evidence_source": "chat",
+            "evidence_metadata": {"conversation_id": "conv_1"},
+            "allowed_actions": ["modify"],
+            "target_scopes": [{"type": "path_glob", "value": "docs/**"}],
+        }
+    )
+
+    assert contract.human_prompt == "Please update docs."
+    assert contract.ai_plan == "Edit docs only."
+    assert contract.evidence_source == "chat"
+    assert contract.evidence_metadata["conversation_id"] == "conv_1"

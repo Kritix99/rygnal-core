@@ -144,3 +144,40 @@ def test_intent_receipt_payload_uses_hashes_not_raw_paths() -> None:
     assert ".env" not in str(receipt.audit_summary)
     assert receipt.action_path_hashes
     assert calculate_intent_decision_receipt_hash(payload) == receipt.receipt_hash
+
+
+def test_intent_receipt_correlates_prompt_plan_and_action_without_raw_text() -> None:
+    contract = IntentContract(
+        contract_id="intent_contract_1",
+        session_id="intent_session_1",
+        source=IntentContractSource.YAML,
+        task_objective="Receipt evidence test",
+        human_prompt="Please create docs. token=secret-value",
+        ai_plan="I will create docs/readme.md only.",
+        evidence_source="chat",
+        allowed_actions=(IntentOperation.CREATE,),
+        target_scopes=(ResourceScope(type=ResourceScopeType.PATH_GLOB, value="docs/**"),),
+        enforcement_mode=IntentEnforcementMode.ENFORCE,
+    )
+
+    receipt = build_intent_decision_receipt(
+        contract=contract,
+        match_results=(_match_result(),),
+        fallback_evaluation=_fallback(),
+        trace_id="trace_receipt",
+        normalized_actions=(_action(),),
+    )
+    payload = intent_decision_receipt_payload(
+        contract=contract,
+        match_results=(_match_result(),),
+        fallback_evaluation=_fallback(),
+        trace_id="trace_receipt",
+        normalized_actions=(_action(),),
+    )
+
+    assert receipt.evidence_hash
+    assert payload["contract"]["intent_evidence"]["human_prompt_present"] is True
+    assert payload["contract"]["intent_evidence"]["ai_plan_present"] is True
+    assert "secret-value" not in str(payload)
+    assert "Please create docs" not in str(payload)
+    assert "I will create" not in str(payload)

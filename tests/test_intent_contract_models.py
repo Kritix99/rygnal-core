@@ -174,3 +174,31 @@ def test_non_exact_match_keeps_reason_codes_and_hint() -> None:
     assert result.match_state == IntentMatchState.PARTIAL_MATCH
     assert result.reason_codes == ("scope-drift", "partial-resource-match")
     assert result.decision_hint == IntentDecisionHint.REQUIRE_APPROVAL
+
+
+def test_intent_contract_accepts_human_prompt_and_ai_plan_evidence() -> None:
+    contract = IntentContract(
+        source=IntentContractSource.YAML,
+        task_objective="Update docs",
+        human_prompt="Human asked to update docs.",
+        ai_plan="AI plans to edit docs only.",
+        evidence_source="chat",
+        evidence_metadata={"message_id": "msg_1"},
+        allowed_actions=(IntentOperation.MODIFY,),
+        target_scopes=(ResourceScope(type=ResourceScopeType.PATH_GLOB, value="docs/**"),),
+    )
+
+    assert contract.human_prompt == "Human asked to update docs."
+    assert contract.ai_plan == "AI plans to edit docs only."
+    assert contract.evidence_source == "chat"
+    assert contract.evidence_metadata["message_id"] == "msg_1"
+
+
+def test_intent_contract_rejects_blank_human_prompt() -> None:
+    with pytest.raises(ValidationError):
+        IntentContract(
+            source=IntentContractSource.YAML,
+            task_objective="Update docs",
+            human_prompt="   ",
+            allowed_actions=(IntentOperation.TEST,),
+        )

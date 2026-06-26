@@ -1745,3 +1745,54 @@ def test_guarded_run_records_intent_receipt_in_result_and_audit(tmp_path: Path) 
         intent_event.metadata["intent_receipt"]["receipt_hash"]
         == result.intent_decision_receipt.receipt_hash
     )
+
+
+def test_guarded_run_audits_intent_evidence_without_raw_prompt_or_plan(
+    tmp_path: Path,
+) -> None:
+    from dataclasses import replace
+
+    from rygnal.intent_contract import (
+        IntentContract,
+        IntentContractSource,
+        IntentEnforcementMode,
+        IntentOperation,
+        ResourceScope,
+        ResourceScopeType,
+    )
+
+    repo = create_repo(tmp_path / "repo")
+    audit = AuditLogger(tmp_path / "audit.jsonl")
+    intent_contract = IntentContract(
+        source=IntentContractSource.YAML,
+        task_objective="Create only allowed docs",
+        human_prompt="Please create docs. token=secret-value",
+        ai_plan="I will create docs/outside.md.",
+        evidence_source="chat",
+        allowed_actions=(IntentOperation.CREATE,),
+        target_scopes=(ResourceScope(type=ResourceScopeType.PATH_GLOB, value="docs/allowed/**"),),
+        enforcement_mode=IntentEnforcementMode.ENFORCE,
+    )
+
+    config = replace(
+        unsafe_config(
+            repo,
+            py_command(
+                "from pathlib import Path; "
+                "Path('docs').mkdir(exist_ok=True); "
+                "Path('docs/outside.md').write_text('outside', encoding='utf-8')"
+            ),
+            audit_logger=audit,
+        ),
+        intent_contract=intent_contract,
+        trace_id="trace_intent_evidence",
+    )
+
+    run_guarded(config)
+
+    events_text = str([event.model_dump(mode="json") for event in audit.read_events()])
+    assert "intent_evidence" in events_text
+    assert "combined_evidence_hash" in events_text
+    assert "secret-value" not in events_text
+    assert "Please create docs" not in events_text
+    assert "I will create" not in events_text

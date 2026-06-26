@@ -56,6 +56,7 @@ from rygnal.intent_contract import (
     IntentMatchResult,
     NormalizedAction,
 )
+from rygnal.intent_evidence import intent_evidence_audit_summary
 from rygnal.intent_fallback_policy import (
     IntentFallbackEvaluation,
     evaluate_intent_fallback,
@@ -459,6 +460,7 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
             "timeout_seconds": config.timeout_seconds,
             "preserve_workspace": config.preserve_workspace,
             "unsafe_local_requested": config.unsafe_local_requested,
+            "intent_evidence": _intent_evidence_summary(config.intent_contract),
         },
     )
     _audit_normalized_actions(
@@ -1133,6 +1135,13 @@ def _intent_policy_reason(fallback_evaluation: IntentFallbackEvaluation) -> str:
     )
 
 
+def _intent_evidence_summary(contract: IntentContract | None) -> dict[str, object] | None:
+    if contract is None:
+        return None
+
+    return intent_evidence_audit_summary(contract)
+
+
 def _intent_contract_audit_summary(
     contract: IntentContract | None,
 ) -> dict[str, object] | None:
@@ -1148,6 +1157,7 @@ def _intent_contract_audit_summary(
         "target_scope_count": len(contract.target_scopes),
         "excluded_scope_count": len(contract.excluded_scopes),
         "risk_ceiling": contract.risk_ceiling,
+        "intent_evidence": _intent_evidence_summary(contract),
     }
 
 

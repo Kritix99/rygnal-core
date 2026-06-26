@@ -132,6 +132,10 @@ class IntentContract(BaseModel):
 
     source: IntentContractSource
     task_objective: str = Field(min_length=1, max_length=4096)
+    human_prompt: str | None = Field(default=None, min_length=1, max_length=16384)
+    ai_plan: str | None = Field(default=None, min_length=1, max_length=16384)
+    evidence_source: str | None = Field(default=None, min_length=1, max_length=256)
+    evidence_metadata: dict[str, Any] = Field(default_factory=dict)
     allowed_actions: tuple[IntentOperation, ...] = Field(min_length=1)
     target_scopes: tuple[ResourceScope, ...] = Field(default_factory=tuple)
     excluded_scopes: tuple[ResourceScope, ...] = Field(default_factory=tuple)
@@ -142,7 +146,16 @@ class IntentContract(BaseModel):
     approved_by: str | None = Field(default=None, min_length=1, max_length=256)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
-    @field_validator("contract_id", "session_id", "task_objective", "expires_at", "approved_by")
+    @field_validator(
+        "contract_id",
+        "session_id",
+        "task_objective",
+        "human_prompt",
+        "ai_plan",
+        "evidence_source",
+        "expires_at",
+        "approved_by",
+    )
     @classmethod
     def _reject_blank_context(cls, value: str | None) -> str | None:
         if value is None:

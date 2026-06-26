@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from rygnal.intent_contract import IntentContract, IntentMatchResult, NormalizedAction
+from rygnal.intent_evidence import intent_evidence_audit_summary
 from rygnal.intent_fallback_policy import IntentFallbackEvaluation
 from rygnal.security import redact_sensitive_value
 
@@ -29,6 +30,7 @@ class IntentDecisionReceipt:
     action_ids: tuple[str, ...] = ()
     reason_codes: tuple[str, ...] = ()
     action_path_hashes: tuple[str, ...] = ()
+    evidence_hash: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -47,6 +49,7 @@ class IntentDecisionReceipt:
             "action_ids": self.action_ids,
             "reason_codes": self.reason_codes,
             "action_path_hashes": self.action_path_hashes,
+            "evidence_hash": self.evidence_hash,
             "metadata": self.metadata,
         }
 
@@ -59,6 +62,7 @@ def build_intent_decision_receipt(
     trace_id: str,
     normalized_actions: tuple[NormalizedAction, ...] = (),
 ) -> IntentDecisionReceipt:
+    evidence_summary = intent_evidence_audit_summary(contract)
     payload = intent_decision_receipt_payload(
         contract=contract,
         match_results=match_results,
@@ -82,6 +86,7 @@ def build_intent_decision_receipt(
         action_ids=_action_ids(match_results, normalized_actions),
         reason_codes=_receipt_reason_codes(match_results, fallback_evaluation),
         action_path_hashes=_action_path_hashes(normalized_actions),
+        evidence_hash=evidence_summary.get("combined_evidence_hash"),
         metadata={
             "payload_sha256": receipt_hash,
             "target_scope_count": len(contract.target_scopes),
@@ -115,6 +120,7 @@ def intent_decision_receipt_payload(
                 "target_scope_count": len(contract.target_scopes),
                 "excluded_scope_count": len(contract.excluded_scopes),
                 "risk_ceiling": contract.risk_ceiling,
+                "intent_evidence": intent_evidence_audit_summary(contract),
             },
             "decision": {
                 "match_state": fallback_evaluation.match_state.value,
