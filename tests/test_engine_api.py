@@ -438,3 +438,47 @@ def test_guarded_result_summary_includes_intent_evaluation(
     assert summary["intent"]["evaluated"] is True
     assert summary["intent"]["matches"]["result_count"] == 1
     assert summary["intent"]["fallback"]["effective_hint"] == "require_approval"
+
+
+def test_guarded_result_summary_includes_intent_decision_receipt(tmp_path) -> None:
+    from rygnal.engine_api import _guarded_result_summary
+    from rygnal.guarded_runner import GuardedRunResult, GuardedRunStatus
+    from rygnal.intent_receipt import IntentDecisionReceipt
+
+    result = GuardedRunResult(
+        status=GuardedRunStatus.APPROVAL_REQUIRED,
+        run_id=None,
+        trusted_repo_path=tmp_path.as_posix(),
+        workspace_path=None,
+        baseline_commit_sha=None,
+        backend_name=None,
+        backend_safe_by_default=False,
+        containment_verified=False,
+        cleanup_performed=False,
+        cleanup_status=None,
+        command_result=None,
+        changed_file_report=None,
+        patch_diff=None,
+        change_risk_report=None,
+        blocked_reason="Intent requires approval.",
+        warnings=(),
+        intent_decision_receipt=IntentDecisionReceipt(
+            schema_version="intent-decision-receipt.v1",
+            receipt_hash="b" * 64,
+            trace_id="trace_receipt",
+            contract_id="intent_1",
+            session_id="intent_session_1",
+            enforcement_mode="enforce",
+            match_state="unknown",
+            recommended_hint="require_approval",
+            effective_hint="require_approval",
+            result_count=1,
+            action_ids=("action_1",),
+            reason_codes=("fallback:unknown-resource-or-operation",),
+        ),
+    )
+
+    summary = _guarded_result_summary(result, object())
+
+    assert summary["intent"]["receipt"]["receipt_hash"] == "b" * 64
+    assert summary["intent"]["receipt"]["trace_id"] == "trace_receipt"

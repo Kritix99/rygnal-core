@@ -1695,3 +1695,53 @@ def test_intent_enforce_secret_boundary_blocks_after_run(tmp_path: Path) -> None
     assert result.intent_fallback_evaluation.should_block
     assert "hard_sensitive" in result.blocked_reason
     assert "guarded_run.intent_evaluated" in audit_actions(audit)
+
+
+def test_guarded_run_records_intent_receipt_in_result_and_audit(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    from rygnal.intent_contract import (
+        IntentContract,
+        IntentContractSource,
+        IntentEnforcementMode,
+        IntentOperation,
+        ResourceScope,
+        ResourceScopeType,
+    )
+
+    repo = create_repo(tmp_path / "repo")
+    audit = AuditLogger(tmp_path / "audit.jsonl")
+    intent_contract = IntentContract(
+        source=IntentContractSource.YAML,
+        task_objective="Create only allowed docs",
+        allowed_actions=(IntentOperation.CREATE,),
+        target_scopes=(ResourceScope(type=ResourceScopeType.PATH_GLOB, value="docs/allowed/**"),),
+        enforcement_mode=IntentEnforcementMode.ENFORCE,
+    )
+
+    config = replace(
+        unsafe_config(
+            repo,
+            py_command(
+                "from pathlib import Path; "
+                "Path('docs').mkdir(exist_ok=True); "
+                "Path('docs/outside.md').write_text('outside', encoding='utf-8')"
+            ),
+            audit_logger=audit,
+        ),
+        intent_contract=intent_contract,
+        trace_id="trace_intent_receipt",
+    )
+
+    result = run_guarded(config)
+
+    assert result.intent_decision_receipt is not None
+    assert result.intent_decision_receipt.trace_id == "trace_intent_receipt"
+    assert result.intent_decision_receipt.receipt_hash
+    intent_event = next(
+        event for event in audit.read_events() if event.action == "guarded_run.intent_evaluated"
+    )
+    assert (
+        intent_event.metadata["intent_receipt"]["receipt_hash"]
+        == result.intent_decision_receipt.receipt_hash
+    )

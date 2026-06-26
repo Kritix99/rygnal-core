@@ -348,13 +348,13 @@ def _guarded_result_summary(result: GuardedRunResult, request: EngineRequest) ->
 def _intent_summary(result: GuardedRunResult) -> dict[str, Any]:
     match_results = tuple(getattr(result, "intent_match_results", ()))
     fallback_evaluation = getattr(result, "intent_fallback_evaluation", None)
+    receipt = getattr(result, "intent_decision_receipt", None)
 
     return {
-        "evaluated": bool(match_results or fallback_evaluation is not None),
+        "evaluated": bool(match_results or fallback_evaluation is not None or receipt is not None),
         "matches": intent_match_results_audit_summary(match_results),
-        "fallback": (
-            fallback_evaluation.audit_summary if fallback_evaluation is not None else None
-        ),
+        "fallback": fallback_evaluation.audit_summary if fallback_evaluation is not None else None,
+        "receipt": receipt.audit_summary if receipt is not None else None,
     }
 
 

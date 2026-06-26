@@ -60,6 +60,10 @@ from rygnal.intent_fallback_policy import (
     IntentFallbackEvaluation,
     evaluate_intent_fallback,
 )
+from rygnal.intent_receipt import (
+    IntentDecisionReceipt,
+    build_intent_decision_receipt,
+)
 from rygnal.models import (
     ApprovalRequest,
     Decision,
@@ -180,6 +184,7 @@ class GuardedRunResult:
     normalized_actions: tuple[NormalizedAction, ...] = ()
     intent_match_results: tuple[IntentMatchResult, ...] = ()
     intent_fallback_evaluation: IntentFallbackEvaluation | None = None
+    intent_decision_receipt: IntentDecisionReceipt | None = None
     approval_request: ApprovalRequest | None = None
     containment_features: dict[str, bool] = field(default_factory=dict)
 
@@ -651,6 +656,7 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
         approval_request: ApprovalRequest | None = None
         intent_match_results: tuple[IntentMatchResult, ...] = ()
         intent_fallback_evaluation: IntentFallbackEvaluation | None = None
+        intent_decision_receipt: IntentDecisionReceipt | None = None
         status = GuardedRunStatus.FAILED
 
         try:
@@ -928,6 +934,13 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
                         config=config,
                         normalized_actions=normalized_actions,
                     )
+                    intent_decision_receipt = build_intent_decision_receipt(
+                        contract=config.intent_contract,
+                        match_results=intent_match_results,
+                        fallback_evaluation=intent_fallback_evaluation,
+                        trace_id=trace_id,
+                        normalized_actions=normalized_actions,
+                    )
                     _audit_intent_evaluation(
                         config,
                         trace_id=trace_id,
@@ -936,6 +949,7 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
                         containment_verified=containment_verified,
                         match_results=intent_match_results,
                         fallback_evaluation=intent_fallback_evaluation,
+                        receipt=intent_decision_receipt,
                     )
 
                     intent_reason = _intent_policy_reason(intent_fallback_evaluation)
@@ -1040,6 +1054,7 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
             or _safe_normalized_command_actions(config.command),
             intent_match_results=intent_match_results,
             intent_fallback_evaluation=intent_fallback_evaluation,
+            intent_decision_receipt=intent_decision_receipt,
             approval_request=approval_request,
             containment_features=containment_features,
         )
@@ -1073,6 +1088,7 @@ def _audit_intent_evaluation(
     containment_verified: bool,
     match_results: tuple[IntentMatchResult, ...],
     fallback_evaluation: IntentFallbackEvaluation,
+    receipt: IntentDecisionReceipt,
 ) -> None:
     decision, allowed, severity = _intent_audit_decision(fallback_evaluation)
 
@@ -1087,6 +1103,7 @@ def _audit_intent_evaluation(
         metadata={
             **_worktree_metadata(worktree, backend_name, containment_verified),
             "intent_contract": _intent_contract_audit_summary(config.intent_contract),
+            "intent_receipt": receipt.audit_summary,
             "intent_matches": intent_match_results_audit_summary(match_results),
             "intent_fallback": fallback_evaluation.audit_summary,
         },

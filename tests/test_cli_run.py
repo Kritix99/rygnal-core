@@ -495,3 +495,28 @@ def test_json_summary_includes_intent_evaluation() -> None:
     assert payload["intent"]["evaluated"] is True
     assert payload["intent"]["matches"]["result_count"] == 1
     assert payload["intent"]["fallback"]["effective_hint"] == "require_approval"
+
+
+def test_json_summary_includes_intent_decision_receipt() -> None:
+    from rygnal.intent_receipt import IntentDecisionReceipt
+
+    result = fake_result()
+    result.intent_decision_receipt = IntentDecisionReceipt(
+        schema_version="intent-decision-receipt.v1",
+        receipt_hash="a" * 64,
+        trace_id="trace_receipt",
+        contract_id="intent_1",
+        session_id="intent_session_1",
+        enforcement_mode="enforce",
+        match_state="unknown",
+        recommended_hint="require_approval",
+        effective_hint="require_approval",
+        result_count=1,
+        action_ids=("action_1",),
+        reason_codes=("fallback:unknown-resource-or-operation",),
+    )
+
+    payload = cli_run.to_safe_json_summary(result)
+
+    assert payload["intent"]["receipt"]["receipt_hash"] == "a" * 64
+    assert payload["intent"]["receipt"]["trace_id"] == "trace_receipt"
