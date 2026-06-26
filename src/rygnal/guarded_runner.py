@@ -1164,6 +1164,8 @@ def _intent_true_risk_level(
     risk_level = getattr(change_risk_report, "risk_level", None)
     if risk_level is None:
         risk_level = getattr(change_risk_report, "overall_risk", None)
+    if risk_level is None:
+        risk_level = getattr(change_risk_report, "overall_risk_level", None)
 
     if risk_level is not None:
         return str(getattr(risk_level, "value", risk_level))

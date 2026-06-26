@@ -109,7 +109,7 @@ def normalize_changed_file_action(
     """Normalize one post-execution changed file."""
     operation = _operation_from_changed_file(changed_file)
     affected_paths = _affected_paths_for_changed_file(changed_file)
-    resource_kind = _resource_kind_for_path(changed_file.path)
+    resource_kind = _dominant_resource_kind(affected_paths)
     diff_metadata = _diff_metadata(patch_file=patch_file, patch_diff=patch_diff)
 
     old_path = changed_file.old_path if changed_file.kind == ChangedFileKind.RENAMED else None

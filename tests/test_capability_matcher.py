@@ -283,3 +283,24 @@ def test_match_many_and_audit_summary_are_queryable() -> None:
     assert summary["result_count"] == 2
     assert summary["match_state_counts"] == {"exact_match": 1, "conflict": 1}
     assert summary["decision_hint_counts"] == {"allow": 1, "require_approval": 1}
+
+
+def test_multi_path_action_is_partial_when_only_some_paths_match_target_scope() -> None:
+    result = match_action_to_contract(
+        action(
+            operation=IntentOperation.COMMAND,
+            affected_paths=("docs/allowed/inside.md", "docs/outside.md"),
+            resource_kind=ResourceKind.DOCUMENTATION,
+        ),
+        contract(
+            allowed_actions=(IntentOperation.COMMAND,),
+            target_scopes=(
+                ResourceScope(type=ResourceScopeType.PATH_GLOB, value="docs/allowed/**"),
+            ),
+        ),
+    )
+
+    assert result.match_state == IntentMatchState.PARTIAL_MATCH
+    assert result.decision_hint == IntentDecisionHint.AUDIT
+    assert "target-scope-partial" in result.reason_codes
+    assert result.metadata["out_of_scope_paths"] == ("docs/outside.md",)

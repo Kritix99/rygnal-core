@@ -196,6 +196,32 @@ def match_action_to_contract(
             metadata=metadata,
         )
 
+    out_of_scope_paths = _action_paths_outside_target_scopes(
+        contract.target_scopes,
+        action=action,
+        action_paths=action_paths,
+        graph=graph,
+    )
+    if out_of_scope_paths:
+        return IntentMatchResult(
+            match_state=IntentMatchState.PARTIAL_MATCH,
+            contract_id=contract.contract_id,
+            action_id=action.action_id,
+            matched_scopes=matched_scopes,
+            unmatched_scopes=tuple(
+                scope for scope in contract.target_scopes if scope not in matched_scopes
+            ),
+            reason_codes=tuple(
+                dict.fromkeys(("target-scope-partial", *operation_match.reason_codes))
+            ),
+            decision_hint=IntentDecisionHint.AUDIT,
+            metadata={
+                **metadata,
+                "matched_target_scope_count": len(matched_scopes),
+                "out_of_scope_paths": out_of_scope_paths,
+            },
+        )
+
     if operation_match.exact:
         return IntentMatchResult(
             match_state=IntentMatchState.EXACT_MATCH,
@@ -432,6 +458,29 @@ def _safe_graph_for_paths(paths: tuple[str, ...]) -> ResourceGraph:
         return ResourceGraph()
 
     return build_resource_graph_from_paths(paths)
+
+
+def _action_paths_outside_target_scopes(
+    scopes: tuple[ResourceScope, ...],
+    *,
+    action: NormalizedAction,
+    action_paths: tuple[str, ...],
+    graph: ResourceGraph,
+) -> tuple[str, ...]:
+    if not action_paths or not _requires_path_or_graph_scope(scopes):
+        return ()
+
+    out_of_scope_paths: list[str] = []
+    for path in action_paths:
+        if any(
+            _scope_matches(scope, action=action, action_paths=(path,), graph=graph)
+            for scope in scopes
+        ):
+            continue
+
+        out_of_scope_paths.append(path)
+
+    return tuple(out_of_scope_paths)
 
 
 def _requires_path_or_graph_scope(scopes: tuple[ResourceScope, ...]) -> bool:

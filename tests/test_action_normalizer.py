@@ -210,3 +210,22 @@ def test_python_inline_code_is_not_treated_as_repo_path_or_raw_telemetry() -> No
         "[REDACTED_INLINE_CODE]",
     )
     assert marker not in str(action.model_dump(mode="json"))
+
+
+def test_rename_resource_kind_considers_old_sensitive_path() -> None:
+    from rygnal.action_normalizer import normalize_changed_file_action
+    from rygnal.changed_files import ChangedFile, ChangedFileKind
+    from rygnal.intent_contract import IntentOperation, ResourceKind
+
+    action = normalize_changed_file_action(
+        ChangedFile(
+            path="docs/allowed/env.txt",
+            kind=ChangedFileKind.RENAMED,
+            old_path=".env",
+        )
+    )
+
+    assert action.operation == IntentOperation.RENAME
+    assert action.old_path == ".env"
+    assert action.new_path == "docs/allowed/env.txt"
+    assert action.resource_kind == ResourceKind.SECRET
