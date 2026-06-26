@@ -11,6 +11,7 @@ from typing import Any
 
 from rygnal.action_normalizer import normalized_actions_audit_summary
 from rygnal.audit_logger import AuditLogger
+from rygnal.capability_matcher import intent_match_results_audit_summary
 from rygnal.guarded_runner import (
     GuardedRunConfig,
     GuardedRunResult,
@@ -243,7 +244,21 @@ def to_safe_json_summary(result: GuardedRunResult) -> dict[str, Any]:
         "normalized_actions": normalized_actions_audit_summary(
             tuple(getattr(result, "normalized_actions", ()))
         ),
+        "intent": _intent_json_summary(result),
         "warnings": _unique_warnings(result.warnings),
+    }
+
+
+def _intent_json_summary(result: GuardedRunResult) -> dict[str, Any]:
+    match_results = tuple(getattr(result, "intent_match_results", ()))
+    fallback_evaluation = getattr(result, "intent_fallback_evaluation", None)
+
+    return {
+        "evaluated": bool(match_results or fallback_evaluation is not None),
+        "matches": intent_match_results_audit_summary(match_results),
+        "fallback": (
+            fallback_evaluation.audit_summary if fallback_evaluation is not None else None
+        ),
     }
 
 

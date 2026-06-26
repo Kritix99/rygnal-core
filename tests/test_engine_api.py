@@ -380,3 +380,61 @@ def test_guarded_result_summary_includes_normalized_action_telemetry(
     assert summary["normalized_actions"]["action_count"] == 1
     assert summary["normalized_actions"]["operation_counts"] == {"test": 1}
     assert summary["normalized_actions"]["source_counts"] == {"command": 1}
+
+
+def test_guarded_result_summary_includes_intent_evaluation(
+    tmp_path: Path,
+) -> None:
+    from rygnal.engine_api import _guarded_result_summary
+    from rygnal.guarded_runner import GuardedRunResult, GuardedRunStatus
+    from rygnal.intent_contract import (
+        IntentDecisionHint,
+        IntentEnforcementMode,
+        IntentMatchResult,
+        IntentMatchState,
+    )
+    from rygnal.intent_fallback_policy import IntentFallbackEvaluation
+
+    result = GuardedRunResult(
+        status=GuardedRunStatus.APPROVAL_REQUIRED,
+        run_id=None,
+        trusted_repo_path=tmp_path.as_posix(),
+        workspace_path=None,
+        baseline_commit_sha=None,
+        backend_name=None,
+        backend_safe_by_default=False,
+        containment_verified=False,
+        cleanup_performed=False,
+        cleanup_status=None,
+        command_result=None,
+        changed_file_report=None,
+        patch_diff=None,
+        change_risk_report=None,
+        blocked_reason="Intent requires approval.",
+        warnings=(),
+        intent_match_results=(
+            IntentMatchResult(
+                match_state=IntentMatchState.UNKNOWN,
+                contract_id="intent_1",
+                action_id="action_1",
+                reason_codes=("scope-unknown:no-affected-paths",),
+                decision_hint=IntentDecisionHint.REQUIRE_APPROVAL,
+            ),
+        ),
+        intent_fallback_evaluation=IntentFallbackEvaluation(
+            contract_id="intent_1",
+            enforcement_mode=IntentEnforcementMode.ENFORCE,
+            match_state=IntentMatchState.UNKNOWN,
+            recommended_hint=IntentDecisionHint.REQUIRE_APPROVAL,
+            effective_hint=IntentDecisionHint.REQUIRE_APPROVAL,
+            reason_codes=("fallback:unknown-resource-or-operation",),
+            result_count=1,
+            metadata={},
+        ),
+    )
+
+    summary = _guarded_result_summary(result, object())
+
+    assert summary["intent"]["evaluated"] is True
+    assert summary["intent"]["matches"]["result_count"] == 1
+    assert summary["intent"]["fallback"]["effective_hint"] == "require_approval"

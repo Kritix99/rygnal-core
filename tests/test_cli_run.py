@@ -458,3 +458,40 @@ def test_json_summary_includes_normalized_action_telemetry() -> None:
     assert payload["normalized_actions"]["action_count"] == 1
     assert payload["normalized_actions"]["operation_counts"] == {"test": 1}
     assert payload["normalized_actions"]["source_counts"] == {"command": 1}
+
+
+def test_json_summary_includes_intent_evaluation() -> None:
+    from rygnal.intent_contract import (
+        IntentDecisionHint,
+        IntentEnforcementMode,
+        IntentMatchResult,
+        IntentMatchState,
+    )
+    from rygnal.intent_fallback_policy import IntentFallbackEvaluation
+
+    result = fake_result()
+    result.intent_match_results = (
+        IntentMatchResult(
+            match_state=IntentMatchState.UNKNOWN,
+            contract_id="intent_1",
+            action_id="action_1",
+            reason_codes=("scope-unknown:no-affected-paths",),
+            decision_hint=IntentDecisionHint.REQUIRE_APPROVAL,
+        ),
+    )
+    result.intent_fallback_evaluation = IntentFallbackEvaluation(
+        contract_id="intent_1",
+        enforcement_mode=IntentEnforcementMode.ENFORCE,
+        match_state=IntentMatchState.UNKNOWN,
+        recommended_hint=IntentDecisionHint.REQUIRE_APPROVAL,
+        effective_hint=IntentDecisionHint.REQUIRE_APPROVAL,
+        reason_codes=("fallback:unknown-resource-or-operation",),
+        result_count=1,
+        metadata={},
+    )
+
+    payload = cli_run.to_safe_json_summary(result)
+
+    assert payload["intent"]["evaluated"] is True
+    assert payload["intent"]["matches"]["result_count"] == 1
+    assert payload["intent"]["fallback"]["effective_hint"] == "require_approval"

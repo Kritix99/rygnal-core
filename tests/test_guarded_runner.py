@@ -1568,3 +1568,130 @@ def test_guarded_run_normalized_actions_include_patch_metadata(
     assert file_actions
     assert file_actions[0].diff_metadata["file_patch_present"] is True
     assert file_actions[0].diff_metadata["patch_sha256"] == result.patch_diff.patch_sha256
+
+
+def test_intent_enforce_scope_drift_requires_approval_after_run(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    from rygnal.intent_contract import (
+        IntentContract,
+        IntentContractSource,
+        IntentEnforcementMode,
+        IntentOperation,
+        ResourceScope,
+        ResourceScopeType,
+    )
+
+    repo = create_repo(tmp_path / "repo")
+    audit = AuditLogger(tmp_path / "audit.jsonl")
+    intent_contract = IntentContract(
+        source=IntentContractSource.YAML,
+        task_objective="Create only allowed docs",
+        allowed_actions=(IntentOperation.CREATE,),
+        target_scopes=(ResourceScope(type=ResourceScopeType.PATH_GLOB, value="docs/allowed/**"),),
+        enforcement_mode=IntentEnforcementMode.ENFORCE,
+    )
+
+    config = replace(
+        unsafe_config(
+            repo,
+            py_command(
+                "from pathlib import Path; "
+                "Path('docs').mkdir(exist_ok=True); "
+                "Path('docs/outside.md').write_text('outside', encoding='utf-8')"
+            ),
+            audit_logger=audit,
+        ),
+        intent_contract=intent_contract,
+    )
+
+    result = run_guarded(config)
+
+    assert result.status == GuardedRunStatus.APPROVAL_REQUIRED
+    assert result.intent_fallback_evaluation is not None
+    assert result.intent_fallback_evaluation.requires_approval
+    assert result.intent_match_results
+    assert "guarded_run.intent_evaluated" in audit_actions(audit)
+
+
+def test_intent_shadow_scope_drift_audits_without_changing_status(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    from rygnal.intent_contract import (
+        IntentContract,
+        IntentContractSource,
+        IntentEnforcementMode,
+        IntentOperation,
+        ResourceScope,
+        ResourceScopeType,
+    )
+
+    repo = create_repo(tmp_path / "repo")
+    audit = AuditLogger(tmp_path / "audit.jsonl")
+    intent_contract = IntentContract(
+        source=IntentContractSource.YAML,
+        task_objective="Create only allowed docs in shadow mode",
+        allowed_actions=(IntentOperation.CREATE,),
+        target_scopes=(ResourceScope(type=ResourceScopeType.PATH_GLOB, value="docs/allowed/**"),),
+        enforcement_mode=IntentEnforcementMode.SHADOW,
+    )
+
+    config = replace(
+        unsafe_config(
+            repo,
+            py_command(
+                "from pathlib import Path; "
+                "Path('docs').mkdir(exist_ok=True); "
+                "Path('docs/outside.md').write_text('outside', encoding='utf-8')"
+            ),
+            audit_logger=audit,
+        ),
+        intent_contract=intent_contract,
+    )
+
+    result = run_guarded(config)
+
+    assert result.status == GuardedRunStatus.COMPLETED
+    assert result.intent_fallback_evaluation is not None
+    assert result.intent_fallback_evaluation.should_audit
+    assert "guarded_run.intent_evaluated" in audit_actions(audit)
+
+
+def test_intent_enforce_secret_boundary_blocks_after_run(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    from rygnal.intent_contract import (
+        IntentContract,
+        IntentContractSource,
+        IntentEnforcementMode,
+        IntentOperation,
+        ResourceScope,
+        ResourceScopeType,
+    )
+
+    repo = create_repo(tmp_path / "repo")
+    audit = AuditLogger(tmp_path / "audit.jsonl")
+    intent_contract = IntentContract(
+        source=IntentContractSource.YAML,
+        task_objective="Modify docs only",
+        allowed_actions=(IntentOperation.MODIFY,),
+        target_scopes=(ResourceScope(type=ResourceScopeType.PATH_GLOB, value="docs/**"),),
+        enforcement_mode=IntentEnforcementMode.ENFORCE,
+    )
+
+    config = replace(
+        unsafe_config(
+            repo,
+            py_command("from pathlib import Path; Path('.env').write_text('TOKEN=x')"),
+            audit_logger=audit,
+        ),
+        intent_contract=intent_contract,
+    )
+
+    result = run_guarded(config)
+
+    assert result.status == GuardedRunStatus.BLOCKED
+    assert result.intent_fallback_evaluation is not None
+    assert result.intent_fallback_evaluation.should_block
+    assert "hard_sensitive" in result.blocked_reason
+    assert "guarded_run.intent_evaluated" in audit_actions(audit)

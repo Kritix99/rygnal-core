@@ -25,6 +25,10 @@ from rygnal.action_normalizer import (
 )
 from rygnal.approval_queue import ApprovalQueueError, InMemoryApprovalQueue
 from rygnal.audit_logger import AuditLogger
+from rygnal.capability_matcher import (
+    intent_match_results_audit_summary,
+    match_actions_to_contract,
+)
 from rygnal.change_risk import (
     ChangeRiskClassificationError,
     ChangeRiskReason,
@@ -46,7 +50,16 @@ from rygnal.guarded_worktree import (
     create_guarded_worktree,
     detect_trusted_repo_root,
 )
-from rygnal.intent_contract import IntentContract, NormalizedAction
+from rygnal.intent_contract import (
+    IntentContract,
+    IntentDecisionHint,
+    IntentMatchResult,
+    NormalizedAction,
+)
+from rygnal.intent_fallback_policy import (
+    IntentFallbackEvaluation,
+    evaluate_intent_fallback,
+)
 from rygnal.models import (
     ApprovalRequest,
     Decision,
@@ -165,6 +178,8 @@ class GuardedRunResult:
     blocked_reason: str | None
     warnings: tuple[str, ...]
     normalized_actions: tuple[NormalizedAction, ...] = ()
+    intent_match_results: tuple[IntentMatchResult, ...] = ()
+    intent_fallback_evaluation: IntentFallbackEvaluation | None = None
     approval_request: ApprovalRequest | None = None
     containment_features: dict[str, bool] = field(default_factory=dict)
 
@@ -634,6 +649,8 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
         cleanup_performed = False
         blocked_reason: str | None = None
         approval_request: ApprovalRequest | None = None
+        intent_match_results: tuple[IntentMatchResult, ...] = ()
+        intent_fallback_evaluation: IntentFallbackEvaluation | None = None
         status = GuardedRunStatus.FAILED
 
         try:
@@ -906,6 +923,34 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
                     },
                 )
 
+                if config.intent_contract is not None:
+                    intent_match_results, intent_fallback_evaluation = _evaluate_intent_contract(
+                        config=config,
+                        normalized_actions=normalized_actions,
+                    )
+                    _audit_intent_evaluation(
+                        config,
+                        trace_id=trace_id,
+                        worktree=worktree,
+                        backend_name=backend_name,
+                        containment_verified=containment_verified,
+                        match_results=intent_match_results,
+                        fallback_evaluation=intent_fallback_evaluation,
+                    )
+
+                    intent_reason = _intent_policy_reason(intent_fallback_evaluation)
+                    if intent_fallback_evaluation.should_block:
+                        status = GuardedRunStatus.BLOCKED
+                        blocked_reason = intent_reason
+                        warnings.append(intent_reason)
+                    elif (
+                        intent_fallback_evaluation.requires_approval
+                        and status != GuardedRunStatus.BLOCKED
+                    ):
+                        status = GuardedRunStatus.APPROVAL_REQUIRED
+                        blocked_reason = blocked_reason or intent_reason
+                        warnings.append(intent_reason)
+
                 if config.preserve_workspace:
                     warnings.append("Guarded workspace was preserved by explicit configuration.")
                     cleanup_result = CleanupResult(
@@ -993,9 +1038,100 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
             warnings=tuple(warnings),
             normalized_actions=normalized_actions
             or _safe_normalized_command_actions(config.command),
+            intent_match_results=intent_match_results,
+            intent_fallback_evaluation=intent_fallback_evaluation,
             approval_request=approval_request,
             containment_features=containment_features,
         )
+
+
+def _evaluate_intent_contract(
+    *,
+    config: GuardedRunConfig,
+    normalized_actions: tuple[NormalizedAction, ...],
+) -> tuple[tuple[IntentMatchResult, ...], IntentFallbackEvaluation]:
+    if config.intent_contract is None:
+        raise ValueError("Intent contract is required for intent evaluation.")
+
+    match_results = match_actions_to_contract(
+        normalized_actions,
+        config.intent_contract,
+    )
+    fallback_evaluation = evaluate_intent_fallback(
+        match_results,
+        config.intent_contract,
+    )
+    return match_results, fallback_evaluation
+
+
+def _audit_intent_evaluation(
+    config: GuardedRunConfig,
+    *,
+    trace_id: str,
+    worktree: GuardedWorktree,
+    backend_name: str | None,
+    containment_verified: bool,
+    match_results: tuple[IntentMatchResult, ...],
+    fallback_evaluation: IntentFallbackEvaluation,
+) -> None:
+    decision, allowed, severity = _intent_audit_decision(fallback_evaluation)
+
+    _audit(
+        config,
+        trace_id=trace_id,
+        event_type="guarded_run.intent_evaluated",
+        decision=decision,
+        allowed=allowed,
+        severity=severity,
+        reason=_intent_policy_reason(fallback_evaluation),
+        metadata={
+            **_worktree_metadata(worktree, backend_name, containment_verified),
+            "intent_contract": _intent_contract_audit_summary(config.intent_contract),
+            "intent_matches": intent_match_results_audit_summary(match_results),
+            "intent_fallback": fallback_evaluation.audit_summary,
+        },
+    )
+
+
+def _intent_audit_decision(
+    fallback_evaluation: IntentFallbackEvaluation,
+) -> tuple[Decision, bool, Severity]:
+    if fallback_evaluation.effective_hint == IntentDecisionHint.BLOCK:
+        return Decision.BLOCK, False, Severity.CRITICAL
+
+    if fallback_evaluation.effective_hint == IntentDecisionHint.REQUIRE_APPROVAL:
+        return Decision.REQUIRE_APPROVAL, False, Severity.HIGH
+
+    if fallback_evaluation.effective_hint == IntentDecisionHint.AUDIT:
+        return Decision.ALLOW, True, Severity.MEDIUM
+
+    return Decision.ALLOW, True, Severity.LOW
+
+
+def _intent_policy_reason(fallback_evaluation: IntentFallbackEvaluation) -> str:
+    return (
+        "Intent contract fallback policy returned "
+        f"{fallback_evaluation.effective_hint.value} "
+        f"for {fallback_evaluation.match_state.value}."
+    )
+
+
+def _intent_contract_audit_summary(
+    contract: IntentContract | None,
+) -> dict[str, object] | None:
+    if contract is None:
+        return None
+
+    return {
+        "contract_id": contract.contract_id,
+        "session_id": contract.session_id,
+        "source": contract.source.value,
+        "enforcement_mode": contract.enforcement_mode.value,
+        "allowed_actions": tuple(action.value for action in contract.allowed_actions),
+        "target_scope_count": len(contract.target_scopes),
+        "excluded_scope_count": len(contract.excluded_scopes),
+        "risk_ceiling": contract.risk_ceiling,
+    }
 
 
 def _submit_patch_approval_request(
