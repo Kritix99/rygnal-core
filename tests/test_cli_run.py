@@ -345,3 +345,103 @@ def test_cli_does_not_directly_execute_agent_command(
     exit_code = main(["run", "--unsafe-local", "--", "python", "-c", "print('ok')"])
 
     assert exit_code == 0
+
+
+def test_cli_loads_intent_yaml_and_passes_contract_to_guarded_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured_config = {}
+
+    def fake_run_guarded(config):
+        captured_config["config"] = config
+        return fake_result()
+
+    monkeypatch.setattr(cli_run, "run_guarded", fake_run_guarded)
+
+    intent_file = tmp_path / "intent.yaml"
+    intent_file.write_text(
+        """
+source: yaml
+task_objective: Refactor authentication middleware
+allowed_actions:
+  - modify
+target_scopes:
+  - type: path_glob
+    value: src/auth/**
+enforcement_mode: shadow
+""",
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "run",
+            "--unsafe-local",
+            "--intent",
+            str(intent_file),
+            "--",
+            "python",
+            "-c",
+            "print(1)",
+        ]
+    )
+
+    config = captured_config["config"]
+
+    assert exit_code == 0
+    assert config.intent_contract is not None
+    assert config.intent_contract.task_objective == "Refactor authentication middleware"
+    assert config.intent_contract.target_scopes[0].value == "src/auth/**"
+
+
+def test_cli_invalid_intent_yaml_returns_usage_error_without_running_agent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def forbidden_run_guarded(_config):
+        raise AssertionError("run_guarded must not run when intent validation fails")
+
+    monkeypatch.setattr(cli_run, "run_guarded", forbidden_run_guarded)
+
+    intent_file = tmp_path / "intent.yaml"
+    intent_file.write_text("source: [", encoding="utf-8")
+
+    exit_code = main(
+        [
+            "run",
+            "--unsafe-local",
+            "--intent",
+            str(intent_file),
+            "--",
+            "python",
+            "-c",
+            "print(1)",
+        ]
+    )
+
+    captured = capsys.readouterr()
+
+    assert exit_code == cli_run.EXIT_USAGE_ERROR
+    assert "Intent file invalid" in captured.err
+    assert "invalid_intent_yaml" in captured.err
+
+
+def test_parser_exposes_intent_argument() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(
+        [
+            "run",
+            "--unsafe-local",
+            "--intent",
+            ".rygnal/intent.yaml",
+            "--",
+            "python",
+            "-c",
+            "print('hi')",
+        ]
+    )
+
+    assert args.intent == Path(".rygnal/intent.yaml")

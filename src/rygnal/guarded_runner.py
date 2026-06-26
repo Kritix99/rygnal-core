@@ -41,6 +41,7 @@ from rygnal.guarded_worktree import (
     create_guarded_worktree,
     detect_trusted_repo_root,
 )
+from rygnal.intent_contract import IntentContract
 from rygnal.models import (
     ApprovalRequest,
     Decision,
@@ -121,6 +122,7 @@ class GuardedRunConfig:
     user_id: str = "local_user"
     agent_id: str = "local_agent"
     trace_id: str | None = None
+    intent_contract: IntentContract | None = None
     audit_logger: AuditLogger | None = None
     approval_queue: InMemoryApprovalQueue | None = None
 

@@ -16,6 +16,7 @@ from rygnal.guarded_runner import (
     GuardedRunStatus,
     run_guarded,
 )
+from rygnal.intent_loader import IntentLoadError, load_intent_contract_from_yaml_file
 
 EXIT_COMPLETED = 0
 EXIT_COMMAND_FAILED = 1
@@ -41,6 +42,16 @@ def run_guarded_cli(args: argparse.Namespace) -> int:
 
     audit_logger = AuditLogger(args.audit_log) if args.audit_log else None
 
+    intent_contract = None
+    intent_path = getattr(args, "intent", None)
+    if intent_path is not None:
+        try:
+            intent_contract = load_intent_contract_from_yaml_file(intent_path)
+        except IntentLoadError as exc:
+            print(f"Intent file invalid: {intent_path}", file=sys.stderr)
+            print(str(exc), file=sys.stderr)
+            return EXIT_USAGE_ERROR
+
     config = GuardedRunConfig(
         trusted_repo_path=args.repo,
         command=agent_command,
@@ -53,6 +64,7 @@ def run_guarded_cli(args: argparse.Namespace) -> int:
         environment="cli",
         user_id="cli_user",
         agent_id="cli_agent",
+        intent_contract=intent_contract,
     )
 
     result = run_guarded(config)

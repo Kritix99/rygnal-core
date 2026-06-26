@@ -78,6 +78,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write audit events to this JSONL file.",
     )
     run_parser.add_argument(
+        "--intent",
+        type=Path,
+        default=None,
+        help="Load a Rygnal intent contract YAML file for this guarded run.",
+    )
+    run_parser.add_argument(
         "--json",
         action="store_true",
         help="Print machine-readable JSON summary.",
