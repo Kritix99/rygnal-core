@@ -7,6 +7,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from rygnal.engine_api import _build_guarded_config
+from rygnal.schemas import EngineRequest
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -286,3 +289,60 @@ def _git(cwd: Path, *args: str) -> None:
         capture_output=True,
         check=True,
     )
+
+
+def test_engine_api_builds_guarded_config_with_intent_contract(tmp_path: Path) -> None:
+    repo = _create_repo(tmp_path / "trusted")
+    request = EngineRequest.model_validate(
+        {
+            "protocol_version": "rygnal.engine.v1",
+            "action": "guarded_run.start",
+            "request_id": "engine-intent-config-test",
+            "trusted_repo_path": repo.as_posix(),
+            "command": [sys.executable, "-c", "print('hello')"],
+            "unsafe_local_requested": True,
+            "run_root": (tmp_path / "runs").as_posix(),
+            "intent_contract": {
+                "source": "json",
+                "task_objective": "Refactor authentication middleware",
+                "allowed_actions": ["modify"],
+                "target_scopes": [
+                    {
+                        "type": "path_glob",
+                        "value": "src/auth/**",
+                    }
+                ],
+            },
+        }
+    )
+
+    config = _build_guarded_config(request)
+
+    assert config.intent_contract is not None
+    assert config.intent_contract.task_objective == "Refactor authentication middleware"
+    assert config.intent_contract.target_scopes[0].value == "src/auth/**"
+
+
+def test_engine_api_rejects_invalid_intent_contract_json(tmp_path: Path) -> None:
+    repo = _create_repo(tmp_path / "trusted")
+    request = {
+        "protocol_version": "rygnal.engine.v1",
+        "action": "guarded_run.start",
+        "request_id": "engine-invalid-intent-test",
+        "trusted_repo_path": repo.as_posix(),
+        "command": [sys.executable, "-c", "print('hello')"],
+        "unsafe_local_requested": True,
+        "intent_contract": {
+            "source": "json",
+            "task_objective": "Modify source without target scope",
+            "allowed_actions": ["modify"],
+        },
+    }
+
+    completed = _run_engine_api(json.dumps(request) + "\n")
+
+    assert completed.returncode == 1
+    events = _parse_ndjson(completed.stdout)
+    assert events[-1]["event"] == "engine.error"
+    assert events[-1]["status"] == "invalid_request"
+    assert events[-1]["error"]["code"] == "invalid_request"

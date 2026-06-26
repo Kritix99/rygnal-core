@@ -241,6 +241,7 @@ def _build_guarded_config(request: EngineRequest) -> GuardedRunConfig:
         user_id=request.user_id,
         agent_id=request.agent_id,
         trace_id=request.request_id,
+        intent_contract=request.intent_contract,
         audit_logger=audit_logger,
         approval_queue=_approval_queue_from_environment(),
     )
