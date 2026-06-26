@@ -12,6 +12,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from rygnal.action_normalizer import normalized_actions_audit_summary
 from rygnal.approval_queue import APPROVAL_QUEUE_DB_PATH_ENV, SQLiteApprovalQueue
 from rygnal.audit_logger import AuditLogger
 from rygnal.guarded_runner import GuardedRunConfig, GuardedRunResult, GuardedRunStatus, run_guarded
@@ -335,6 +336,9 @@ def _guarded_result_summary(result: GuardedRunResult, request: EngineRequest) ->
         "risk": _risk_summary(result),
         "blocked_reason": result.blocked_reason,
         "approval": _approval_summary(result),
+        "normalized_actions": normalized_actions_audit_summary(
+            tuple(getattr(result, "normalized_actions", ()))
+        ),
         "warnings": tuple(dict.fromkeys(result.warnings)),
     }
 

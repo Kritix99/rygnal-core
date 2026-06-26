@@ -445,3 +445,16 @@ def test_parser_exposes_intent_argument() -> None:
     )
 
     assert args.intent == Path(".rygnal/intent.yaml")
+
+
+def test_json_summary_includes_normalized_action_telemetry() -> None:
+    from rygnal.action_normalizer import normalize_command_action
+
+    result = fake_result()
+    result.normalized_actions = (normalize_command_action(("python", "-m", "pytest")),)
+
+    payload = cli_run.to_safe_json_summary(result)
+
+    assert payload["normalized_actions"]["action_count"] == 1
+    assert payload["normalized_actions"]["operation_counts"] == {"test": 1}
+    assert payload["normalized_actions"]["source_counts"] == {"command": 1}

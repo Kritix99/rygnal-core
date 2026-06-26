@@ -18,6 +18,11 @@ from rygnal.action_intent import (
     ActionIntentSeverity,
     classify_command_intent,
 )
+from rygnal.action_normalizer import (
+    normalize_command_action,
+    normalize_guarded_actions,
+    normalized_actions_audit_summary,
+)
 from rygnal.approval_queue import ApprovalQueueError, InMemoryApprovalQueue
 from rygnal.audit_logger import AuditLogger
 from rygnal.change_risk import (
@@ -41,7 +46,7 @@ from rygnal.guarded_worktree import (
     create_guarded_worktree,
     detect_trusted_repo_root,
 )
-from rygnal.intent_contract import IntentContract
+from rygnal.intent_contract import IntentContract, NormalizedAction
 from rygnal.models import (
     ApprovalRequest,
     Decision,
@@ -159,6 +164,7 @@ class GuardedRunResult:
 
     blocked_reason: str | None
     warnings: tuple[str, ...]
+    normalized_actions: tuple[NormalizedAction, ...] = ()
     approval_request: ApprovalRequest | None = None
     containment_features: dict[str, bool] = field(default_factory=dict)
 
@@ -400,6 +406,7 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
     trace_id = config.trace_id or new_trace_id()
     warnings: list[str] = []
     trusted_repo_label = str(config.trusted_repo_path)
+    normalized_actions = _safe_normalized_command_actions(config.command)
 
     try:
         command = _validate_command(config.command)
@@ -413,7 +420,11 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
             trusted_repo_path=trusted_repo_label,
             reason=str(exc),
             warnings=warnings,
+            normalized_actions=normalized_actions
+            or _safe_normalized_command_actions(config.command),
         )
+
+    normalized_actions = (normalize_command_action(command),)
 
     _audit(
         config,
@@ -429,6 +440,17 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
             "preserve_workspace": config.preserve_workspace,
             "unsafe_local_requested": config.unsafe_local_requested,
         },
+    )
+    _audit_normalized_actions(
+        config,
+        trace_id=trace_id,
+        event_type="guarded_run.normalized_command_prepared",
+        decision=Decision.ALLOW,
+        allowed=True,
+        severity=Severity.LOW,
+        reason="Guarded command normalized before execution.",
+        actions=normalized_actions,
+        metadata={"phase": "pre_execution"},
     )
     _audit_command_intent(config, trace_id=trace_id, command=command)
 
@@ -446,6 +468,8 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
             trusted_repo_path=trusted_repo_label,
             reason=str(exc),
             warnings=warnings,
+            normalized_actions=normalized_actions
+            or _safe_normalized_command_actions(config.command),
         )
 
     backend_selection: ExecutionBackendSelection | None = None
@@ -860,6 +884,28 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
             )
         finally:
             if worktree is not None:
+                normalized_actions = normalize_guarded_actions(
+                    command,
+                    changed_file_report=changed_file_report,
+                    patch_diff=patch_diff,
+                )
+                _audit_normalized_actions(
+                    config,
+                    trace_id=trace_id,
+                    event_type="guarded_run.normalized_actions_recorded",
+                    decision=Decision.ALLOW,
+                    allowed=True,
+                    severity=Severity.LOW,
+                    reason="Guarded run normalized action telemetry recorded.",
+                    actions=normalized_actions,
+                    metadata={
+                        **_worktree_metadata(worktree, backend_name, containment_verified),
+                        "run_status": status.value,
+                        "changed_files_detected": changed_file_report is not None,
+                        "patch_generated": patch_diff is not None,
+                    },
+                )
+
                 if config.preserve_workspace:
                     warnings.append("Guarded workspace was preserved by explicit configuration.")
                     cleanup_result = CleanupResult(
@@ -945,6 +991,8 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
             change_risk_report=change_risk_report,
             blocked_reason=blocked_reason,
             warnings=tuple(warnings),
+            normalized_actions=normalized_actions
+            or _safe_normalized_command_actions(config.command),
             approval_request=approval_request,
             containment_features=containment_features,
         )
@@ -1049,6 +1097,33 @@ def _system_risk_score_for_level(risk_level: RiskLevel) -> float:
     if risk_level == RiskLevel.MEDIUM:
         return 4.0
     return 2.0
+
+
+def _audit_normalized_actions(
+    config: GuardedRunConfig,
+    *,
+    trace_id: str,
+    event_type: str,
+    decision: Decision,
+    allowed: bool,
+    severity: Severity,
+    reason: str,
+    actions: tuple[NormalizedAction, ...],
+    metadata: dict[str, object],
+) -> None:
+    _audit(
+        config,
+        trace_id=trace_id,
+        event_type=event_type,
+        decision=decision,
+        allowed=allowed,
+        severity=severity,
+        reason=reason,
+        metadata={
+            **metadata,
+            "normalized_actions": normalized_actions_audit_summary(actions),
+        },
+    )
 
 
 def _audit_command_intent(
@@ -1608,8 +1683,12 @@ def _blocked_result(
     backend_safe_by_default: bool = False,
     containment_verified: bool = False,
     containment_features: dict[str, bool] | None = None,
+    normalized_actions: tuple[NormalizedAction, ...] | None = None,
     event_type: str = "guarded_run.blocked",
 ) -> GuardedRunResult:
+    if not normalized_actions:
+        normalized_actions = _safe_normalized_command_actions(config.command)
+
     _audit(
         config,
         trace_id=trace_id,
@@ -1626,6 +1705,7 @@ def _blocked_result(
             "blocked_reason": reason,
             "warnings": tuple(warnings),
             "command": _command_audit_summary(config.command),
+            "normalized_actions": normalized_actions_audit_summary(normalized_actions),
         },
     )
 
@@ -1646,8 +1726,27 @@ def _blocked_result(
         change_risk_report=None,
         blocked_reason=reason,
         warnings=tuple(warnings),
+        normalized_actions=normalized_actions,
         containment_features=containment_features or {},
     )
+
+
+def _safe_normalized_command_actions(command: object) -> tuple[NormalizedAction, ...]:
+    if isinstance(command, str):
+        return ()
+
+    try:
+        command_tuple = tuple(command)  # type: ignore[arg-type]
+    except TypeError:
+        return ()
+
+    if not command_tuple or any(not isinstance(item, str) for item in command_tuple):
+        return ()
+
+    try:
+        return (normalize_command_action(command_tuple),)
+    except (TypeError, ValueError):
+        return ()
 
 
 def _audit(

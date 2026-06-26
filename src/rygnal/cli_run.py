@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from rygnal.action_normalizer import normalized_actions_audit_summary
 from rygnal.audit_logger import AuditLogger
 from rygnal.guarded_runner import (
     GuardedRunConfig,
@@ -239,6 +240,9 @@ def to_safe_json_summary(result: GuardedRunResult) -> dict[str, Any]:
             "sha256": patch.patch_sha256 if patch else None,
             "size_bytes": patch.patch_size_bytes if patch else 0,
         },
+        "normalized_actions": normalized_actions_audit_summary(
+            tuple(getattr(result, "normalized_actions", ()))
+        ),
         "warnings": _unique_warnings(result.warnings),
     }
 

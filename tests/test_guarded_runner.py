@@ -1432,3 +1432,139 @@ def test_guarded_run_audits_command_intent_before_execution_for_dirty_repo(
     assert intent_event.metadata["recommended_action"] == "block"
     assert intent_event.metadata["intents"]
     assert audit.verify_integrity()
+
+
+def test_guarded_run_records_normalized_command_before_dirty_repo_block(
+    tmp_path: Path,
+) -> None:
+    repo = create_repo(tmp_path / "repo")
+    audit = AuditLogger(tmp_path / "audit.jsonl")
+    (repo / "README.md").write_text("# dirty\n", encoding="utf-8")
+
+    result = run_guarded(
+        unsafe_config(
+            repo,
+            ("rm", "-rf", "dist"),
+            audit_logger=audit,
+        )
+    )
+
+    actions = audit_actions(audit)
+    normalized_event = next(
+        event
+        for event in audit.read_events()
+        if event.action == "guarded_run.normalized_command_prepared"
+    )
+
+    assert result.status == GuardedRunStatus.BLOCKED
+    assert result.normalized_actions
+    assert result.normalized_actions[0].operation.value == "delete_folder"
+    assert "guarded_run.normalized_command_prepared" in actions
+    assert "guarded_run.command_started" not in actions
+    assert actions.index("guarded_run.normalized_command_prepared") < actions.index(
+        "guarded_run.blocked"
+    )
+    assert normalized_event.metadata["normalized_actions"]["action_count"] == 1
+    assert normalized_event.metadata["normalized_actions"]["operation_counts"] == {
+        "delete_folder": 1
+    }
+
+
+def test_guarded_run_records_normalized_actions_for_noop_run(
+    tmp_path: Path,
+) -> None:
+    repo = create_repo(tmp_path / "repo")
+    audit = AuditLogger(tmp_path / "audit.jsonl")
+
+    result = run_guarded(
+        unsafe_config(
+            repo,
+            py_command("print('noop')"),
+            audit_logger=audit,
+        )
+    )
+
+    normalized_event = next(
+        event
+        for event in audit.read_events()
+        if event.action == "guarded_run.normalized_actions_recorded"
+    )
+
+    assert result.status == GuardedRunStatus.COMPLETED
+    assert len(result.normalized_actions) == 1
+    assert result.normalized_actions[0].source.value == "command"
+    assert normalized_event.metadata["normalized_actions"]["action_count"] == 1
+    assert normalized_event.metadata["changed_files_detected"] is True
+    assert normalized_event.metadata["patch_generated"] is False
+    assert audit.verify_integrity()
+
+
+def test_failed_guarded_run_exposes_normalized_file_effects(
+    tmp_path: Path,
+) -> None:
+    repo = create_repo(tmp_path / "repo")
+
+    result = run_guarded(
+        unsafe_config(
+            repo,
+            py_command(
+                "from pathlib import Path; import sys; "
+                "Path('failed_normalized.py').write_text('evidence'); "
+                "sys.exit(7)"
+            ),
+        )
+    )
+
+    assert result.status == GuardedRunStatus.FAILED
+    assert any(
+        action.operation.value == "create" and action.affected_paths == ("failed_normalized.py",)
+        for action in result.normalized_actions
+    )
+
+
+def test_timeout_guarded_run_exposes_normalized_file_effects(
+    tmp_path: Path,
+) -> None:
+    repo = create_repo(tmp_path / "repo")
+
+    result = run_guarded(
+        unsafe_config(
+            repo,
+            py_command(
+                "from pathlib import Path; import time; "
+                "Path('timeout_normalized.py').write_text('evidence'); "
+                "time.sleep(5)"
+            ),
+            timeout_seconds=1,
+        )
+    )
+
+    assert result.status == GuardedRunStatus.TIMED_OUT
+    assert any(
+        action.operation.value == "create" and action.affected_paths == ("timeout_normalized.py",)
+        for action in result.normalized_actions
+    )
+
+
+def test_guarded_run_normalized_actions_include_patch_metadata(
+    tmp_path: Path,
+) -> None:
+    repo = create_repo(tmp_path / "repo")
+
+    result = run_guarded(
+        unsafe_config(
+            repo,
+            py_command("from pathlib import Path; Path('normalized_patch.py').write_text('x')"),
+        )
+    )
+
+    file_actions = [
+        action
+        for action in result.normalized_actions
+        if action.source.value == "filesystem" and action.affected_paths == ("normalized_patch.py",)
+    ]
+
+    assert result.patch_diff is not None
+    assert file_actions
+    assert file_actions[0].diff_metadata["file_patch_present"] is True
+    assert file_actions[0].diff_metadata["patch_sha256"] == result.patch_diff.patch_sha256

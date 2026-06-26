@@ -346,3 +346,37 @@ def test_engine_api_rejects_invalid_intent_contract_json(tmp_path: Path) -> None
     assert events[-1]["event"] == "engine.error"
     assert events[-1]["status"] == "invalid_request"
     assert events[-1]["error"]["code"] == "invalid_request"
+
+
+def test_guarded_result_summary_includes_normalized_action_telemetry(
+    tmp_path: Path,
+) -> None:
+    from rygnal.action_normalizer import normalize_command_action
+    from rygnal.engine_api import _guarded_result_summary
+    from rygnal.guarded_runner import GuardedRunResult, GuardedRunStatus
+
+    result = GuardedRunResult(
+        status=GuardedRunStatus.COMPLETED,
+        run_id=None,
+        trusted_repo_path=tmp_path.as_posix(),
+        workspace_path=None,
+        baseline_commit_sha=None,
+        backend_name=None,
+        backend_safe_by_default=False,
+        containment_verified=False,
+        cleanup_performed=False,
+        cleanup_status=None,
+        command_result=None,
+        changed_file_report=None,
+        patch_diff=None,
+        change_risk_report=None,
+        blocked_reason=None,
+        warnings=(),
+        normalized_actions=(normalize_command_action(("python", "-m", "pytest")),),
+    )
+
+    summary = _guarded_result_summary(result, object())
+
+    assert summary["normalized_actions"]["action_count"] == 1
+    assert summary["normalized_actions"]["operation_counts"] == {"test": 1}
+    assert summary["normalized_actions"]["source_counts"] == {"command": 1}
