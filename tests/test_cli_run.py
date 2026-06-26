@@ -520,3 +520,44 @@ def test_json_summary_includes_intent_decision_receipt() -> None:
 
     assert payload["intent"]["receipt"]["receipt_hash"] == "a" * 64
     assert payload["intent"]["receipt"]["trace_id"] == "trace_receipt"
+
+
+def test_json_summary_includes_intent_review_decision() -> None:
+    from rygnal.intent_review import (
+        INTENT_REVIEW_SCHEMA_VERSION,
+        IntentReviewDecision,
+        IntentReviewDecisionType,
+        IntentReviewNextAction,
+    )
+
+    result = fake_result()
+    result.intent_review_decision = IntentReviewDecision(
+        schema_version=INTENT_REVIEW_SCHEMA_VERSION,
+        decision=IntentReviewDecisionType.SCOPE_EXPANSION_SUGGESTED,
+        action_summary={"action_count": 1},
+        affected_resources=(),
+        current_intent_contract_id="intent_1",
+        proposed_additional_scope=(
+            {
+                "type": "exact_path",
+                "value": "docs/outside.md",
+                "value_sha256": "a" * 64,
+                "resource_kind": "file",
+                "source_action_id": "action_1",
+                "source_match_state": "drift",
+                "requires_human_approval": True,
+                "auto_apply": False,
+            },
+        ),
+        reason_codes=("fallback:scope-drift",),
+        true_risk_level="high",
+        recommended_next_action=IntentReviewNextAction.REQUEST_SCOPE_EXPANSION_APPROVAL,
+    )
+
+    payload = cli_run.to_safe_json_summary(result)
+
+    assert payload["intent"]["review"]["schema_version"] == "intent-review.v1"
+    assert payload["intent"]["review"]["decision"] == "scope_expansion_suggested"
+    assert payload["intent"]["review"]["recommended_next_action"] == (
+        "request_scope_expansion_approval"
+    )

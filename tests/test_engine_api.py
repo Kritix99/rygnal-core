@@ -482,3 +482,48 @@ def test_guarded_result_summary_includes_intent_decision_receipt(tmp_path) -> No
 
     assert summary["intent"]["receipt"]["receipt_hash"] == "b" * 64
     assert summary["intent"]["receipt"]["trace_id"] == "trace_receipt"
+
+
+def test_guarded_result_summary_includes_intent_review_decision(tmp_path: Path) -> None:
+    from rygnal.engine_api import _guarded_result_summary
+    from rygnal.guarded_runner import GuardedRunResult, GuardedRunStatus
+    from rygnal.intent_review import (
+        INTENT_REVIEW_SCHEMA_VERSION,
+        IntentReviewDecision,
+        IntentReviewDecisionType,
+        IntentReviewNextAction,
+    )
+
+    result = GuardedRunResult(
+        status=GuardedRunStatus.APPROVAL_REQUIRED,
+        run_id=None,
+        trusted_repo_path=tmp_path.as_posix(),
+        workspace_path=None,
+        baseline_commit_sha=None,
+        backend_name=None,
+        backend_safe_by_default=False,
+        containment_verified=False,
+        cleanup_performed=False,
+        cleanup_status=None,
+        command_result=None,
+        changed_file_report=None,
+        patch_diff=None,
+        change_risk_report=None,
+        blocked_reason="Intent requires approval.",
+        warnings=(),
+        intent_review_decision=IntentReviewDecision(
+            schema_version=INTENT_REVIEW_SCHEMA_VERSION,
+            decision=IntentReviewDecisionType.GROUPED_REVIEW_SUGGESTED,
+            action_summary={"action_count": 2},
+            affected_resources=(),
+            current_intent_contract_id="intent_1",
+            reason_codes=("fallback:capability-conflict",),
+            true_risk_level="high",
+            recommended_next_action=IntentReviewNextAction.GROUP_REVIEW,
+        ),
+    )
+
+    summary = _guarded_result_summary(result, object())
+
+    assert summary["intent"]["review"]["decision"] == "grouped_review_suggested"
+    assert summary["intent"]["review"]["recommended_next_action"] == "group_review"

@@ -1796,3 +1796,59 @@ def test_guarded_run_audits_intent_evidence_without_raw_prompt_or_plan(
     assert "secret-value" not in events_text
     assert "Please create docs" not in events_text
     assert "I will create" not in events_text
+
+
+def test_guarded_run_records_intent_review_scope_expansion_hook(
+    tmp_path: Path,
+) -> None:
+    from dataclasses import replace
+
+    from rygnal.intent_contract import (
+        IntentContract,
+        IntentContractSource,
+        IntentEnforcementMode,
+        IntentOperation,
+        ResourceScope,
+        ResourceScopeType,
+    )
+    from rygnal.intent_review import IntentReviewDecisionType
+
+    repo = create_repo(tmp_path / "repo")
+    audit = AuditLogger(tmp_path / "audit.jsonl")
+    intent_contract = IntentContract(
+        source=IntentContractSource.YAML,
+        task_objective="Create only allowed docs",
+        allowed_actions=(IntentOperation.CREATE,),
+        target_scopes=(ResourceScope(type=ResourceScopeType.PATH_GLOB, value="docs/allowed/**"),),
+        enforcement_mode=IntentEnforcementMode.ENFORCE,
+    )
+
+    config = replace(
+        unsafe_config(
+            repo,
+            py_command(
+                "from pathlib import Path; "
+                "Path('docs').mkdir(exist_ok=True); "
+                "Path('docs/outside.md').write_text('outside', encoding='utf-8')"
+            ),
+            audit_logger=audit,
+        ),
+        intent_contract=intent_contract,
+    )
+
+    result = run_guarded(config)
+
+    assert result.status == GuardedRunStatus.APPROVAL_REQUIRED
+    assert result.intent_review_decision is not None
+    assert result.intent_review_decision.decision == (
+        IntentReviewDecisionType.SCOPE_EXPANSION_SUGGESTED
+    )
+    assert result.intent_review_decision.proposed_additional_scope
+    assert result.intent_review_decision.metadata["scope_auto_expanded"] is False
+    assert result.intent_review_decision.metadata["approval_submitted"] is False
+
+    intent_event = next(
+        event for event in audit.read_events() if event.action == "guarded_run.intent_evaluated"
+    )
+    assert intent_event.metadata["intent_review"]["decision"] == "scope_expansion_suggested"
+    assert intent_event.metadata["intent_review"]["proposed_additional_scope"]

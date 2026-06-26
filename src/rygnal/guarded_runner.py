@@ -65,6 +65,10 @@ from rygnal.intent_receipt import (
     IntentDecisionReceipt,
     build_intent_decision_receipt,
 )
+from rygnal.intent_review import (
+    IntentReviewDecision,
+    build_intent_review_decision,
+)
 from rygnal.models import (
     ApprovalRequest,
     Decision,
@@ -186,6 +190,7 @@ class GuardedRunResult:
     intent_match_results: tuple[IntentMatchResult, ...] = ()
     intent_fallback_evaluation: IntentFallbackEvaluation | None = None
     intent_decision_receipt: IntentDecisionReceipt | None = None
+    intent_review_decision: IntentReviewDecision | None = None
     approval_request: ApprovalRequest | None = None
     containment_features: dict[str, bool] = field(default_factory=dict)
 
@@ -659,6 +664,7 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
         intent_match_results: tuple[IntentMatchResult, ...] = ()
         intent_fallback_evaluation: IntentFallbackEvaluation | None = None
         intent_decision_receipt: IntentDecisionReceipt | None = None
+        intent_review_decision: IntentReviewDecision | None = None
         status = GuardedRunStatus.FAILED
 
         try:
@@ -943,6 +949,16 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
                         trace_id=trace_id,
                         normalized_actions=normalized_actions,
                     )
+                    intent_review_decision = build_intent_review_decision(
+                        contract=config.intent_contract,
+                        match_results=intent_match_results,
+                        fallback_evaluation=intent_fallback_evaluation,
+                        normalized_actions=normalized_actions,
+                        true_risk_level=_intent_true_risk_level(
+                            change_risk_report,
+                            intent_fallback_evaluation,
+                        ),
+                    )
                     _audit_intent_evaluation(
                         config,
                         trace_id=trace_id,
@@ -952,6 +968,7 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
                         match_results=intent_match_results,
                         fallback_evaluation=intent_fallback_evaluation,
                         receipt=intent_decision_receipt,
+                        review_decision=intent_review_decision,
                     )
 
                     intent_reason = _intent_policy_reason(intent_fallback_evaluation)
@@ -1057,6 +1074,7 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
             intent_match_results=intent_match_results,
             intent_fallback_evaluation=intent_fallback_evaluation,
             intent_decision_receipt=intent_decision_receipt,
+            intent_review_decision=intent_review_decision,
             approval_request=approval_request,
             containment_features=containment_features,
         )
@@ -1091,6 +1109,7 @@ def _audit_intent_evaluation(
     match_results: tuple[IntentMatchResult, ...],
     fallback_evaluation: IntentFallbackEvaluation,
     receipt: IntentDecisionReceipt,
+    review_decision: IntentReviewDecision | None,
 ) -> None:
     decision, allowed, severity = _intent_audit_decision(fallback_evaluation)
 
@@ -1108,6 +1127,9 @@ def _audit_intent_evaluation(
             "intent_receipt": receipt.audit_summary,
             "intent_matches": intent_match_results_audit_summary(match_results),
             "intent_fallback": fallback_evaluation.audit_summary,
+            "intent_review": (
+                review_decision.audit_summary if review_decision is not None else None
+            ),
         },
     )
 
@@ -1133,6 +1155,29 @@ def _intent_policy_reason(fallback_evaluation: IntentFallbackEvaluation) -> str:
         f"{fallback_evaluation.effective_hint.value} "
         f"for {fallback_evaluation.match_state.value}."
     )
+
+
+def _intent_true_risk_level(
+    change_risk_report: ChangeRiskReport | None,
+    fallback_evaluation: IntentFallbackEvaluation,
+) -> str:
+    risk_level = getattr(change_risk_report, "risk_level", None)
+    if risk_level is None:
+        risk_level = getattr(change_risk_report, "overall_risk", None)
+
+    if risk_level is not None:
+        return str(getattr(risk_level, "value", risk_level))
+
+    if fallback_evaluation.should_block:
+        return "critical"
+
+    if fallback_evaluation.requires_approval:
+        return "high"
+
+    if fallback_evaluation.should_audit:
+        return "medium"
+
+    return "low"
 
 
 def _intent_evidence_summary(contract: IntentContract | None) -> dict[str, object] | None:
