@@ -345,3 +345,219 @@ def test_cli_does_not_directly_execute_agent_command(
     exit_code = main(["run", "--unsafe-local", "--", "python", "-c", "print('ok')"])
 
     assert exit_code == 0
+
+
+def test_cli_loads_intent_yaml_and_passes_contract_to_guarded_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured_config = {}
+
+    def fake_run_guarded(config):
+        captured_config["config"] = config
+        return fake_result()
+
+    monkeypatch.setattr(cli_run, "run_guarded", fake_run_guarded)
+
+    intent_file = tmp_path / "intent.yaml"
+    intent_file.write_text(
+        """
+source: yaml
+task_objective: Refactor authentication middleware
+allowed_actions:
+  - modify
+target_scopes:
+  - type: path_glob
+    value: src/auth/**
+enforcement_mode: shadow
+""",
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "run",
+            "--unsafe-local",
+            "--intent",
+            str(intent_file),
+            "--",
+            "python",
+            "-c",
+            "print(1)",
+        ]
+    )
+
+    config = captured_config["config"]
+
+    assert exit_code == 0
+    assert config.intent_contract is not None
+    assert config.intent_contract.task_objective == "Refactor authentication middleware"
+    assert config.intent_contract.target_scopes[0].value == "src/auth/**"
+
+
+def test_cli_invalid_intent_yaml_returns_usage_error_without_running_agent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def forbidden_run_guarded(_config):
+        raise AssertionError("run_guarded must not run when intent validation fails")
+
+    monkeypatch.setattr(cli_run, "run_guarded", forbidden_run_guarded)
+
+    intent_file = tmp_path / "intent.yaml"
+    intent_file.write_text("source: [", encoding="utf-8")
+
+    exit_code = main(
+        [
+            "run",
+            "--unsafe-local",
+            "--intent",
+            str(intent_file),
+            "--",
+            "python",
+            "-c",
+            "print(1)",
+        ]
+    )
+
+    captured = capsys.readouterr()
+
+    assert exit_code == cli_run.EXIT_USAGE_ERROR
+    assert "Intent file invalid" in captured.err
+    assert "invalid_intent_yaml" in captured.err
+
+
+def test_parser_exposes_intent_argument() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(
+        [
+            "run",
+            "--unsafe-local",
+            "--intent",
+            ".rygnal/intent.yaml",
+            "--",
+            "python",
+            "-c",
+            "print('hi')",
+        ]
+    )
+
+    assert args.intent == Path(".rygnal/intent.yaml")
+
+
+def test_json_summary_includes_normalized_action_telemetry() -> None:
+    from rygnal.action_normalizer import normalize_command_action
+
+    result = fake_result()
+    result.normalized_actions = (normalize_command_action(("python", "-m", "pytest")),)
+
+    payload = cli_run.to_safe_json_summary(result)
+
+    assert payload["normalized_actions"]["action_count"] == 1
+    assert payload["normalized_actions"]["operation_counts"] == {"test": 1}
+    assert payload["normalized_actions"]["source_counts"] == {"command": 1}
+
+
+def test_json_summary_includes_intent_evaluation() -> None:
+    from rygnal.intent_contract import (
+        IntentDecisionHint,
+        IntentEnforcementMode,
+        IntentMatchResult,
+        IntentMatchState,
+    )
+    from rygnal.intent_fallback_policy import IntentFallbackEvaluation
+
+    result = fake_result()
+    result.intent_match_results = (
+        IntentMatchResult(
+            match_state=IntentMatchState.UNKNOWN,
+            contract_id="intent_1",
+            action_id="action_1",
+            reason_codes=("scope-unknown:no-affected-paths",),
+            decision_hint=IntentDecisionHint.REQUIRE_APPROVAL,
+        ),
+    )
+    result.intent_fallback_evaluation = IntentFallbackEvaluation(
+        contract_id="intent_1",
+        enforcement_mode=IntentEnforcementMode.ENFORCE,
+        match_state=IntentMatchState.UNKNOWN,
+        recommended_hint=IntentDecisionHint.REQUIRE_APPROVAL,
+        effective_hint=IntentDecisionHint.REQUIRE_APPROVAL,
+        reason_codes=("fallback:unknown-resource-or-operation",),
+        result_count=1,
+        metadata={},
+    )
+
+    payload = cli_run.to_safe_json_summary(result)
+
+    assert payload["intent"]["evaluated"] is True
+    assert payload["intent"]["matches"]["result_count"] == 1
+    assert payload["intent"]["fallback"]["effective_hint"] == "require_approval"
+
+
+def test_json_summary_includes_intent_decision_receipt() -> None:
+    from rygnal.intent_receipt import IntentDecisionReceipt
+
+    result = fake_result()
+    result.intent_decision_receipt = IntentDecisionReceipt(
+        schema_version="intent-decision-receipt.v1",
+        receipt_hash="a" * 64,
+        trace_id="trace_receipt",
+        contract_id="intent_1",
+        session_id="intent_session_1",
+        enforcement_mode="enforce",
+        match_state="unknown",
+        recommended_hint="require_approval",
+        effective_hint="require_approval",
+        result_count=1,
+        action_ids=("action_1",),
+        reason_codes=("fallback:unknown-resource-or-operation",),
+    )
+
+    payload = cli_run.to_safe_json_summary(result)
+
+    assert payload["intent"]["receipt"]["receipt_hash"] == "a" * 64
+    assert payload["intent"]["receipt"]["trace_id"] == "trace_receipt"
+
+
+def test_json_summary_includes_intent_review_decision() -> None:
+    from rygnal.intent_review import (
+        INTENT_REVIEW_SCHEMA_VERSION,
+        IntentReviewDecision,
+        IntentReviewDecisionType,
+        IntentReviewNextAction,
+    )
+
+    result = fake_result()
+    result.intent_review_decision = IntentReviewDecision(
+        schema_version=INTENT_REVIEW_SCHEMA_VERSION,
+        decision=IntentReviewDecisionType.SCOPE_EXPANSION_SUGGESTED,
+        action_summary={"action_count": 1},
+        affected_resources=(),
+        current_intent_contract_id="intent_1",
+        proposed_additional_scope=(
+            {
+                "type": "exact_path",
+                "value": "docs/outside.md",
+                "value_sha256": "a" * 64,
+                "resource_kind": "file",
+                "source_action_id": "action_1",
+                "source_match_state": "drift",
+                "requires_human_approval": True,
+                "auto_apply": False,
+            },
+        ),
+        reason_codes=("fallback:scope-drift",),
+        true_risk_level="high",
+        recommended_next_action=IntentReviewNextAction.REQUEST_SCOPE_EXPANSION_APPROVAL,
+    )
+
+    payload = cli_run.to_safe_json_summary(result)
+
+    assert payload["intent"]["review"]["schema_version"] == "intent-review.v1"
+    assert payload["intent"]["review"]["decision"] == "scope_expansion_suggested"
+    assert payload["intent"]["review"]["recommended_next_action"] == (
+        "request_scope_expansion_approval"
+    )

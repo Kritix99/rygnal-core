@@ -18,8 +18,17 @@ from rygnal.action_intent import (
     ActionIntentSeverity,
     classify_command_intent,
 )
+from rygnal.action_normalizer import (
+    normalize_command_action,
+    normalize_guarded_actions,
+    normalized_actions_audit_summary,
+)
 from rygnal.approval_queue import ApprovalQueueError, InMemoryApprovalQueue
 from rygnal.audit_logger import AuditLogger
+from rygnal.capability_matcher import (
+    intent_match_results_audit_summary,
+    match_actions_to_contract,
+)
 from rygnal.change_risk import (
     ChangeRiskClassificationError,
     ChangeRiskReason,
@@ -40,6 +49,25 @@ from rygnal.guarded_worktree import (
     GuardedWorktreeError,
     create_guarded_worktree,
     detect_trusted_repo_root,
+)
+from rygnal.intent_contract import (
+    IntentContract,
+    IntentDecisionHint,
+    IntentMatchResult,
+    NormalizedAction,
+)
+from rygnal.intent_evidence import intent_evidence_audit_summary
+from rygnal.intent_fallback_policy import (
+    IntentFallbackEvaluation,
+    evaluate_intent_fallback,
+)
+from rygnal.intent_receipt import (
+    IntentDecisionReceipt,
+    build_intent_decision_receipt,
+)
+from rygnal.intent_review import (
+    IntentReviewDecision,
+    build_intent_review_decision,
 )
 from rygnal.models import (
     ApprovalRequest,
@@ -121,6 +149,7 @@ class GuardedRunConfig:
     user_id: str = "local_user"
     agent_id: str = "local_agent"
     trace_id: str | None = None
+    intent_contract: IntentContract | None = None
     audit_logger: AuditLogger | None = None
     approval_queue: InMemoryApprovalQueue | None = None
 
@@ -157,6 +186,11 @@ class GuardedRunResult:
 
     blocked_reason: str | None
     warnings: tuple[str, ...]
+    normalized_actions: tuple[NormalizedAction, ...] = ()
+    intent_match_results: tuple[IntentMatchResult, ...] = ()
+    intent_fallback_evaluation: IntentFallbackEvaluation | None = None
+    intent_decision_receipt: IntentDecisionReceipt | None = None
+    intent_review_decision: IntentReviewDecision | None = None
     approval_request: ApprovalRequest | None = None
     containment_features: dict[str, bool] = field(default_factory=dict)
 
@@ -398,6 +432,7 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
     trace_id = config.trace_id or new_trace_id()
     warnings: list[str] = []
     trusted_repo_label = str(config.trusted_repo_path)
+    normalized_actions = _safe_normalized_command_actions(config.command)
 
     try:
         command = _validate_command(config.command)
@@ -411,7 +446,11 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
             trusted_repo_path=trusted_repo_label,
             reason=str(exc),
             warnings=warnings,
+            normalized_actions=normalized_actions
+            or _safe_normalized_command_actions(config.command),
         )
+
+    normalized_actions = (normalize_command_action(command),)
 
     _audit(
         config,
@@ -426,7 +465,19 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
             "timeout_seconds": config.timeout_seconds,
             "preserve_workspace": config.preserve_workspace,
             "unsafe_local_requested": config.unsafe_local_requested,
+            "intent_evidence": _intent_evidence_summary(config.intent_contract),
         },
+    )
+    _audit_normalized_actions(
+        config,
+        trace_id=trace_id,
+        event_type="guarded_run.normalized_command_prepared",
+        decision=Decision.ALLOW,
+        allowed=True,
+        severity=Severity.LOW,
+        reason="Guarded command normalized before execution.",
+        actions=normalized_actions,
+        metadata={"phase": "pre_execution"},
     )
     _audit_command_intent(config, trace_id=trace_id, command=command)
 
@@ -444,6 +495,8 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
             trusted_repo_path=trusted_repo_label,
             reason=str(exc),
             warnings=warnings,
+            normalized_actions=normalized_actions
+            or _safe_normalized_command_actions(config.command),
         )
 
     backend_selection: ExecutionBackendSelection | None = None
@@ -608,6 +661,10 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
         cleanup_performed = False
         blocked_reason: str | None = None
         approval_request: ApprovalRequest | None = None
+        intent_match_results: tuple[IntentMatchResult, ...] = ()
+        intent_fallback_evaluation: IntentFallbackEvaluation | None = None
+        intent_decision_receipt: IntentDecisionReceipt | None = None
+        intent_review_decision: IntentReviewDecision | None = None
         status = GuardedRunStatus.FAILED
 
         try:
@@ -858,6 +915,75 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
             )
         finally:
             if worktree is not None:
+                normalized_actions = normalize_guarded_actions(
+                    command,
+                    changed_file_report=changed_file_report,
+                    patch_diff=patch_diff,
+                )
+                _audit_normalized_actions(
+                    config,
+                    trace_id=trace_id,
+                    event_type="guarded_run.normalized_actions_recorded",
+                    decision=Decision.ALLOW,
+                    allowed=True,
+                    severity=Severity.LOW,
+                    reason="Guarded run normalized action telemetry recorded.",
+                    actions=normalized_actions,
+                    metadata={
+                        **_worktree_metadata(worktree, backend_name, containment_verified),
+                        "run_status": status.value,
+                        "changed_files_detected": changed_file_report is not None,
+                        "patch_generated": patch_diff is not None,
+                    },
+                )
+
+                if config.intent_contract is not None:
+                    intent_match_results, intent_fallback_evaluation = _evaluate_intent_contract(
+                        config=config,
+                        normalized_actions=normalized_actions,
+                    )
+                    intent_decision_receipt = build_intent_decision_receipt(
+                        contract=config.intent_contract,
+                        match_results=intent_match_results,
+                        fallback_evaluation=intent_fallback_evaluation,
+                        trace_id=trace_id,
+                        normalized_actions=normalized_actions,
+                    )
+                    intent_review_decision = build_intent_review_decision(
+                        contract=config.intent_contract,
+                        match_results=intent_match_results,
+                        fallback_evaluation=intent_fallback_evaluation,
+                        normalized_actions=normalized_actions,
+                        true_risk_level=_intent_true_risk_level(
+                            change_risk_report,
+                            intent_fallback_evaluation,
+                        ),
+                    )
+                    _audit_intent_evaluation(
+                        config,
+                        trace_id=trace_id,
+                        worktree=worktree,
+                        backend_name=backend_name,
+                        containment_verified=containment_verified,
+                        match_results=intent_match_results,
+                        fallback_evaluation=intent_fallback_evaluation,
+                        receipt=intent_decision_receipt,
+                        review_decision=intent_review_decision,
+                    )
+
+                    intent_reason = _intent_policy_reason(intent_fallback_evaluation)
+                    if intent_fallback_evaluation.should_block:
+                        status = GuardedRunStatus.BLOCKED
+                        blocked_reason = intent_reason
+                        warnings.append(intent_reason)
+                    elif (
+                        intent_fallback_evaluation.requires_approval
+                        and status != GuardedRunStatus.BLOCKED
+                    ):
+                        status = GuardedRunStatus.APPROVAL_REQUIRED
+                        blocked_reason = blocked_reason or intent_reason
+                        warnings.append(intent_reason)
+
                 if config.preserve_workspace:
                     warnings.append("Guarded workspace was preserved by explicit configuration.")
                     cleanup_result = CleanupResult(
@@ -943,9 +1069,143 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
             change_risk_report=change_risk_report,
             blocked_reason=blocked_reason,
             warnings=tuple(warnings),
+            normalized_actions=normalized_actions
+            or _safe_normalized_command_actions(config.command),
+            intent_match_results=intent_match_results,
+            intent_fallback_evaluation=intent_fallback_evaluation,
+            intent_decision_receipt=intent_decision_receipt,
+            intent_review_decision=intent_review_decision,
             approval_request=approval_request,
             containment_features=containment_features,
         )
+
+
+def _evaluate_intent_contract(
+    *,
+    config: GuardedRunConfig,
+    normalized_actions: tuple[NormalizedAction, ...],
+) -> tuple[tuple[IntentMatchResult, ...], IntentFallbackEvaluation]:
+    if config.intent_contract is None:
+        raise ValueError("Intent contract is required for intent evaluation.")
+
+    match_results = match_actions_to_contract(
+        normalized_actions,
+        config.intent_contract,
+    )
+    fallback_evaluation = evaluate_intent_fallback(
+        match_results,
+        config.intent_contract,
+    )
+    return match_results, fallback_evaluation
+
+
+def _audit_intent_evaluation(
+    config: GuardedRunConfig,
+    *,
+    trace_id: str,
+    worktree: GuardedWorktree,
+    backend_name: str | None,
+    containment_verified: bool,
+    match_results: tuple[IntentMatchResult, ...],
+    fallback_evaluation: IntentFallbackEvaluation,
+    receipt: IntentDecisionReceipt,
+    review_decision: IntentReviewDecision | None,
+) -> None:
+    decision, allowed, severity = _intent_audit_decision(fallback_evaluation)
+
+    _audit(
+        config,
+        trace_id=trace_id,
+        event_type="guarded_run.intent_evaluated",
+        decision=decision,
+        allowed=allowed,
+        severity=severity,
+        reason=_intent_policy_reason(fallback_evaluation),
+        metadata={
+            **_worktree_metadata(worktree, backend_name, containment_verified),
+            "intent_contract": _intent_contract_audit_summary(config.intent_contract),
+            "intent_receipt": receipt.audit_summary,
+            "intent_matches": intent_match_results_audit_summary(match_results),
+            "intent_fallback": fallback_evaluation.audit_summary,
+            "intent_review": (
+                review_decision.audit_summary if review_decision is not None else None
+            ),
+        },
+    )
+
+
+def _intent_audit_decision(
+    fallback_evaluation: IntentFallbackEvaluation,
+) -> tuple[Decision, bool, Severity]:
+    if fallback_evaluation.effective_hint == IntentDecisionHint.BLOCK:
+        return Decision.BLOCK, False, Severity.CRITICAL
+
+    if fallback_evaluation.effective_hint == IntentDecisionHint.REQUIRE_APPROVAL:
+        return Decision.REQUIRE_APPROVAL, False, Severity.HIGH
+
+    if fallback_evaluation.effective_hint == IntentDecisionHint.AUDIT:
+        return Decision.ALLOW, True, Severity.MEDIUM
+
+    return Decision.ALLOW, True, Severity.LOW
+
+
+def _intent_policy_reason(fallback_evaluation: IntentFallbackEvaluation) -> str:
+    return (
+        "Intent contract fallback policy returned "
+        f"{fallback_evaluation.effective_hint.value} "
+        f"for {fallback_evaluation.match_state.value}."
+    )
+
+
+def _intent_true_risk_level(
+    change_risk_report: ChangeRiskReport | None,
+    fallback_evaluation: IntentFallbackEvaluation,
+) -> str:
+    risk_level = getattr(change_risk_report, "risk_level", None)
+    if risk_level is None:
+        risk_level = getattr(change_risk_report, "overall_risk", None)
+    if risk_level is None:
+        risk_level = getattr(change_risk_report, "overall_risk_level", None)
+
+    if risk_level is not None:
+        return str(getattr(risk_level, "value", risk_level))
+
+    if fallback_evaluation.should_block:
+        return "critical"
+
+    if fallback_evaluation.requires_approval:
+        return "high"
+
+    if fallback_evaluation.should_audit:
+        return "medium"
+
+    return "low"
+
+
+def _intent_evidence_summary(contract: IntentContract | None) -> dict[str, object] | None:
+    if contract is None:
+        return None
+
+    return intent_evidence_audit_summary(contract)
+
+
+def _intent_contract_audit_summary(
+    contract: IntentContract | None,
+) -> dict[str, object] | None:
+    if contract is None:
+        return None
+
+    return {
+        "contract_id": contract.contract_id,
+        "session_id": contract.session_id,
+        "source": contract.source.value,
+        "enforcement_mode": contract.enforcement_mode.value,
+        "allowed_actions": tuple(action.value for action in contract.allowed_actions),
+        "target_scope_count": len(contract.target_scopes),
+        "excluded_scope_count": len(contract.excluded_scopes),
+        "risk_ceiling": contract.risk_ceiling,
+        "intent_evidence": _intent_evidence_summary(contract),
+    }
 
 
 def _submit_patch_approval_request(
@@ -1047,6 +1307,33 @@ def _system_risk_score_for_level(risk_level: RiskLevel) -> float:
     if risk_level == RiskLevel.MEDIUM:
         return 4.0
     return 2.0
+
+
+def _audit_normalized_actions(
+    config: GuardedRunConfig,
+    *,
+    trace_id: str,
+    event_type: str,
+    decision: Decision,
+    allowed: bool,
+    severity: Severity,
+    reason: str,
+    actions: tuple[NormalizedAction, ...],
+    metadata: dict[str, object],
+) -> None:
+    _audit(
+        config,
+        trace_id=trace_id,
+        event_type=event_type,
+        decision=decision,
+        allowed=allowed,
+        severity=severity,
+        reason=reason,
+        metadata={
+            **metadata,
+            "normalized_actions": normalized_actions_audit_summary(actions),
+        },
+    )
 
 
 def _audit_command_intent(
@@ -1606,8 +1893,12 @@ def _blocked_result(
     backend_safe_by_default: bool = False,
     containment_verified: bool = False,
     containment_features: dict[str, bool] | None = None,
+    normalized_actions: tuple[NormalizedAction, ...] | None = None,
     event_type: str = "guarded_run.blocked",
 ) -> GuardedRunResult:
+    if not normalized_actions:
+        normalized_actions = _safe_normalized_command_actions(config.command)
+
     _audit(
         config,
         trace_id=trace_id,
@@ -1624,6 +1915,7 @@ def _blocked_result(
             "blocked_reason": reason,
             "warnings": tuple(warnings),
             "command": _command_audit_summary(config.command),
+            "normalized_actions": normalized_actions_audit_summary(normalized_actions),
         },
     )
 
@@ -1644,8 +1936,27 @@ def _blocked_result(
         change_risk_report=None,
         blocked_reason=reason,
         warnings=tuple(warnings),
+        normalized_actions=normalized_actions,
         containment_features=containment_features or {},
     )
+
+
+def _safe_normalized_command_actions(command: object) -> tuple[NormalizedAction, ...]:
+    if isinstance(command, str):
+        return ()
+
+    try:
+        command_tuple = tuple(command)  # type: ignore[arg-type]
+    except TypeError:
+        return ()
+
+    if not command_tuple or any(not isinstance(item, str) for item in command_tuple):
+        return ()
+
+    try:
+        return (normalize_command_action(command_tuple),)
+    except (TypeError, ValueError):
+        return ()
 
 
 def _audit(

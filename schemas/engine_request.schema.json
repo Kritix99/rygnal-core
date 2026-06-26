@@ -19,7 +19,9 @@
     },
     "action": {
       "type": "string",
-      "enum": ["guarded_run.start"]
+      "enum": [
+        "guarded_run.start"
+      ]
     },
     "request_id": {
       "type": "string",
@@ -47,12 +49,18 @@
       "default": 300
     },
     "run_root": {
-      "type": ["string", "null"],
+      "type": [
+        "string",
+        "null"
+      ],
       "default": null,
       "description": "Optional absolute run-root path. If omitted, Python chooses a safe default."
     },
     "audit_log_path": {
-      "type": ["string", "null"],
+      "type": [
+        "string",
+        "null"
+      ],
       "default": null,
       "description": "Optional absolute audit log path."
     },
@@ -70,7 +78,10 @@
     },
     "untracked_file_policy": {
       "type": "string",
-      "enum": ["block", "preserve_and_warn"],
+      "enum": [
+        "block",
+        "preserve_and_warn"
+      ],
       "default": "block"
     },
     "environment": {
@@ -91,6 +102,18 @@
       "maxLength": 256,
       "default": "local_agent"
     },
+    "intent_contract": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/IntentContract"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Optional Rygnal intent contract JSON object. Validated by the Python engine before guarded execution."
+    },
     "debug": {
       "type": "object",
       "additionalProperties": false,
@@ -107,6 +130,185 @@
         "include_stderr": {
           "type": "boolean",
           "default": false
+        }
+      }
+    }
+  },
+  "$defs": {
+    "ResourceScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "value"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "exact_path",
+            "path_glob",
+            "file_type",
+            "resource_kind",
+            "symbol"
+          ]
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "resource_kind": {
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "file",
+                "directory",
+                "python_module",
+                "python_symbol",
+                "rust_module",
+                "rust_symbol",
+                "config",
+                "dependency_manifest",
+                "lockfile",
+                "ci_workflow",
+                "secret",
+                "test",
+                "generated",
+                "database_migration",
+                "policy",
+                "documentation",
+                "unknown"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "metadata": {
+          "type": "object",
+          "default": {}
+        }
+      }
+    },
+    "IntentContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "task_objective",
+        "allowed_actions"
+      ],
+      "properties": {
+        "protocol_version": {
+          "type": "string",
+          "const": "rygnal.intent.v1",
+          "default": "rygnal.intent.v1"
+        },
+        "contract_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "session_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "source": {
+          "type": "string",
+          "enum": [
+            "yaml",
+            "cli",
+            "json",
+            "prompt_draft",
+            "jit_expansion"
+          ]
+        },
+        "task_objective": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "allowed_actions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "enum": [
+              "read",
+              "create",
+              "modify",
+              "delete_file",
+              "delete_folder",
+              "rename",
+              "move",
+              "command",
+              "dependency_change",
+              "config_change",
+              "test",
+              "build",
+              "unknown"
+            ]
+          }
+        },
+        "target_scopes": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ResourceScope"
+          }
+        },
+        "excluded_scopes": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ResourceScope"
+          }
+        },
+        "risk_ceiling": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100,
+          "default": 100
+        },
+        "expires_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "approved_by": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "enforcement_mode": {
+          "type": "string",
+          "enum": [
+            "disabled",
+            "shadow",
+            "enforce"
+          ],
+          "default": "shadow"
+        },
+        "metadata": {
+          "type": "object",
+          "default": {}
         }
       }
     }

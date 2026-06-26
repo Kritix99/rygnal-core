@@ -7,6 +7,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from rygnal.engine_api import _build_guarded_config
+from rygnal.schemas import EngineRequest
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -286,3 +289,241 @@ def _git(cwd: Path, *args: str) -> None:
         capture_output=True,
         check=True,
     )
+
+
+def test_engine_api_builds_guarded_config_with_intent_contract(tmp_path: Path) -> None:
+    repo = _create_repo(tmp_path / "trusted")
+    request = EngineRequest.model_validate(
+        {
+            "protocol_version": "rygnal.engine.v1",
+            "action": "guarded_run.start",
+            "request_id": "engine-intent-config-test",
+            "trusted_repo_path": repo.as_posix(),
+            "command": [sys.executable, "-c", "print('hello')"],
+            "unsafe_local_requested": True,
+            "run_root": (tmp_path / "runs").as_posix(),
+            "intent_contract": {
+                "source": "json",
+                "task_objective": "Refactor authentication middleware",
+                "allowed_actions": ["modify"],
+                "target_scopes": [
+                    {
+                        "type": "path_glob",
+                        "value": "src/auth/**",
+                    }
+                ],
+            },
+        }
+    )
+
+    config = _build_guarded_config(request)
+
+    assert config.intent_contract is not None
+    assert config.intent_contract.task_objective == "Refactor authentication middleware"
+    assert config.intent_contract.target_scopes[0].value == "src/auth/**"
+
+
+def test_engine_api_rejects_invalid_intent_contract_json(tmp_path: Path) -> None:
+    repo = _create_repo(tmp_path / "trusted")
+    request = {
+        "protocol_version": "rygnal.engine.v1",
+        "action": "guarded_run.start",
+        "request_id": "engine-invalid-intent-test",
+        "trusted_repo_path": repo.as_posix(),
+        "command": [sys.executable, "-c", "print('hello')"],
+        "unsafe_local_requested": True,
+        "intent_contract": {
+            "source": "json",
+            "task_objective": "Modify source without target scope",
+            "allowed_actions": ["modify"],
+        },
+    }
+
+    completed = _run_engine_api(json.dumps(request) + "\n")
+
+    assert completed.returncode == 1
+    events = _parse_ndjson(completed.stdout)
+    assert events[-1]["event"] == "engine.error"
+    assert events[-1]["status"] == "invalid_request"
+    assert events[-1]["error"]["code"] == "invalid_request"
+
+
+def test_guarded_result_summary_includes_normalized_action_telemetry(
+    tmp_path: Path,
+) -> None:
+    from rygnal.action_normalizer import normalize_command_action
+    from rygnal.engine_api import _guarded_result_summary
+    from rygnal.guarded_runner import GuardedRunResult, GuardedRunStatus
+
+    result = GuardedRunResult(
+        status=GuardedRunStatus.COMPLETED,
+        run_id=None,
+        trusted_repo_path=tmp_path.as_posix(),
+        workspace_path=None,
+        baseline_commit_sha=None,
+        backend_name=None,
+        backend_safe_by_default=False,
+        containment_verified=False,
+        cleanup_performed=False,
+        cleanup_status=None,
+        command_result=None,
+        changed_file_report=None,
+        patch_diff=None,
+        change_risk_report=None,
+        blocked_reason=None,
+        warnings=(),
+        normalized_actions=(normalize_command_action(("python", "-m", "pytest")),),
+    )
+
+    summary = _guarded_result_summary(result, object())
+
+    assert summary["normalized_actions"]["action_count"] == 1
+    assert summary["normalized_actions"]["operation_counts"] == {"test": 1}
+    assert summary["normalized_actions"]["source_counts"] == {"command": 1}
+
+
+def test_guarded_result_summary_includes_intent_evaluation(
+    tmp_path: Path,
+) -> None:
+    from rygnal.engine_api import _guarded_result_summary
+    from rygnal.guarded_runner import GuardedRunResult, GuardedRunStatus
+    from rygnal.intent_contract import (
+        IntentDecisionHint,
+        IntentEnforcementMode,
+        IntentMatchResult,
+        IntentMatchState,
+    )
+    from rygnal.intent_fallback_policy import IntentFallbackEvaluation
+
+    result = GuardedRunResult(
+        status=GuardedRunStatus.APPROVAL_REQUIRED,
+        run_id=None,
+        trusted_repo_path=tmp_path.as_posix(),
+        workspace_path=None,
+        baseline_commit_sha=None,
+        backend_name=None,
+        backend_safe_by_default=False,
+        containment_verified=False,
+        cleanup_performed=False,
+        cleanup_status=None,
+        command_result=None,
+        changed_file_report=None,
+        patch_diff=None,
+        change_risk_report=None,
+        blocked_reason="Intent requires approval.",
+        warnings=(),
+        intent_match_results=(
+            IntentMatchResult(
+                match_state=IntentMatchState.UNKNOWN,
+                contract_id="intent_1",
+                action_id="action_1",
+                reason_codes=("scope-unknown:no-affected-paths",),
+                decision_hint=IntentDecisionHint.REQUIRE_APPROVAL,
+            ),
+        ),
+        intent_fallback_evaluation=IntentFallbackEvaluation(
+            contract_id="intent_1",
+            enforcement_mode=IntentEnforcementMode.ENFORCE,
+            match_state=IntentMatchState.UNKNOWN,
+            recommended_hint=IntentDecisionHint.REQUIRE_APPROVAL,
+            effective_hint=IntentDecisionHint.REQUIRE_APPROVAL,
+            reason_codes=("fallback:unknown-resource-or-operation",),
+            result_count=1,
+            metadata={},
+        ),
+    )
+
+    summary = _guarded_result_summary(result, object())
+
+    assert summary["intent"]["evaluated"] is True
+    assert summary["intent"]["matches"]["result_count"] == 1
+    assert summary["intent"]["fallback"]["effective_hint"] == "require_approval"
+
+
+def test_guarded_result_summary_includes_intent_decision_receipt(tmp_path) -> None:
+    from rygnal.engine_api import _guarded_result_summary
+    from rygnal.guarded_runner import GuardedRunResult, GuardedRunStatus
+    from rygnal.intent_receipt import IntentDecisionReceipt
+
+    result = GuardedRunResult(
+        status=GuardedRunStatus.APPROVAL_REQUIRED,
+        run_id=None,
+        trusted_repo_path=tmp_path.as_posix(),
+        workspace_path=None,
+        baseline_commit_sha=None,
+        backend_name=None,
+        backend_safe_by_default=False,
+        containment_verified=False,
+        cleanup_performed=False,
+        cleanup_status=None,
+        command_result=None,
+        changed_file_report=None,
+        patch_diff=None,
+        change_risk_report=None,
+        blocked_reason="Intent requires approval.",
+        warnings=(),
+        intent_decision_receipt=IntentDecisionReceipt(
+            schema_version="intent-decision-receipt.v1",
+            receipt_hash="b" * 64,
+            trace_id="trace_receipt",
+            contract_id="intent_1",
+            session_id="intent_session_1",
+            enforcement_mode="enforce",
+            match_state="unknown",
+            recommended_hint="require_approval",
+            effective_hint="require_approval",
+            result_count=1,
+            action_ids=("action_1",),
+            reason_codes=("fallback:unknown-resource-or-operation",),
+        ),
+    )
+
+    summary = _guarded_result_summary(result, object())
+
+    assert summary["intent"]["receipt"]["receipt_hash"] == "b" * 64
+    assert summary["intent"]["receipt"]["trace_id"] == "trace_receipt"
+
+
+def test_guarded_result_summary_includes_intent_review_decision(tmp_path: Path) -> None:
+    from rygnal.engine_api import _guarded_result_summary
+    from rygnal.guarded_runner import GuardedRunResult, GuardedRunStatus
+    from rygnal.intent_review import (
+        INTENT_REVIEW_SCHEMA_VERSION,
+        IntentReviewDecision,
+        IntentReviewDecisionType,
+        IntentReviewNextAction,
+    )
+
+    result = GuardedRunResult(
+        status=GuardedRunStatus.APPROVAL_REQUIRED,
+        run_id=None,
+        trusted_repo_path=tmp_path.as_posix(),
+        workspace_path=None,
+        baseline_commit_sha=None,
+        backend_name=None,
+        backend_safe_by_default=False,
+        containment_verified=False,
+        cleanup_performed=False,
+        cleanup_status=None,
+        command_result=None,
+        changed_file_report=None,
+        patch_diff=None,
+        change_risk_report=None,
+        blocked_reason="Intent requires approval.",
+        warnings=(),
+        intent_review_decision=IntentReviewDecision(
+            schema_version=INTENT_REVIEW_SCHEMA_VERSION,
+            decision=IntentReviewDecisionType.GROUPED_REVIEW_SUGGESTED,
+            action_summary={"action_count": 2},
+            affected_resources=(),
+            current_intent_contract_id="intent_1",
+            reason_codes=("fallback:capability-conflict",),
+            true_risk_level="high",
+            recommended_next_action=IntentReviewNextAction.GROUP_REVIEW,
+        ),
+    )
+
+    summary = _guarded_result_summary(result, object())
+
+    assert summary["intent"]["review"]["decision"] == "grouped_review_suggested"
+    assert summary["intent"]["review"]["recommended_next_action"] == "group_review"

@@ -1432,3 +1432,423 @@ def test_guarded_run_audits_command_intent_before_execution_for_dirty_repo(
     assert intent_event.metadata["recommended_action"] == "block"
     assert intent_event.metadata["intents"]
     assert audit.verify_integrity()
+
+
+def test_guarded_run_records_normalized_command_before_dirty_repo_block(
+    tmp_path: Path,
+) -> None:
+    repo = create_repo(tmp_path / "repo")
+    audit = AuditLogger(tmp_path / "audit.jsonl")
+    (repo / "README.md").write_text("# dirty\n", encoding="utf-8")
+
+    result = run_guarded(
+        unsafe_config(
+            repo,
+            ("rm", "-rf", "dist"),
+            audit_logger=audit,
+        )
+    )
+
+    actions = audit_actions(audit)
+    normalized_event = next(
+        event
+        for event in audit.read_events()
+        if event.action == "guarded_run.normalized_command_prepared"
+    )
+
+    assert result.status == GuardedRunStatus.BLOCKED
+    assert result.normalized_actions
+    assert result.normalized_actions[0].operation.value == "delete_folder"
+    assert "guarded_run.normalized_command_prepared" in actions
+    assert "guarded_run.command_started" not in actions
+    assert actions.index("guarded_run.normalized_command_prepared") < actions.index(
+        "guarded_run.blocked"
+    )
+    assert normalized_event.metadata["normalized_actions"]["action_count"] == 1
+    assert normalized_event.metadata["normalized_actions"]["operation_counts"] == {
+        "delete_folder": 1
+    }
+
+
+def test_guarded_run_records_normalized_actions_for_noop_run(
+    tmp_path: Path,
+) -> None:
+    repo = create_repo(tmp_path / "repo")
+    audit = AuditLogger(tmp_path / "audit.jsonl")
+
+    result = run_guarded(
+        unsafe_config(
+            repo,
+            py_command("print('noop')"),
+            audit_logger=audit,
+        )
+    )
+
+    normalized_event = next(
+        event
+        for event in audit.read_events()
+        if event.action == "guarded_run.normalized_actions_recorded"
+    )
+
+    assert result.status == GuardedRunStatus.COMPLETED
+    assert len(result.normalized_actions) == 1
+    assert result.normalized_actions[0].source.value == "command"
+    assert normalized_event.metadata["normalized_actions"]["action_count"] == 1
+    assert normalized_event.metadata["changed_files_detected"] is True
+    assert normalized_event.metadata["patch_generated"] is False
+    assert audit.verify_integrity()
+
+
+def test_failed_guarded_run_exposes_normalized_file_effects(
+    tmp_path: Path,
+) -> None:
+    repo = create_repo(tmp_path / "repo")
+
+    result = run_guarded(
+        unsafe_config(
+            repo,
+            py_command(
+                "from pathlib import Path; import sys; "
+                "Path('failed_normalized.py').write_text('evidence'); "
+                "sys.exit(7)"
+            ),
+        )
+    )
+
+    assert result.status == GuardedRunStatus.FAILED
+    assert any(
+        action.operation.value == "create" and action.affected_paths == ("failed_normalized.py",)
+        for action in result.normalized_actions
+    )
+
+
+def test_timeout_guarded_run_exposes_normalized_file_effects(
+    tmp_path: Path,
+) -> None:
+    repo = create_repo(tmp_path / "repo")
+
+    result = run_guarded(
+        unsafe_config(
+            repo,
+            py_command(
+                "from pathlib import Path; import time; "
+                "Path('timeout_normalized.py').write_text('evidence'); "
+                "time.sleep(5)"
+            ),
+            timeout_seconds=1,
+        )
+    )
+
+    assert result.status == GuardedRunStatus.TIMED_OUT
+    assert any(
+        action.operation.value == "create" and action.affected_paths == ("timeout_normalized.py",)
+        for action in result.normalized_actions
+    )
+
+
+def test_guarded_run_normalized_actions_include_patch_metadata(
+    tmp_path: Path,
+) -> None:
+    repo = create_repo(tmp_path / "repo")
+
+    result = run_guarded(
+        unsafe_config(
+            repo,
+            py_command("from pathlib import Path; Path('normalized_patch.py').write_text('x')"),
+        )
+    )
+
+    file_actions = [
+        action
+        for action in result.normalized_actions
+        if action.source.value == "filesystem" and action.affected_paths == ("normalized_patch.py",)
+    ]
+
+    assert result.patch_diff is not None
+    assert file_actions
+    assert file_actions[0].diff_metadata["file_patch_present"] is True
+    assert file_actions[0].diff_metadata["patch_sha256"] == result.patch_diff.patch_sha256
+
+
+def test_intent_enforce_scope_drift_requires_approval_after_run(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    from rygnal.intent_contract import (
+        IntentContract,
+        IntentContractSource,
+        IntentEnforcementMode,
+        IntentOperation,
+        ResourceScope,
+        ResourceScopeType,
+    )
+
+    repo = create_repo(tmp_path / "repo")
+    audit = AuditLogger(tmp_path / "audit.jsonl")
+    intent_contract = IntentContract(
+        source=IntentContractSource.YAML,
+        task_objective="Create only allowed docs",
+        allowed_actions=(IntentOperation.CREATE,),
+        target_scopes=(ResourceScope(type=ResourceScopeType.PATH_GLOB, value="docs/allowed/**"),),
+        enforcement_mode=IntentEnforcementMode.ENFORCE,
+    )
+
+    config = replace(
+        unsafe_config(
+            repo,
+            py_command(
+                "from pathlib import Path; "
+                "Path('docs').mkdir(exist_ok=True); "
+                "Path('docs/outside.md').write_text('outside', encoding='utf-8')"
+            ),
+            audit_logger=audit,
+        ),
+        intent_contract=intent_contract,
+    )
+
+    result = run_guarded(config)
+
+    assert result.status == GuardedRunStatus.APPROVAL_REQUIRED
+    assert result.intent_fallback_evaluation is not None
+    assert result.intent_fallback_evaluation.requires_approval
+    assert result.intent_match_results
+    assert "guarded_run.intent_evaluated" in audit_actions(audit)
+
+
+def test_intent_shadow_scope_drift_audits_without_changing_status(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    from rygnal.intent_contract import (
+        IntentContract,
+        IntentContractSource,
+        IntentEnforcementMode,
+        IntentOperation,
+        ResourceScope,
+        ResourceScopeType,
+    )
+
+    repo = create_repo(tmp_path / "repo")
+    audit = AuditLogger(tmp_path / "audit.jsonl")
+    intent_contract = IntentContract(
+        source=IntentContractSource.YAML,
+        task_objective="Create only allowed docs in shadow mode",
+        allowed_actions=(IntentOperation.CREATE,),
+        target_scopes=(ResourceScope(type=ResourceScopeType.PATH_GLOB, value="docs/allowed/**"),),
+        enforcement_mode=IntentEnforcementMode.SHADOW,
+    )
+
+    config = replace(
+        unsafe_config(
+            repo,
+            py_command(
+                "from pathlib import Path; "
+                "Path('docs').mkdir(exist_ok=True); "
+                "Path('docs/outside.md').write_text('outside', encoding='utf-8')"
+            ),
+            audit_logger=audit,
+        ),
+        intent_contract=intent_contract,
+    )
+
+    result = run_guarded(config)
+
+    assert result.status == GuardedRunStatus.COMPLETED
+    assert result.intent_fallback_evaluation is not None
+    assert result.intent_fallback_evaluation.should_audit
+    assert "guarded_run.intent_evaluated" in audit_actions(audit)
+
+
+def test_intent_enforce_secret_boundary_blocks_after_run(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    from rygnal.intent_contract import (
+        IntentContract,
+        IntentContractSource,
+        IntentEnforcementMode,
+        IntentOperation,
+        ResourceScope,
+        ResourceScopeType,
+    )
+
+    repo = create_repo(tmp_path / "repo")
+    audit = AuditLogger(tmp_path / "audit.jsonl")
+    intent_contract = IntentContract(
+        source=IntentContractSource.YAML,
+        task_objective="Modify docs only",
+        allowed_actions=(IntentOperation.MODIFY,),
+        target_scopes=(ResourceScope(type=ResourceScopeType.PATH_GLOB, value="docs/**"),),
+        enforcement_mode=IntentEnforcementMode.ENFORCE,
+    )
+
+    config = replace(
+        unsafe_config(
+            repo,
+            py_command("from pathlib import Path; Path('.env').write_text('TOKEN=x')"),
+            audit_logger=audit,
+        ),
+        intent_contract=intent_contract,
+    )
+
+    result = run_guarded(config)
+
+    assert result.status == GuardedRunStatus.BLOCKED
+    assert result.intent_fallback_evaluation is not None
+    assert result.intent_fallback_evaluation.should_block
+    assert "hard_sensitive" in result.blocked_reason
+    assert "guarded_run.intent_evaluated" in audit_actions(audit)
+
+
+def test_guarded_run_records_intent_receipt_in_result_and_audit(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    from rygnal.intent_contract import (
+        IntentContract,
+        IntentContractSource,
+        IntentEnforcementMode,
+        IntentOperation,
+        ResourceScope,
+        ResourceScopeType,
+    )
+
+    repo = create_repo(tmp_path / "repo")
+    audit = AuditLogger(tmp_path / "audit.jsonl")
+    intent_contract = IntentContract(
+        source=IntentContractSource.YAML,
+        task_objective="Create only allowed docs",
+        allowed_actions=(IntentOperation.CREATE,),
+        target_scopes=(ResourceScope(type=ResourceScopeType.PATH_GLOB, value="docs/allowed/**"),),
+        enforcement_mode=IntentEnforcementMode.ENFORCE,
+    )
+
+    config = replace(
+        unsafe_config(
+            repo,
+            py_command(
+                "from pathlib import Path; "
+                "Path('docs').mkdir(exist_ok=True); "
+                "Path('docs/outside.md').write_text('outside', encoding='utf-8')"
+            ),
+            audit_logger=audit,
+        ),
+        intent_contract=intent_contract,
+        trace_id="trace_intent_receipt",
+    )
+
+    result = run_guarded(config)
+
+    assert result.intent_decision_receipt is not None
+    assert result.intent_decision_receipt.trace_id == "trace_intent_receipt"
+    assert result.intent_decision_receipt.receipt_hash
+    intent_event = next(
+        event for event in audit.read_events() if event.action == "guarded_run.intent_evaluated"
+    )
+    assert (
+        intent_event.metadata["intent_receipt"]["receipt_hash"]
+        == result.intent_decision_receipt.receipt_hash
+    )
+
+
+def test_guarded_run_audits_intent_evidence_without_raw_prompt_or_plan(
+    tmp_path: Path,
+) -> None:
+    from dataclasses import replace
+
+    from rygnal.intent_contract import (
+        IntentContract,
+        IntentContractSource,
+        IntentEnforcementMode,
+        IntentOperation,
+        ResourceScope,
+        ResourceScopeType,
+    )
+
+    repo = create_repo(tmp_path / "repo")
+    audit = AuditLogger(tmp_path / "audit.jsonl")
+    intent_contract = IntentContract(
+        source=IntentContractSource.YAML,
+        task_objective="Create only allowed docs",
+        human_prompt="Please create docs. token=secret-value",
+        ai_plan="I will create docs/outside.md.",
+        evidence_source="chat",
+        allowed_actions=(IntentOperation.CREATE,),
+        target_scopes=(ResourceScope(type=ResourceScopeType.PATH_GLOB, value="docs/allowed/**"),),
+        enforcement_mode=IntentEnforcementMode.ENFORCE,
+    )
+
+    config = replace(
+        unsafe_config(
+            repo,
+            py_command(
+                "from pathlib import Path; "
+                "Path('docs').mkdir(exist_ok=True); "
+                "Path('docs/outside.md').write_text('outside', encoding='utf-8')"
+            ),
+            audit_logger=audit,
+        ),
+        intent_contract=intent_contract,
+        trace_id="trace_intent_evidence",
+    )
+
+    run_guarded(config)
+
+    events_text = str([event.model_dump(mode="json") for event in audit.read_events()])
+    assert "intent_evidence" in events_text
+    assert "combined_evidence_hash" in events_text
+    assert "secret-value" not in events_text
+    assert "Please create docs" not in events_text
+    assert "I will create" not in events_text
+
+
+def test_guarded_run_records_intent_review_scope_expansion_hook(
+    tmp_path: Path,
+) -> None:
+    from dataclasses import replace
+
+    from rygnal.intent_contract import (
+        IntentContract,
+        IntentContractSource,
+        IntentEnforcementMode,
+        IntentOperation,
+        ResourceScope,
+        ResourceScopeType,
+    )
+    from rygnal.intent_review import IntentReviewDecisionType
+
+    repo = create_repo(tmp_path / "repo")
+    audit = AuditLogger(tmp_path / "audit.jsonl")
+    intent_contract = IntentContract(
+        source=IntentContractSource.YAML,
+        task_objective="Create only allowed docs",
+        allowed_actions=(IntentOperation.CREATE,),
+        target_scopes=(ResourceScope(type=ResourceScopeType.PATH_GLOB, value="docs/allowed/**"),),
+        enforcement_mode=IntentEnforcementMode.ENFORCE,
+    )
+
+    config = replace(
+        unsafe_config(
+            repo,
+            py_command(
+                "from pathlib import Path; "
+                "Path('docs').mkdir(exist_ok=True); "
+                "Path('docs/outside.md').write_text('outside', encoding='utf-8')"
+            ),
+            audit_logger=audit,
+        ),
+        intent_contract=intent_contract,
+    )
+
+    result = run_guarded(config)
+
+    assert result.status == GuardedRunStatus.APPROVAL_REQUIRED
+    assert result.intent_review_decision is not None
+    assert result.intent_review_decision.decision == (
+        IntentReviewDecisionType.SCOPE_EXPANSION_SUGGESTED
+    )
+    assert result.intent_review_decision.proposed_additional_scope
+    assert result.intent_review_decision.metadata["scope_auto_expanded"] is False
+    assert result.intent_review_decision.metadata["approval_submitted"] is False
+
+    intent_event = next(
+        event for event in audit.read_events() if event.action == "guarded_run.intent_evaluated"
+    )
+    assert intent_event.metadata["intent_review"]["decision"] == "scope_expansion_suggested"
+    assert intent_event.metadata["intent_review"]["proposed_additional_scope"]

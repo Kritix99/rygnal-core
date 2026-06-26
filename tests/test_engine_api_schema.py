@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from rygnal.intent_contract import IntentOperation
 from rygnal.schemas import EngineRequest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -85,3 +86,64 @@ def test_engine_request_model_forbids_shell_true(tmp_path: Path) -> None:
 
     with pytest.raises(ValidationError):
         EngineRequest.model_validate(payload)
+
+
+def test_engine_request_model_accepts_intent_contract_json(tmp_path: Path) -> None:
+    request = EngineRequest.model_validate(
+        {
+            "protocol_version": "rygnal.engine.v1",
+            "action": "guarded_run.start",
+            "request_id": "schema-intent-test",
+            "trusted_repo_path": tmp_path.resolve().as_posix(),
+            "command": [sys.executable, "-c", "print('hello')"],
+            "unsafe_local_requested": True,
+            "intent_contract": {
+                "source": "json",
+                "task_objective": "Refactor authentication middleware",
+                "allowed_actions": ["modify"],
+                "target_scopes": [
+                    {
+                        "type": "path_glob",
+                        "value": "src/auth/**",
+                    }
+                ],
+                "enforcement_mode": "shadow",
+            },
+        }
+    )
+
+    assert request.intent_contract is not None
+    assert request.intent_contract.source == "json"
+    assert request.intent_contract.allowed_actions == (IntentOperation.MODIFY,)
+    assert request.intent_contract.target_scopes[0].value == "src/auth/**"
+
+
+def test_engine_request_model_rejects_invalid_intent_contract(tmp_path: Path) -> None:
+    payload = {
+        "protocol_version": "rygnal.engine.v1",
+        "action": "guarded_run.start",
+        "request_id": "schema-invalid-intent-test",
+        "trusted_repo_path": tmp_path.resolve().as_posix(),
+        "command": [sys.executable, "-c", "print('hello')"],
+        "unsafe_local_requested": True,
+        "intent_contract": {
+            "source": "json",
+            "task_objective": "Modify source without target scope",
+            "allowed_actions": ["modify"],
+        },
+    }
+
+    with pytest.raises(ValidationError):
+        EngineRequest.model_validate(payload)
+
+
+def test_engine_request_schema_exposes_intent_contract() -> None:
+    request_schema = json.loads(
+        (PROJECT_ROOT / "schemas/engine_request.schema.json").read_text(encoding="utf-8")
+    )
+
+    intent_schema = request_schema["properties"]["intent_contract"]
+
+    assert intent_schema["anyOf"][0]["$ref"] == "#/$defs/IntentContract"
+    assert "IntentContract" in request_schema["$defs"]
+    assert "ResourceScope" in request_schema["$defs"]

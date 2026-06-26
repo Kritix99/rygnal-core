@@ -9,13 +9,16 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from rygnal.action_normalizer import normalized_actions_audit_summary
 from rygnal.audit_logger import AuditLogger
+from rygnal.capability_matcher import intent_match_results_audit_summary
 from rygnal.guarded_runner import (
     GuardedRunConfig,
     GuardedRunResult,
     GuardedRunStatus,
     run_guarded,
 )
+from rygnal.intent_loader import IntentLoadError, load_intent_contract_from_yaml_file
 
 EXIT_COMPLETED = 0
 EXIT_COMMAND_FAILED = 1
@@ -41,6 +44,16 @@ def run_guarded_cli(args: argparse.Namespace) -> int:
 
     audit_logger = AuditLogger(args.audit_log) if args.audit_log else None
 
+    intent_contract = None
+    intent_path = getattr(args, "intent", None)
+    if intent_path is not None:
+        try:
+            intent_contract = load_intent_contract_from_yaml_file(intent_path)
+        except IntentLoadError as exc:
+            print(f"Intent file invalid: {intent_path}", file=sys.stderr)
+            print(str(exc), file=sys.stderr)
+            return EXIT_USAGE_ERROR
+
     config = GuardedRunConfig(
         trusted_repo_path=args.repo,
         command=agent_command,
@@ -53,6 +66,7 @@ def run_guarded_cli(args: argparse.Namespace) -> int:
         environment="cli",
         user_id="cli_user",
         agent_id="cli_agent",
+        intent_contract=intent_contract,
     )
 
     result = run_guarded(config)
@@ -227,7 +241,31 @@ def to_safe_json_summary(result: GuardedRunResult) -> dict[str, Any]:
             "sha256": patch.patch_sha256 if patch else None,
             "size_bytes": patch.patch_size_bytes if patch else 0,
         },
+        "normalized_actions": normalized_actions_audit_summary(
+            tuple(getattr(result, "normalized_actions", ()))
+        ),
+        "intent": _intent_json_summary(result),
         "warnings": _unique_warnings(result.warnings),
+    }
+
+
+def _intent_json_summary(result: GuardedRunResult) -> dict[str, Any]:
+    match_results = tuple(getattr(result, "intent_match_results", ()))
+    fallback_evaluation = getattr(result, "intent_fallback_evaluation", None)
+    receipt = getattr(result, "intent_decision_receipt", None)
+    review_decision = getattr(result, "intent_review_decision", None)
+
+    return {
+        "evaluated": bool(
+            match_results
+            or fallback_evaluation is not None
+            or receipt is not None
+            or review_decision is not None
+        ),
+        "matches": intent_match_results_audit_summary(match_results),
+        "fallback": fallback_evaluation.audit_summary if fallback_evaluation is not None else None,
+        "receipt": receipt.audit_summary if receipt is not None else None,
+        "review": review_decision.audit_summary if review_decision is not None else None,
     }
 
 

@@ -8,6 +8,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from rygnal.intent_contract import IntentContract
+
 PROTOCOL_VERSION = "rygnal.engine.v1"
 
 
@@ -81,6 +83,8 @@ class EngineRequest(BaseModel):
     environment: str = Field(default="local", min_length=1, max_length=128)
     user_id: str = Field(default="local_user", min_length=1, max_length=256)
     agent_id: str = Field(default="local_agent", min_length=1, max_length=256)
+
+    intent_contract: IntentContract | None = None
 
     debug: EngineDebugOptions = Field(default_factory=EngineDebugOptions)
 
