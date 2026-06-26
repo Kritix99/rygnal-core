@@ -162,7 +162,7 @@ def classify_resource_path(path: str) -> ResourceKind:
     name = PurePosixPath(normalized).name
 
     if _is_secret_path(lowered):
-        return ResourceKind.SECRET
+        return ResourceKind.SENSITIVE
     if normalized.startswith(".github/workflows/"):
         return ResourceKind.CI_WORKFLOW
     if name in _LOCKFILE_NAMES:
@@ -299,7 +299,7 @@ def _edges_for_path(path: str, file_node_id: str) -> tuple[ResourceGraphEdge, ..
         ResourceKind.DEPENDENCY_MANIFEST,
         ResourceKind.LOCKFILE,
         ResourceKind.POLICY,
-        ResourceKind.SECRET,
+        ResourceKind.SENSITIVE,
     }:
         edges.append(
             _edge(

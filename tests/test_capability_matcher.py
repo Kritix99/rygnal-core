@@ -245,7 +245,7 @@ def test_secret_action_is_hard_sensitive_even_if_scope_matches() -> None:
         action(
             operation=IntentOperation.MODIFY,
             affected_paths=(".env",),
-            resource_kind=ResourceKind.SECRET,
+            resource_kind=ResourceKind.SENSITIVE,
         ),
         contract(
             allowed_actions=(IntentOperation.MODIFY,),

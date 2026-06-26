@@ -62,7 +62,7 @@ def _action() -> NormalizedAction:
         source=NormalizedActionSource.FILESYSTEM,
         operation=IntentOperation.CREATE,
         affected_paths=(".env",),
-        resource_kind=ResourceKind.SECRET,
+        resource_kind=ResourceKind.SENSITIVE,
     )
 
 

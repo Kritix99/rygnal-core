@@ -19,7 +19,7 @@ def test_classifies_python_rust_and_config_resources() -> None:
     assert classify_resource_path("src/rust_kernel/lib.rs") == ResourceKind.RUST_MODULE
     assert classify_resource_path("pyproject.toml") == ResourceKind.DEPENDENCY_MANIFEST
     assert classify_resource_path(".github/workflows/ci.yml") == ResourceKind.CI_WORKFLOW
-    assert classify_resource_path(".env") == ResourceKind.SECRET
+    assert classify_resource_path(".env") == ResourceKind.SENSITIVE
     assert classify_resource_path("docs/usage.md") == ResourceKind.DOCUMENTATION
 
 

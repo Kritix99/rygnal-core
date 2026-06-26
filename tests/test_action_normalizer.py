@@ -72,8 +72,8 @@ def test_normalize_deleted_secret_file_action() -> None:
     action = normalize_changed_file_action(changed_file)
 
     assert action.operation == IntentOperation.DELETE_FILE
-    assert action.resource_kind == ResourceKind.SECRET
-    assert "resource_kind:secret" in action.reason_codes
+    assert action.resource_kind == ResourceKind.SENSITIVE
+    assert "resource_kind:sensitive" in action.reason_codes
 
 
 def test_normalize_renamed_file_preserves_old_and_new_paths() -> None:
@@ -228,4 +228,4 @@ def test_rename_resource_kind_considers_old_sensitive_path() -> None:
     assert action.operation == IntentOperation.RENAME
     assert action.old_path == ".env"
     assert action.new_path == "docs/allowed/env.txt"
-    assert action.resource_kind == ResourceKind.SECRET
+    assert action.resource_kind == ResourceKind.SENSITIVE

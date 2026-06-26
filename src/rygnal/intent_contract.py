@@ -70,7 +70,7 @@ class ResourceKind(StrEnum):
     DEPENDENCY_MANIFEST = "dependency_manifest"
     LOCKFILE = "lockfile"
     CI_WORKFLOW = "ci_workflow"
-    SECRET = "secret"
+    SENSITIVE = "sensitive"
     TEST = "test"
     GENERATED = "generated"
     DATABASE_MIGRATION = "database_migration"

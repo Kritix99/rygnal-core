@@ -118,12 +118,12 @@ def test_scope_expansion_suggested_for_scope_drift_without_auto_expanding_contra
 
 def test_policy_deny_for_hard_sensitive_boundary() -> None:
     contract = _contract()
-    action = _action(path=".env", resource_kind=ResourceKind.SECRET)
+    action = _action(path=".env", resource_kind=ResourceKind.SENSITIVE)
     result = IntentMatchResult(
         match_state=IntentMatchState.HARD_SENSITIVE,
         contract_id=contract.contract_id,
         action_id=action.action_id,
-        reason_codes=("hard-sensitive-resource", "resource_kind:secret"),
+        reason_codes=("hard-sensitive-resource", "resource_kind:sensitive"),
         decision_hint=IntentDecisionHint.BLOCK,
     )
 
@@ -146,7 +146,7 @@ def test_policy_deny_for_hard_sensitive_boundary() -> None:
 
 def test_shadow_mode_emits_shadow_only_trace_without_approval_submission() -> None:
     contract = _contract(enforcement_mode=IntentEnforcementMode.SHADOW)
-    action = _action(path=".env", resource_kind=ResourceKind.SECRET)
+    action = _action(path=".env", resource_kind=ResourceKind.SENSITIVE)
     result = IntentMatchResult(
         match_state=IntentMatchState.HARD_SENSITIVE,
         contract_id=contract.contract_id,

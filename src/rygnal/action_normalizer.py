@@ -421,7 +421,7 @@ def _dominant_resource_kind(paths: tuple[str, ...]) -> ResourceKind:
     kinds = tuple(_resource_kind_for_path(path) for path in paths)
 
     for preferred in (
-        ResourceKind.SECRET,
+        ResourceKind.SENSITIVE,
         ResourceKind.POLICY,
         ResourceKind.CI_WORKFLOW,
         ResourceKind.DEPENDENCY_MANIFEST,
@@ -443,7 +443,7 @@ def _resource_kind_for_path(path: str) -> ResourceKind:
     name = PurePosixPath(normalized).name
 
     if _is_secret_path(lowered):
-        return ResourceKind.SECRET
+        return ResourceKind.SENSITIVE
     if normalized.startswith(".github/workflows/"):
         return ResourceKind.CI_WORKFLOW
     if name in _LOCKFILE_NAMES:

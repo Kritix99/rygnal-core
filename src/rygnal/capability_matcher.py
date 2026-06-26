@@ -27,7 +27,7 @@ from rygnal.resource_graph import ResourceGraph, build_resource_graph_from_paths
 
 _SENSITIVE_RESOURCE_KINDS = frozenset(
     {
-        ResourceKind.SECRET,
+        ResourceKind.SENSITIVE,
     }
 )
 
