@@ -21,7 +21,8 @@ class ActionIntentCode(StrEnum):
     TEST_OR_BUILD = "test_or_build"
     SOURCE_CODE_CHANGE = "source_code_change"
     DEPENDENCY_CHANGE = "dependency_change"
-    SECRET_OR_CREDENTIAL_ACCESS = "secret_or_credential_access"  # nosec B105 - public intent code label, not a credential
+    # Public intent-category label, not a credential value.
+    SECRET_OR_CREDENTIAL_ACCESS = "secret_or_credential_access"  # nosec B105
     NETWORK_ACCESS = "network_access"
     EXTERNAL_DOWNLOAD = "external_download"
     FILESYSTEM_DESTRUCTIVE = "filesystem_destructive"
