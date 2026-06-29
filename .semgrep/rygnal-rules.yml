@@ -1,0 +1,67 @@
+rules:
+  - id: dangerous-recursive-delete
+    languages: [python]
+    message: "Potential dangerous recursive delete or directory removal. Ensure this operation is restricted to the sandbox workspace."
+    severity: WARNING
+    metadata:
+      category: security
+    patterns:
+      - pattern-either:
+          - pattern: shutil.rmtree(...)
+          - pattern: os.removedirs(...)
+      - pattern-not: shutil.rmtree(run_dir, ...)
+      - pattern-not: shutil.rmtree(worktree.workspace_path, ...)
+
+  - id: dangerous-shell-delete-python
+    languages: [python]
+    message: "Dangerous shell command executing 'rm -rf'. Destructive deletes should be managed through guarded workspace APIs."
+    severity: ERROR
+    metadata:
+      category: security
+    patterns:
+      - pattern-either:
+          - pattern: subprocess.run("rm -rf" + ...)
+          - pattern: subprocess.run(["rm", "-rf", ...], ...)
+          - pattern: subprocess.Popen("rm -rf" + ...)
+          - pattern: subprocess.Popen(["rm", "-rf", ...], ...)
+          - pattern: os.system("rm -rf" + ...)
+
+  - id: dangerous-shell-delete-go
+    languages: [go]
+    message: "Dangerous shell command executing 'rm -rf'. Destructive deletes should be managed through guarded workspace APIs."
+    severity: ERROR
+    metadata:
+      category: security
+    patterns:
+      - pattern-either:
+          - pattern: exec.Command("rm", "-rf", ...)
+          - pattern: exec.CommandContext(..., "rm", "-rf", ...)
+          - pattern: exec.Command("sh", "-c", "rm -rf" + ...)
+          - pattern: exec.Command("bash", "-c", "rm -rf" + ...)
+
+  - id: risky-safety-bypass
+    languages: [python, go]
+    message: "Hardcoded safety bypass detected. Do not force unsafe local execution or allow dirty overrides directly in codebase logic."
+    severity: WARNING
+    metadata:
+      category: security
+    patterns:
+      - pattern-either:
+          - pattern: allow_dirty_override = True
+          - pattern: unsafe_local_requested = True
+          - pattern: UnsafeLocal = true
+
+  - id: direct-file-mutation
+    languages: [python]
+    message: "Direct file mutation targeting sensitive configuration or system files. Writes should go through the safe apply layer."
+    severity: WARNING
+    metadata:
+      category: security
+    patterns:
+      - pattern: open($PATH, $MODE, ...)
+      - metavariable-regex:
+          metavariable: $MODE
+          regex: "['\"](w|a|x|r\\+|w\\+|a\\+|x\\+)(b|t)?['\"]"
+      - metavariable-regex:
+          metavariable: $PATH
+          regex: ".*(gitignore|dockerignore|requirements|policies|roles.yaml|passwd|group).*"

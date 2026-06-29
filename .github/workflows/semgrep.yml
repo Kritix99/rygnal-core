@@ -1,0 +1,25 @@
+name: Semgrep Static Analysis
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  semgrep:
+    name: Semgrep Scan
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run Auto Configuration Scan
+        run: semgrep scan --config auto
+
+      - name: Run Custom Safety Rules Scan
+        run: semgrep scan --config .semgrep/rygnal-rules.yml
