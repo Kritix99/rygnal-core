@@ -44,9 +44,10 @@ This is not:
 - a full SaaS product
 - a production enterprise deployment
 - a web dashboard
-- a real AI-agent framework integration
 - a cloud-hosted service
-- an MCP gateway
+- a direct, out-of-the-box real AI-agent framework integration or proxy gateway (integrated via example adapter wrappers for OpenAI, LangChain, and MCP under `examples/`)
+
+
 
 ## Validation
 

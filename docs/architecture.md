@@ -2,7 +2,11 @@
 
 ## Overview
 
-Rygnal Core is designed as a runtime control layer for AI-agent tool actions.
+Rygnal Core is designed as a runtime control layer for AI-agent tool actions. The codebase is organized as a three-language monorepo:
+
+- **Go (CLI and TUI)**: Manages CLI commands, process containment, terminal approval prompt UX, and routes tool-interception requests.
+- **Python (Engine and Orchestration)**: Handles policy evaluation, risk analysis, local HTTP API services, database audit logs, and approval queue workflows.
+- **Rust (Safety Kernel)**: Provides high-performance, deterministic primitives (AST parsing via Tree-Sitter, path safety, and criticality assessment) exported as a Python extension via PyO3.
 
 The core architecture is modular so each part can evolve independently.
 
