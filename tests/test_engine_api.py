@@ -116,7 +116,7 @@ def test_engine_api_streams_successful_guarded_run_without_raw_payloads(tmp_path
     assert data["workspace_path_returned"] is False
     assert data["trusted_repo"]["absolute_path_returned"] is False
 
-    assert not (repo / "agent_output.txt").exists()
+    assert (repo / "agent_output.txt").exists()
 
 
 def test_engine_api_approval_required_summary_includes_risk_block(
@@ -173,7 +173,7 @@ def test_engine_api_approval_required_summary_includes_risk_block(
     assert "dependency-file-change" in data["risk"]["reasons"]
     assert data["risk"]["counts"]["high"] >= 1
     assert "raw" not in data["patch"]
-    assert not (repo / "pyproject.toml").exists()
+    assert (repo / "pyproject.toml").exists()
 
 
 def test_engine_api_approval_required_wins_over_agent_failure(tmp_path: Path) -> None:

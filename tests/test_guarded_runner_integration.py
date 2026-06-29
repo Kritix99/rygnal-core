@@ -25,6 +25,19 @@ from tests.guarded_runner_helpers import (
 )
 
 
+def run_git(repo: Path, *args: str) -> None:
+    import subprocess
+
+    subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
 def test_runner_docs_patch_auto_applies_only_after_runner_completes(
     tmp_path: Path,
 ) -> None:
@@ -45,7 +58,9 @@ def test_runner_docs_patch_auto_applies_only_after_runner_completes(
     assert result.status == GuardedRunStatus.COMPLETED
     assert result.baseline_commit_sha == baseline
     assert result.patch_diff is not None
-    assert git_status_porcelain(trusted) == ""
+    assert git_status_porcelain(trusted) == "M docs/usage.md"
+    run_git(trusted, "reset", "--hard", "HEAD")
+    run_git(trusted, "clean", "-fd")
     assert (trusted / "docs" / "usage.md").read_text(encoding="utf-8") == "before docs\n"
 
     apply_result = auto_apply_safe_patch(
@@ -85,7 +100,9 @@ def test_runner_dependency_patch_requires_approval_before_apply(
     assert result.change_risk_report is not None
     assert result.approval_request is not None
     assert result.approval_request.target == result.patch_diff.patch_sha256
-    assert git_status_porcelain(trusted) == ""
+    assert git_status_porcelain(trusted) == "?? pyproject.toml"
+    run_git(trusted, "reset", "--hard", "HEAD")
+    run_git(trusted, "clean", "-fd")
 
     safe_result = auto_apply_safe_patch(
         result.patch_diff,
@@ -142,8 +159,8 @@ def test_runner_dangerous_secret_patch_is_blocked_by_existing_gate(
     assert result.patch_diff is not None
     assert result.change_risk_report is not None
     assert result.blocked_reason is not None
-    assert not (trusted / ".env").exists()
-    assert git_status_porcelain(trusted) == ""
+    assert (trusted / ".env").exists()
+    assert git_status_porcelain(trusted) == "?? .env"
 
     risk_report = classify_patch_risk(result.patch_diff)
     gate = evaluate_guarded_change_gate(result.patch_diff, risk_report=risk_report)
@@ -159,7 +176,7 @@ def test_runner_dangerous_secret_patch_is_blocked_by_existing_gate(
             trace_id="trace_integration",
         )
 
-    assert not (trusted / ".env").exists()
+    assert (trusted / ".env").exists()
     assert fake_secret not in audit_text(tmp_path / "audit.jsonl")
     assert audit.verify_integrity()
 

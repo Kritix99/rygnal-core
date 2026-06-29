@@ -43,11 +43,11 @@ from rygnal.execution_backend import (
     detect_host_backend_capabilities,
     select_execution_backend,
 )
-from rygnal.guarded_worktree import (
-    GuardedWorktree,
-    GuardedWorktreeConfig,
-    GuardedWorktreeError,
-    create_guarded_worktree,
+from rygnal.recovery_session import (
+    RecoverySession,
+    RecoverySessionConfig,
+    RecoverySessionError,
+    create_recovery_session,
     detect_trusted_repo_root,
 )
 from rygnal.intent_contract import (
@@ -91,7 +91,7 @@ from rygnal.subjective_risk import (
     collect_subjective_patch_reasons,
 )
 from rygnal.untracked_files import UntrackedFilePolicy
-from rygnal.workspace_cleanup import CleanupResult, CleanupStatus, destroy_worktree
+from rygnal.recovery_session import CleanupResult, CleanupStatus, destroy_recovery_session
 from rygnal.workspace_mounts import MountContract, MountKind, WorkspaceMountPlan
 
 UNSAFE_LOCAL_WARNING = "Unsafe local execution is not a containment backend."
@@ -226,7 +226,7 @@ class UnsafeLocalCommandBackend:
     """Explicit developer/test backend.
 
     This backend is intentionally not a containment boundary. It still runs the
-    command inside the guarded worktree, never inside the trusted repository.
+    command inside the trusted repository execution path for the in-repo recovery model.
     """
 
     def run(
@@ -427,7 +427,7 @@ def _guarded_run_concurrency_guard(
 
 
 def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
-    """Run a command inside a disposable guarded workspace."""
+    """Run a command inside an in-repo Rygnal recovery session."""
 
     trace_id = config.trace_id or new_trace_id()
     warnings: list[str] = []
@@ -488,7 +488,7 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
             allow_dirty_override=config.allow_dirty_override,
             warnings=warnings,
         )
-    except (GuardedWorktreeError, DirtyRepositoryError, RuntimeError, OSError) as exc:
+    except (RecoverySessionError, DirtyRepositoryError, RuntimeError, OSError) as exc:
         return _blocked_result(
             config=config,
             trace_id=trace_id,
@@ -645,14 +645,14 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
                 event_type="guarded_run.blocked",
             )
 
-        worktree_config = GuardedWorktreeConfig(
+        worktree_config = RecoverySessionConfig(
             trusted_repo_path=trusted_repo,
             rygnal_run_root=config.rygnal_run_root,
             untracked_policy=config.untracked_policy,
             audit_logger=config.audit_logger,
         )
 
-        worktree: GuardedWorktree | None = None
+        worktree: RecoverySession | None = None
         command_result: GuardedCommandResult | None = None
         changed_file_report: ChangedFileReport | None = None
         patch_diff: PatchDiff | None = None
@@ -668,8 +668,8 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
         status = GuardedRunStatus.FAILED
 
         try:
-            worktree = create_guarded_worktree(worktree_config)
-        except GuardedWorktreeError as exc:
+            worktree = create_recovery_session(worktree_config)
+        except RecoverySessionError as exc:
             return _blocked_result(
                 config=config,
                 trace_id=trace_id,
@@ -871,7 +871,7 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
                 },
             )
 
-        except (GuardedWorktreeError, GuardedCommandExecutionError) as exc:
+        except (RecoverySessionError, GuardedCommandExecutionError) as exc:
             blocked_reason = str(exc)
             status = GuardedRunStatus.FAILED
             warnings.append(blocked_reason)
@@ -1017,7 +1017,7 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
                         metadata=_worktree_metadata(worktree, backend_name, containment_verified),
                     )
 
-                    cleanup_result = destroy_worktree(worktree, worktree_config)
+                    cleanup_result = destroy_recovery_session(worktree, worktree_config)
 
                     if cleanup_result.status == CleanupStatus.CLEANUP_FAILED:
                         status = GuardedRunStatus.CLEANUP_FAILED
@@ -1103,7 +1103,7 @@ def _audit_intent_evaluation(
     config: GuardedRunConfig,
     *,
     trace_id: str,
-    worktree: GuardedWorktree,
+    worktree: RecoverySession,
     backend_name: str | None,
     containment_verified: bool,
     match_results: tuple[IntentMatchResult, ...],
@@ -2003,7 +2003,7 @@ def _audit(
 
 
 def _worktree_metadata(
-    worktree: GuardedWorktree,
+    worktree: RecoverySession,
     backend_name: str | None,
     containment_verified: bool,
 ) -> dict[str, object]:

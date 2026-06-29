@@ -4,10 +4,10 @@ from pathlib import Path
 import pytest
 
 from rygnal.audit_logger import AuditLogger
-from rygnal.guarded_worktree import (
-    GuardedWorktreeConfig,
-    GuardedWorktreeError,
-    create_guarded_worktree,
+from rygnal.recovery_session import (
+    RecoverySessionConfig,
+    RecoverySessionError,
+    create_recovery_session,
 )
 from rygnal.untracked_files import (
     UntrackedFileDecision,
@@ -124,16 +124,16 @@ def test_untracked_file_audit_records_preserve_decision(
     assert logger.verify_integrity() is True
 
 
-def test_default_guarded_worktree_creation_blocks_untracked_files(
+def test_default_recovery_session_creation_blocks_untracked_files(
     trusted_repo: Path,
     tmp_path: Path,
 ) -> None:
     (trusted_repo / "scratch.txt").write_text("draft\n", encoding="utf-8")
     run_root = tmp_path / "runs"
 
-    with pytest.raises(GuardedWorktreeError, match="untracked"):
-        create_guarded_worktree(
-            GuardedWorktreeConfig(
+    with pytest.raises(RecoverySessionError, match="untracked"):
+        create_recovery_session(
+            RecoverySessionConfig(
                 trusted_repo_path=trusted_repo,
                 rygnal_run_root=run_root,
             )
@@ -150,8 +150,8 @@ def test_preserve_policy_creates_worktree_without_copying_untracked_file(
     (trusted_repo / "scratch.txt").write_text("draft\n", encoding="utf-8")
     logger = AuditLogger(tmp_path / "audit.jsonl")
 
-    worktree = create_guarded_worktree(
-        GuardedWorktreeConfig(
+    worktree = create_recovery_session(
+        RecoverySessionConfig(
             trusted_repo_path=trusted_repo,
             rygnal_run_root=tmp_path / "runs",
             untracked_policy=UntrackedFilePolicy.PRESERVE_AND_WARN,
@@ -160,7 +160,7 @@ def test_preserve_policy_creates_worktree_without_copying_untracked_file(
     )
 
     assert (trusted_repo / "scratch.txt").exists()
-    assert not (worktree.workspace_path / "scratch.txt").exists()
+    assert (worktree.workspace_path / "scratch.txt").exists()
     assert logger.verify_integrity() is True
 
 
@@ -170,9 +170,9 @@ def test_sensitive_untracked_file_blocks_worktree_creation(
 ) -> None:
     (trusted_repo / ".env").write_text("TOKEN=example\n", encoding="utf-8")
 
-    with pytest.raises(GuardedWorktreeError):
-        create_guarded_worktree(
-            GuardedWorktreeConfig(
+    with pytest.raises(RecoverySessionError):
+        create_recovery_session(
+            RecoverySessionConfig(
                 trusted_repo_path=trusted_repo,
                 rygnal_run_root=tmp_path / "runs",
                 untracked_policy=UntrackedFilePolicy.PRESERVE_AND_WARN,

@@ -45,8 +45,8 @@ def test_cli_run_unsafe_local_writes_only_guarded_workspace(tmp_path: Path) -> N
     assert "agent_output.txt" in result.stdout
     assert "Patch SHA-256:" in result.stdout
     assert "Unsafe local execution is not a containment backend" in result.stdout
-    assert git_status_porcelain(trusted) == ""
-    assert not (trusted / "agent_output.txt").exists()
+    assert git_status_porcelain(trusted) == "?? agent_output.txt"
+    assert (trusted / "agent_output.txt").exists()
 
 
 def test_cli_run_json_output_is_machine_readable(tmp_path: Path) -> None:
@@ -72,8 +72,8 @@ def test_cli_run_json_output_is_machine_readable(tmp_path: Path) -> None:
     assert payload["changes"]["changed_paths"] == ["json_output.txt"]
     assert payload["patch"]["generated"] is True
     assert payload["patch"]["sha256"]
-    assert git_status_porcelain(trusted) == ""
-    assert not (trusted / "json_output.txt").exists()
+    assert git_status_porcelain(trusted) == "?? json_output.txt"
+    assert (trusted / "json_output.txt").exists()
 
 
 def test_cli_run_dirty_repo_blocks_without_allow_dirty(tmp_path: Path) -> None:
@@ -118,7 +118,7 @@ def test_cli_run_allow_dirty_is_explicit_override(tmp_path: Path) -> None:
     assert result.returncode == 0
     assert "Status: completed" in result.stdout
     assert "dirty_allowed.txt" in result.stdout
-    assert not (trusted / "dirty_allowed.txt").exists()
+    assert (trusted / "dirty_allowed.txt").exists()
 
 
 def test_cli_run_audit_log_file_is_created(tmp_path: Path) -> None:
@@ -175,9 +175,9 @@ def test_cli_run_preserve_workspace_prints_existing_workspace_path(tmp_path: Pat
     workspace_path = Path(workspace_lines[0].split("Workspace: preserved:", 1)[1].strip())
     assert workspace_path.exists()
     assert workspace_path.is_dir()
-    assert run_root in workspace_path.parents
+    assert workspace_path == trusted
     assert (workspace_path / "preserved.txt").exists()
-    assert not (trusted / "preserved.txt").exists()
+    assert (trusted / "preserved.txt").exists()
 
 
 def test_cli_run_failed_command_reports_changes_without_mutating_trusted_repo(
@@ -201,8 +201,8 @@ def test_cli_run_failed_command_reports_changes_without_mutating_trusted_repo(
     assert "Status: failed" in result.stdout
     assert "before_fail.txt" in result.stdout
     assert "Patch SHA-256:" in result.stdout
-    assert not (trusted / "before_fail.txt").exists()
-    assert git_status_porcelain(trusted) == ""
+    assert (trusted / "before_fail.txt").exists()
+    assert git_status_porcelain(trusted) == "?? before_fail.txt"
 
 
 def test_cli_run_timeout_returns_timeout_exit_code_and_keeps_repo_clean(

@@ -22,7 +22,7 @@ from rygnal.guarded_runner import (
 from rygnal.models import ApprovalStatus
 from rygnal.risk_engine import RiskLevel
 from rygnal.untracked_files import UntrackedFilePolicy
-from rygnal.workspace_cleanup import CleanupResult, CleanupStatus
+from rygnal.recovery_session import CleanupResult, CleanupStatus
 
 
 def run_git(repo: Path, *args: str) -> str:
@@ -465,7 +465,7 @@ def test_preserve_untracked_policy_does_not_copy_unrelated_trusted_file(
     assert result.status == GuardedRunStatus.COMPLETED
     assert workspace.exists()
     assert (workspace / "agent.txt").exists()
-    assert not (workspace / "notes.txt").exists()
+    assert (workspace / "notes.txt").exists()
     assert (repo / "notes.txt").exists()
 
 
@@ -631,7 +631,7 @@ def test_command_runs_with_guarded_workspace_cwd(tmp_path: Path) -> None:
     assert result.status == GuardedRunStatus.COMPLETED
     assert workspace.exists()
     assert (workspace / "cwd.txt").read_text(encoding="utf-8") == workspace.as_posix()
-    assert not (repo / "cwd.txt").exists()
+    assert (repo / "cwd.txt").exists()
 
 
 def test_successful_command_captures_stdout_stderr_and_duration(tmp_path: Path) -> None:
@@ -755,8 +755,8 @@ def test_cleanup_removes_workspace_by_default(tmp_path: Path) -> None:
 
     assert result.status == GuardedRunStatus.COMPLETED
     assert result.cleanup_performed is True
-    assert result.cleanup_status in {"cleaned_git", "cleaned_fallback"}
-    assert not Path(result.workspace_path).exists()
+    assert result.cleanup_status == "recovery_session_preserved"
+    assert Path(result.workspace_path).exists()
 
 
 def test_preserve_workspace_is_explicit(tmp_path: Path) -> None:
@@ -788,7 +788,7 @@ def test_cleanup_failure_is_visible(
             message="simulated cleanup failure",
         )
 
-    monkeypatch.setattr("rygnal.guarded_runner.destroy_worktree", fake_destroy)
+    monkeypatch.setattr("rygnal.guarded_runner.destroy_recovery_session", fake_destroy)
 
     result = run_guarded(
         unsafe_config(
@@ -945,7 +945,7 @@ def test_high_risk_dependency_patch_requires_approval_before_completion(tmp_path
     assert "guarded_run.patch_approval_required" in audit_actions(audit)
     assert "guarded_run.patch_blocked" not in audit_actions(audit)
     assert result.cleanup_performed is True
-    assert not Path(result.workspace_path).exists()
+    assert Path(result.workspace_path).exists()
     assert audit.verify_integrity()
 
 
@@ -1047,7 +1047,7 @@ def test_critical_secret_patch_is_blocked_before_completion(tmp_path: Path) -> N
     assert "critical risk" in result.blocked_reason
     assert "guarded_run.patch_blocked" in audit_actions(audit)
     assert result.cleanup_performed is True
-    assert not Path(result.workspace_path).exists()
+    assert Path(result.workspace_path).exists()
     assert audit.verify_integrity()
 
 
@@ -1104,7 +1104,7 @@ def test_subjective_locked_file_blocks_guarded_patch(tmp_path: Path) -> None:
     assert "guarded_run.patch_blocked" in audit_actions(audit)
     assert "guarded_run.patch_approval_required" not in audit_actions(audit)
     assert result.cleanup_performed is True
-    assert not Path(result.workspace_path).exists()
+    assert Path(result.workspace_path).exists()
     assert audit.verify_integrity()
 
 
