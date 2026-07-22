@@ -467,7 +467,10 @@ class PatchArtifactStore:
         return candidate
 
     @contextmanager
-    def _artifact_lock(self, artifact_id: str) -> Iterator[None]:
+    def _artifact_lock(
+        self,
+        artifact_id: str,
+    ) -> Iterator[None]:
         lock_path = self.root.joinpath(f".{artifact_id}.lock")
         descriptor: int | None = None
 
@@ -486,14 +489,22 @@ class PatchArtifactStore:
             raise PatchArtifactError(f"Patch artifact is locked: {artifact_id}")
 
         try:
-            os.write(
+            with os.fdopen(
                 descriptor,
-                f"pid={os.getpid()}\\n".encode("ascii"),
-            )
-            os.fsync(descriptor)
+                "w",
+                encoding="utf-8",
+            ) as handle:
+                handle.write(
+                    "schema=rygnal-artifact-lock.v1\n"
+                    f"pid={os.getpid()}\n"
+                    f"artifact_id={artifact_id}\n"
+                    f"created_at_unix={time.time()}\n"
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+
             yield
         finally:
-            os.close(descriptor)
             try:
                 lock_path.unlink()
             except FileNotFoundError:

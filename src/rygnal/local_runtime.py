@@ -13,6 +13,7 @@ from rygnal.audit_logger import AuditLogger
 from rygnal.audit_storage import SQLiteAuditStore
 from rygnal.local_paths import LocalPaths, resolve_local_paths
 from rygnal.patch_artifact import PatchArtifactStore
+from rygnal.recovery_reconciler import RecoveryReconciler
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +26,7 @@ class LocalRuntimeDependencies:
     approval_queue: SQLiteApprovalQueue
     artifact_store: PatchArtifactStore
     approval_service: ApprovalArtifactService
+    recovery_reconciler: RecoveryReconciler
 
 
 def create_local_audit_store(
@@ -65,6 +67,20 @@ def create_local_patch_artifact_store(
     return PatchArtifactStore(paths.artifacts_dir)
 
 
+def create_local_recovery_reconciler(
+    paths: LocalPaths,
+    *,
+    approval_service: ApprovalArtifactService,
+    audit_logger: AuditLogger,
+) -> RecoveryReconciler:
+    """Create the durable local crash reconciler."""
+    return RecoveryReconciler(
+        run_root=paths.runs_dir,
+        approval_service=approval_service,
+        audit_logger=audit_logger,
+    )
+
+
 def create_local_runtime_dependencies(
     *,
     data_dir: str | Path | None = None,
@@ -93,6 +109,11 @@ def create_local_runtime_dependencies(
         artifact_store=artifact_store,
         audit_logger=audit_logger,
     )
+    recovery_reconciler = create_local_recovery_reconciler(
+        paths,
+        approval_service=approval_service,
+        audit_logger=audit_logger,
+    )
 
     return LocalRuntimeDependencies(
         paths=paths,
@@ -101,6 +122,7 @@ def create_local_runtime_dependencies(
         approval_queue=approval_queue,
         artifact_store=artifact_store,
         approval_service=approval_service,
+        recovery_reconciler=recovery_reconciler,
     )
 
 
@@ -108,6 +130,7 @@ __all__ = [
     "LocalRuntimeDependencies",
     "create_local_approval_queue",
     "create_local_patch_artifact_store",
+    "create_local_recovery_reconciler",
     "create_local_audit_logger",
     "create_local_audit_store",
     "create_local_runtime_dependencies",
