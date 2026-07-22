@@ -29,6 +29,12 @@ from rygnal.models import (
     ToolRequest,
     new_trace_id,
 )
+from rygnal.operation_store import (
+    OperationRecord,
+    OperationRecoveryStatus,
+    OperationStoreError,
+    SQLiteOperationStore,
+)
 from rygnal.patch_artifact import (
     PATCH_ARTIFACT_STATE_CONSUMED,
     PATCH_ARTIFACT_STATE_PENDING,
@@ -166,6 +172,7 @@ class RecoveryReconciler:
         run_root: str | Path,
         approval_service: ApprovalArtifactService,
         audit_logger: AuditLogger,
+        operation_store: SQLiteOperationStore | None = None,
     ) -> None:
         candidate = Path(run_root).expanduser()
 
@@ -180,6 +187,7 @@ class RecoveryReconciler:
         _ensure_private_directory(self.run_root)
         self._workspace_recovery_blocked_reason: str | None = None
         self._artifact_recovery_blocked_reason: str | None = None
+        self.operation_store = operation_store
 
     def reconcile(
         self,
@@ -710,6 +718,95 @@ class RecoveryReconciler:
 
         return findings, len(paths)
 
+    def _reconcile_operations(
+        self,
+        *,
+        trace_id: str,
+    ) -> list[RecoveryFinding]:
+        if self.operation_store is None:
+            return []
+
+        try:
+            results = self.operation_store.reconcile_incomplete(
+                has_apply_evidence=(self._operation_has_apply_evidence)
+            )
+        except OperationStoreError as exc:
+            finding = RecoveryFinding(
+                kind="operation_store",
+                identifier="operations",
+                status=RecoveryFindingStatus.UNRESOLVED,
+                message=str(exc),
+            )
+            self._write_finding_audit(
+                finding,
+                trace_id=trace_id,
+            )
+            return [finding]
+
+        findings: list[RecoveryFinding] = []
+
+        for result in results:
+            if result.status == OperationRecoveryStatus.ACTIVE:
+                status = RecoveryFindingStatus.ACTIVE
+            elif result.status == OperationRecoveryStatus.UNRESOLVED:
+                status = RecoveryFindingStatus.UNRESOLVED
+            else:
+                status = RecoveryFindingStatus.RECOVERED
+
+            finding = RecoveryFinding(
+                kind="artifact_apply_operation",
+                identifier=result.operation_key,
+                status=status,
+                message=result.message,
+                path=result.target_repo_path,
+                metadata={
+                    "artifact_id": result.artifact_id,
+                    "operation_status": (result.status.value),
+                },
+            )
+            findings.append(finding)
+
+            if finding.mutated or status == RecoveryFindingStatus.UNRESOLVED:
+                self._write_finding_audit(
+                    finding,
+                    trace_id=trace_id,
+                )
+
+        return findings
+
+    def _operation_has_apply_evidence(
+        self,
+        operation: OperationRecord,
+    ) -> bool:
+        storage = getattr(
+            self.audit_logger,
+            "storage_backend",
+            None,
+        )
+        reader = getattr(
+            storage,
+            "read_events",
+            None,
+        )
+
+        if not callable(reader):
+            reader = self.audit_logger.read_events
+
+        for event in reader():
+            if event.policy_id != APPROVED_PATCH_APPLY_POLICY_ID:
+                continue
+
+            metadata = event.metadata or {}
+
+            if (
+                metadata.get("approval_id") == operation.approval_id
+                and metadata.get("patch_sha256") == operation.patch_sha256
+                and metadata.get("baseline_commit_sha") == operation.baseline_commit_sha
+            ):
+                return True
+
+        return False
+
     def _reconcile_artifacts(
         self,
         *,
@@ -759,6 +856,7 @@ class RecoveryReconciler:
                 ).append(item)
 
         findings: list[RecoveryFinding] = []
+        findings.extend(self._reconcile_operations(trace_id=trace_id))
         discovered_ids: set[str] = set()
 
         for artifact_path in artifact_paths:

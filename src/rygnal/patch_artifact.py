@@ -381,7 +381,11 @@ class PatchArtifactStore:
                     )
                 path.unlink()
 
-    def mark_consumed(self, artifact_id: str) -> PatchArtifact:
+    def mark_consumed(
+        self,
+        artifact_id: str,
+    ) -> PatchArtifact:
+        """Atomically mark one pending artifact consumed."""
         normalized_id = _require_identifier(
             artifact_id,
             "artifact ID",
@@ -393,31 +397,7 @@ class PatchArtifactStore:
                 allow_expired=True,
                 allow_consumed=True,
             )
-
-            if artifact.state == PATCH_ARTIFACT_STATE_CONSUMED:
-                raise PatchArtifactConsumedError(
-                    f"Patch artifact has already been consumed: {normalized_id}"
-                )
-
-            consumed = PatchArtifact(
-                **{
-                    **artifact.to_payload(include_digest=False),
-                    "state": PATCH_ARTIFACT_STATE_CONSUMED,
-                    "consumed_at": datetime.now(UTC).isoformat(),
-                    "artifact_digest": "",
-                }
-            )
-            consumed = _with_integrity_digest(consumed)
-            self._atomic_write(
-                self._artifact_path(normalized_id),
-                consumed.to_payload(),
-            )
-
-        return self.load(
-            normalized_id,
-            allow_expired=True,
-            allow_consumed=True,
-        )
+            return self._mark_consumed_unlocked(artifact)
 
     def apply_approved(
         self,
@@ -426,36 +406,77 @@ class PatchArtifactStore:
         *,
         approval_request: ApprovalRequest,
         approval_decision: ApprovalDecision,
-        logger: AuditLogger,
+        logger: AuditLogger | None = None,
     ) -> ApprovedPatchApplyResult:
-        artifact = self.load(artifact_id)
-
-        if artifact.approval_request_id != approval_request.approval_id:
-            raise PatchArtifactError("Patch artifact is bound to a different approval request.")
-
-        metadata_artifact_id = approval_request.metadata.get("artifact_id")
-        if metadata_artifact_id is not None and metadata_artifact_id != artifact.artifact_id:
-            raise PatchArtifactError("Approval request artifact binding does not match.")
-
-        target_repo = Path(target_repo_path).expanduser().resolve()
-
-        if _repo_identity(target_repo) != artifact.trusted_repo_identity_sha256:
-            raise PatchArtifactError("Patch artifact is bound to a different trusted repository.")
-
-        patch_diff = artifact.to_patch_diff()
-        risk_report = artifact.to_risk_report()
-
-        result = apply_approved_patch(
-            patch_diff,
-            target_repo,
-            approval_request=approval_request,
-            approval_decision=approval_decision,
-            risk_report=risk_report,
-            logger=logger,
+        """Hold the artifact lock through apply and consume."""
+        normalized_id = _require_identifier(
+            artifact_id,
+            "artifact ID",
         )
 
-        self.mark_consumed(artifact.artifact_id)
-        return result
+        with self._artifact_lock(normalized_id):
+            artifact = self.load(
+                normalized_id,
+                allow_expired=False,
+                allow_consumed=False,
+            )
+
+            if artifact.approval_request_id != approval_request.approval_id:
+                raise PatchArtifactError("Patch artifact is bound to a different approval request.")
+
+            metadata_artifact_id = approval_request.metadata.get("artifact_id")
+
+            if metadata_artifact_id is not None and metadata_artifact_id != artifact.artifact_id:
+                raise PatchArtifactError("Approval request artifact binding does not match.")
+
+            target_repo = Path(target_repo_path).expanduser().resolve()
+
+            if _repo_identity(target_repo) != artifact.trusted_repo_identity_sha256:
+                raise PatchArtifactError(
+                    "Patch artifact is bound to a different trusted repository."
+                )
+
+            result = apply_approved_patch(
+                artifact.to_patch_diff(),
+                target_repo,
+                approval_request=approval_request,
+                approval_decision=approval_decision,
+                risk_report=artifact.to_risk_report(),
+                logger=logger,
+            )
+
+            self._mark_consumed_unlocked(artifact)
+            return result
+
+    def _mark_consumed_unlocked(
+        self,
+        artifact: PatchArtifact,
+    ) -> PatchArtifact:
+        if artifact.state == PATCH_ARTIFACT_STATE_CONSUMED:
+            raise PatchArtifactConsumedError(
+                f"Patch artifact has already been consumed: {artifact.artifact_id}"
+            )
+
+        consumed = PatchArtifact(
+            **{
+                **artifact.to_payload(include_digest=False),
+                "state": (PATCH_ARTIFACT_STATE_CONSUMED),
+                "consumed_at": (datetime.now(UTC).isoformat()),
+                "artifact_digest": "",
+            }
+        )
+        consumed = _with_integrity_digest(consumed)
+
+        self._atomic_write(
+            self._artifact_path(artifact.artifact_id),
+            consumed.to_payload(),
+        )
+
+        return self.load(
+            artifact.artifact_id,
+            allow_expired=True,
+            allow_consumed=True,
+        )
 
     def _artifact_path(self, artifact_id: str) -> Path:
         candidate = self.root.joinpath(f"{artifact_id}.json")

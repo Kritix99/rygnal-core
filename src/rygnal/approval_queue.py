@@ -12,6 +12,10 @@ from rygnal.approval_authorization import ApprovalAuthorizationEngine
 from rygnal.approval_state import ApprovalStateMachine
 from rygnal.models import ApprovalDecision, ApprovalRequest, ApprovalStatus, utc_now_iso
 from rygnal.security import redact_sensitive_value
+from rygnal.sqlite_runtime import (
+    connect_sqlite,
+    initialize_sqlite_database,
+)
 
 APPROVAL_QUEUE_DB_PATH_ENV = "RYGNAL_APPROVAL_QUEUE_DB_PATH"
 
@@ -179,48 +183,259 @@ class InMemoryApprovalQueue:
 
 
 class SQLiteApprovalQueue(InMemoryApprovalQueue):
-    """SQLite-backed approval queue with the same API as the in-memory queue."""
+    """Transactional durable approval queue."""
 
     def __init__(
         self,
         db_path: str | Path = "logs/approval_queue.db",
         *,
-        authorization_engine: ApprovalAuthorizationEngine | None = None,
+        authorization_engine: (ApprovalAuthorizationEngine | None) = None,
     ) -> None:
         self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.db_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        initialize_sqlite_database(self.db_path)
         super().__init__(authorization_engine=authorization_engine)
         self._initialize()
         self._load_items()
 
-    def submit(self, approval_request: ApprovalRequest) -> ApprovalRequest:
-        """Add an approval request after refreshing durable queue state."""
-        self._load_items()
-        return super().submit(approval_request)
+    def submit(
+        self,
+        approval_request: ApprovalRequest,
+    ) -> ApprovalRequest:
+        """Insert once; identical resubmission is idempotent."""
+        request_json = _redacted_model_json(approval_request)
+        now = utc_now_iso()
+        connection = self._connect()
 
-    def list(self, *, status: ApprovalStatus | None = None) -> tuple[QueuedApproval, ...]:
-        """Return queued approvals after refreshing durable queue state."""
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT request_json
+                FROM approval_queue
+                WHERE approval_id = ?
+                """,
+                (approval_request.approval_id,),
+            ).fetchone()
+
+            if row is not None:
+                if str(row["request_json"]) != request_json:
+                    connection.rollback()
+                    raise ApprovalQueueError("Approval ID is already bound to a different request.")
+
+                connection.commit()
+                self._load_items()
+                return approval_request
+
+            connection.execute(
+                """
+                INSERT INTO approval_queue (
+                    approval_id,
+                    status,
+                    request_json,
+                    decision_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, NULL, ?, ?)
+                """,
+                (
+                    approval_request.approval_id,
+                    ApprovalStatus.PENDING.value,
+                    request_json,
+                    approval_request.created_at,
+                    now,
+                ),
+            )
+            connection.commit()
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+        self._load_items()
+        return approval_request
+
+    def list(
+        self,
+        *,
+        status: ApprovalStatus | None = None,
+    ) -> tuple[QueuedApproval, ...]:
         self._load_items()
         return super().list(status=status)
 
-    def get(self, approval_id: str) -> QueuedApproval:
-        """Return one queued approval after refreshing durable queue state."""
+    def get(
+        self,
+        approval_id: str,
+    ) -> QueuedApproval:
         self._load_items()
         return super().get(approval_id)
 
-    def approve(self, approval_id: str, *, decided_by: str, reason: str) -> QueuedApproval:
-        """Approve a pending approval request after refreshing durable queue state."""
-        self._load_items()
-        return super().approve(approval_id, decided_by=decided_by, reason=reason)
+    def approve(
+        self,
+        approval_id: str,
+        *,
+        decided_by: str,
+        reason: str,
+    ) -> QueuedApproval:
+        return super().approve(
+            approval_id,
+            decided_by=decided_by,
+            reason=reason,
+        )
 
-    def reject(self, approval_id: str, *, decided_by: str, reason: str) -> QueuedApproval:
-        """Reject a pending approval request after refreshing durable queue state."""
-        self._load_items()
-        return super().reject(approval_id, decided_by=decided_by, reason=reason)
+    def reject(
+        self,
+        approval_id: str,
+        *,
+        decided_by: str,
+        reason: str,
+    ) -> QueuedApproval:
+        return super().reject(
+            approval_id,
+            decided_by=decided_by,
+            reason=reason,
+        )
 
-    def _store_item(self, item: QueuedApproval) -> None:
-        self._persist_item(item)
-        self._items[item.approval_id] = item
+    def record_decision(
+        self,
+        approval_id: str,
+        *,
+        approval_decision: ApprovalDecision,
+    ) -> QueuedApproval:
+        """Atomically commit exactly one terminal decision."""
+        if approval_decision.approval_id != approval_id:
+            raise ApprovalQueueError("Approval decision ID does not match the queued request.")
+
+        connection = self._connect()
+
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT status, request_json, decision_json
+                FROM approval_queue
+                WHERE approval_id = ?
+                """,
+                (approval_id,),
+            ).fetchone()
+
+            if row is None:
+                connection.rollback()
+                raise ApprovalNotFoundError(f"Approval request '{approval_id}' was not found.")
+
+            request = ApprovalRequest(**json.loads(row["request_json"]))
+            current_status = ApprovalStatus(row["status"])
+            decision_json = row["decision_json"]
+            current_decision = (
+                ApprovalDecision(**json.loads(decision_json)) if decision_json is not None else None
+            )
+
+            if current_status != ApprovalStatus.PENDING:
+                if current_decision is not None and _same_terminal_decision(
+                    current_decision,
+                    approval_decision,
+                ):
+                    connection.commit()
+                    updated = QueuedApproval(
+                        request=request,
+                        status=current_status,
+                        decision=current_decision,
+                    )
+                    self._items[approval_id] = updated
+                    return updated
+
+                connection.rollback()
+                raise ApprovalStateConflictError(
+                    "Approval already has a different terminal decision."
+                )
+
+            transition = ApprovalStateMachine.validate_transition(
+                current_status=current_status,
+                next_status=approval_decision.status,
+            )
+
+            if not transition.allowed:
+                connection.rollback()
+                raise ApprovalStateConflictError(transition.reason)
+
+            authorization = self.authorization_engine.authorize(
+                approval_request=request,
+                approval_decision=(approval_decision),
+                current_status=current_status,
+            )
+
+            if not authorization.allowed:
+                connection.rollback()
+                raise ApprovalDeniedError(authorization.reason)
+
+            cursor = connection.execute(
+                """
+                UPDATE approval_queue
+                SET status = ?,
+                    decision_json = ?,
+                    updated_at = ?
+                WHERE approval_id = ?
+                  AND status = ?
+                """,
+                (
+                    approval_decision.status.value,
+                    _redacted_model_json(approval_decision),
+                    utc_now_iso(),
+                    approval_id,
+                    ApprovalStatus.PENDING.value,
+                ),
+            )
+
+            if cursor.rowcount != 1:
+                connection.rollback()
+                raise ApprovalStateConflictError("Approval state changed concurrently.")
+
+            connection.commit()
+            updated = QueuedApproval(
+                request=request,
+                status=approval_decision.status,
+                decision=approval_decision,
+            )
+            self._items[approval_id] = updated
+            return updated
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def pragma_snapshot(self) -> dict[str, Any]:
+        with self._connect() as connection:
+            names = (
+                "journal_mode",
+                "synchronous",
+                "busy_timeout",
+                "foreign_keys",
+            )
+            return {name: connection.execute(f"PRAGMA {name}").fetchone()[0] for name in names}
+
+    def _store_item(
+        self,
+        item: QueuedApproval,
+    ) -> None:
+        if item.status == ApprovalStatus.PENDING:
+            self.submit(item.request)
+            return
+
+        if item.decision is None:
+            raise ApprovalQueueError("Terminal approval is missing a decision.")
+
+        self.record_decision(
+            item.approval_id,
+            approval_decision=item.decision,
+        )
 
     def _initialize(self) -> None:
         with self._connect() as connection:
@@ -233,12 +448,23 @@ class SQLiteApprovalQueue(InMemoryApprovalQueue):
                     request_json TEXT NOT NULL,
                     decision_json TEXT,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    CHECK (
+                        (status = 'pending'
+                         AND decision_json IS NULL)
+                        OR
+                        (status IN ('approved', 'rejected')
+                         AND decision_json IS NOT NULL)
+                    )
                 )
                 """
             )
             connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_approval_queue_status ON approval_queue(status)"
+                """
+                CREATE INDEX IF NOT EXISTS
+                idx_approval_queue_status
+                ON approval_queue(status)
+                """
             )
 
     def _load_items(self) -> None:
@@ -251,7 +477,8 @@ class SQLiteApprovalQueue(InMemoryApprovalQueue):
                 """
             ).fetchall()
 
-        self._items = {}
+        loaded: dict[str, QueuedApproval] = {}
+
         for row in rows:
             request = ApprovalRequest(**json.loads(row["request_json"]))
             decision_json = row["decision_json"]
@@ -263,41 +490,27 @@ class SQLiteApprovalQueue(InMemoryApprovalQueue):
                 status=ApprovalStatus(row["status"]),
                 decision=decision,
             )
-            self._items[item.approval_id] = item
+            loaded[item.approval_id] = item
 
-    def _persist_item(self, item: QueuedApproval) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO approval_queue (
-                    approval_id,
-                    status,
-                    request_json,
-                    decision_json,
-                    created_at,
-                    updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(approval_id) DO UPDATE SET
-                    status = excluded.status,
-                    request_json = excluded.request_json,
-                    decision_json = excluded.decision_json,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    item.approval_id,
-                    item.status.value,
-                    _redacted_model_json(item.request),
-                    _redacted_model_json(item.decision) if item.decision is not None else None,
-                    item.request.created_at,
-                    utc_now_iso(),
-                ),
-            )
+        self._items = loaded
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path)
-        connection.row_factory = sqlite3.Row
-        return connection
+        return connect_sqlite(self.db_path)
+
+
+def _same_terminal_decision(
+    left: ApprovalDecision,
+    right: ApprovalDecision,
+) -> bool:
+    """Compare semantic idempotency, excluding timestamps."""
+    return (
+        left.approval_id == right.approval_id
+        and left.status == right.status
+        and left.approved == right.approved
+        and left.decided_by == right.decided_by
+        and left.reason == right.reason
+        and left.metadata == right.metadata
+    )
 
 
 def _redacted_model_json(model: ApprovalRequest | ApprovalDecision) -> str:

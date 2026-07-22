@@ -12,6 +12,7 @@ from rygnal.approval_service import ApprovalArtifactService
 from rygnal.audit_logger import AuditLogger
 from rygnal.audit_storage import SQLiteAuditStore
 from rygnal.local_paths import LocalPaths, resolve_local_paths
+from rygnal.operation_store import SQLiteOperationStore
 from rygnal.patch_artifact import PatchArtifactStore
 from rygnal.recovery_reconciler import RecoveryReconciler
 
@@ -25,6 +26,7 @@ class LocalRuntimeDependencies:
     audit_store: SQLiteAuditStore
     approval_queue: SQLiteApprovalQueue
     artifact_store: PatchArtifactStore
+    operation_store: SQLiteOperationStore
     approval_service: ApprovalArtifactService
     recovery_reconciler: RecoveryReconciler
 
@@ -67,17 +69,26 @@ def create_local_patch_artifact_store(
     return PatchArtifactStore(paths.artifacts_dir)
 
 
+def create_local_operation_store(
+    paths: LocalPaths,
+) -> SQLiteOperationStore:
+    """Create the durable operation lease store."""
+    return SQLiteOperationStore(paths.runtime_dir / "operations.db")
+
+
 def create_local_recovery_reconciler(
     paths: LocalPaths,
     *,
     approval_service: ApprovalArtifactService,
     audit_logger: AuditLogger,
+    operation_store: SQLiteOperationStore,
 ) -> RecoveryReconciler:
     """Create the durable local crash reconciler."""
     return RecoveryReconciler(
         run_root=paths.runs_dir,
         approval_service=approval_service,
         audit_logger=audit_logger,
+        operation_store=operation_store,
     )
 
 
@@ -104,15 +115,18 @@ def create_local_runtime_dependencies(
         authorization_engine=authorization_engine,
     )
     artifact_store = create_local_patch_artifact_store(paths)
+    operation_store = create_local_operation_store(paths)
     approval_service = ApprovalArtifactService(
         approval_queue=approval_queue,
         artifact_store=artifact_store,
         audit_logger=audit_logger,
+        operation_store=operation_store,
     )
     recovery_reconciler = create_local_recovery_reconciler(
         paths,
         approval_service=approval_service,
         audit_logger=audit_logger,
+        operation_store=operation_store,
     )
 
     return LocalRuntimeDependencies(
@@ -121,6 +135,7 @@ def create_local_runtime_dependencies(
         audit_store=audit_store,
         approval_queue=approval_queue,
         artifact_store=artifact_store,
+        operation_store=operation_store,
         approval_service=approval_service,
         recovery_reconciler=recovery_reconciler,
     )
@@ -130,6 +145,7 @@ __all__ = [
     "LocalRuntimeDependencies",
     "create_local_approval_queue",
     "create_local_patch_artifact_store",
+    "create_local_operation_store",
     "create_local_recovery_reconciler",
     "create_local_audit_logger",
     "create_local_audit_store",

@@ -11,9 +11,19 @@ from rygnal.approval_queue import (
     InMemoryApprovalQueue,
     QueuedApproval,
 )
-from rygnal.approved_apply import ApprovedPatchApplyError
+from rygnal.approved_apply import (
+    ApprovedPatchApplyError,
+    ApprovedPatchApplyOutcome,
+    ApprovedPatchApplyResult,
+)
 from rygnal.audit_logger import AuditLogger
 from rygnal.models import ApprovalDecision, ApprovalStatus
+from rygnal.operation_store import (
+    OperationConflictError,
+    OperationRecoveryRequiredError,
+    OperationStoreError,
+    SQLiteOperationStore,
+)
 from rygnal.patch_approval import (
     PatchApprovalError,
     approve_patch_request,
@@ -114,10 +124,12 @@ class ApprovalArtifactService:
         approval_queue: InMemoryApprovalQueue,
         artifact_store: PatchArtifactStore,
         audit_logger: AuditLogger,
+        operation_store: SQLiteOperationStore | None = None,
     ) -> None:
         self.approval_queue = approval_queue
         self.artifact_store = artifact_store
         self.audit_logger = audit_logger
+        self.operation_store = operation_store
 
     def list(
         self,
@@ -223,20 +235,71 @@ class ApprovalArtifactService:
         self,
         artifact_id: str,
         target_repo_path: str | Path,
-    ):
-        """Apply one approved artifact through the canonical apply boundary."""
+    ) -> ApprovedPatchApplyResult:
+        """Apply with a durable cross-process reservation."""
         queued = self._queued_for_artifact(artifact_id)
 
         if queued.status != ApprovalStatus.APPROVED:
             raise ApprovalOperationStateError(
-                "Patch artifact cannot be applied because its approval "
-                f"status is {queued.status.value!r}."
+                "Patch artifact cannot be applied because "
+                f"its approval status is "
+                f"'{queued.status.value}'."
             )
 
         decision = _required_decision(queued)
+        artifact = self._load_bound_artifact(
+            queued,
+            allow_expired=True,
+            allow_consumed=True,
+        )
+
+        if self.operation_store is None:
+            try:
+                return self.artifact_store.apply_approved(
+                    artifact_id,
+                    target_repo_path,
+                    approval_request=queued.request,
+                    approval_decision=decision,
+                    logger=self.audit_logger,
+                )
+            except (
+                ApprovedPatchApplyError,
+                PatchArtifactError,
+            ) as exc:
+                raise ApprovalOperationError(str(exc)) from exc
 
         try:
-            return self.artifact_store.apply_approved(
+            reservation = self.operation_store.reserve_artifact_apply(
+                artifact_id=artifact.artifact_id,
+                approval_id=queued.approval_id,
+                patch_sha256=(artifact.patch_sha256),
+                baseline_commit_sha=(artifact.baseline_commit_sha),
+                target_repo_path=target_repo_path,
+            )
+        except (
+            OperationConflictError,
+            OperationRecoveryRequiredError,
+            OperationStoreError,
+        ) as exc:
+            raise ApprovalOperationStateError(str(exc)) from exc
+
+        if reservation.replayed:
+            return _replayed_apply_result(
+                artifact=artifact,
+                queued=queued,
+                operation_result=(reservation.record.result),
+                target_repo_path=target_repo_path,
+            )
+
+        applying = self.operation_store.mark_applying(reservation)
+        reservation = reservation.__class__(
+            record=applying,
+            acquired=True,
+            replayed=False,
+        )
+
+        try:
+            result = self.artifact_store.apply_approved(
                 artifact_id,
                 target_repo_path,
                 approval_request=queued.request,
@@ -246,8 +309,44 @@ class ApprovalArtifactService:
         except (
             ApprovedPatchApplyError,
             PatchArtifactError,
+            OSError,
+            RuntimeError,
         ) as exc:
-            raise ApprovalOperationError(str(exc)) from exc
+            try:
+                released = self.operation_store.fail_or_preserve_ambiguous(
+                    reservation,
+                    error=str(exc),
+                )
+            except OperationStoreError as state_exc:
+                raise ApprovalOperationError(
+                    "Artifact application failed and "
+                    "its durable operation state could "
+                    "not be finalized safely."
+                ) from state_exc
+
+            if released:
+                raise ApprovalOperationError(str(exc)) from exc
+
+            raise ApprovalOperationStateError(
+                "Artifact application may have mutated "
+                "the trusted repository, but durable "
+                "completion was not established. "
+                "Run crash recovery before continuing."
+            ) from exc
+
+        try:
+            self.operation_store.mark_applied(
+                reservation,
+                result.audit_summary,
+            )
+        except OperationStoreError as exc:
+            raise ApprovalOperationStateError(
+                "Patch applied, but durable operation "
+                "completion could not be recorded. "
+                "Run crash recovery before continuing."
+            ) from exc
+
+        return result
 
     def _queued_for_artifact(
         self,
@@ -351,6 +450,38 @@ class ApprovalArtifactService:
             decided_at=(decision.decided_at if decision is not None else None),
             decision_reason=(decision.reason if decision is not None else None),
         )
+
+
+def _replayed_apply_result(
+    *,
+    artifact: PatchArtifact,
+    queued: QueuedApproval,
+    operation_result: dict[str, Any] | None,
+    target_repo_path: str | Path,
+) -> ApprovedPatchApplyResult:
+    decision = _required_decision(queued)
+    result = operation_result or {}
+
+    return ApprovedPatchApplyResult(
+        outcome=ApprovedPatchApplyOutcome.APPLIED,
+        target_repo_path=str(
+            result.get(
+                "target_repo_path",
+                Path(target_repo_path).expanduser().resolve().as_posix(),
+            )
+        ),
+        patch_sha256=artifact.patch_sha256,
+        baseline_commit_sha=(artifact.baseline_commit_sha),
+        approval_id=queued.approval_id,
+        approved_by=str(
+            result.get(
+                "approved_by",
+                decision.decided_by,
+            )
+        ),
+        files=tuple(file.path for file in artifact.to_patch_diff().files),
+        risk_report=artifact.to_risk_report(),
+    )
 
 
 def _artifact_id_from_request(
