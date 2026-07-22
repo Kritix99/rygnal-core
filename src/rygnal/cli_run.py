@@ -28,6 +28,12 @@ EXIT_TIMED_OUT = 4
 EXIT_CLEANUP_FAILED = 5
 EXIT_USAGE_ERROR = 64
 
+EXPERIMENTAL_RUN_WARNING = (
+    "WARNING: `rygnal run` is an experimental developer-preview command. "
+    "It does not provide a trusted prevention or rollback boundary on every "
+    "host. Use a disposable repository and review all generated changes."
+)
+
 
 def default_guarded_run_root() -> Path:
     """Return the default directory used for guarded run workspaces."""
@@ -41,6 +47,8 @@ def run_guarded_cli(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return EXIT_USAGE_ERROR
+
+    print(EXPERIMENTAL_RUN_WARNING, file=sys.stderr)
 
     audit_logger = AuditLogger(args.audit_log) if args.audit_log else None
 
