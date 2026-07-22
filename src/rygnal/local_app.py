@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -22,9 +23,13 @@ def create_local_app(
         environ=environ,
     )
 
+    environment = os.environ if environ is None else environ
+
     app = create_app(
         audit_logger=dependencies.audit_logger,
         approval_queue=dependencies.approval_queue,
+        approval_service=dependencies.approval_service,
+        operator_token=environment.get("RYGNAL_OPERATOR_TOKEN"),
     )
 
     app.state.rygnal_local_paths = dependencies.paths

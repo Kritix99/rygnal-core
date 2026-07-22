@@ -8,9 +8,11 @@ from pathlib import Path
 
 from rygnal.approval_authorization import ApprovalAuthorizationEngine
 from rygnal.approval_queue import SQLiteApprovalQueue
+from rygnal.approval_service import ApprovalArtifactService
 from rygnal.audit_logger import AuditLogger
 from rygnal.audit_storage import SQLiteAuditStore
 from rygnal.local_paths import LocalPaths, resolve_local_paths
+from rygnal.patch_artifact import PatchArtifactStore
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,6 +23,8 @@ class LocalRuntimeDependencies:
     audit_logger: AuditLogger
     audit_store: SQLiteAuditStore
     approval_queue: SQLiteApprovalQueue
+    artifact_store: PatchArtifactStore
+    approval_service: ApprovalArtifactService
 
 
 def create_local_audit_store(
@@ -54,6 +58,13 @@ def create_local_approval_queue(
     )
 
 
+def create_local_patch_artifact_store(
+    paths: LocalPaths,
+) -> PatchArtifactStore:
+    """Create the local durable patch artifact store."""
+    return PatchArtifactStore(paths.artifacts_dir)
+
+
 def create_local_runtime_dependencies(
     *,
     data_dir: str | Path | None = None,
@@ -76,18 +87,27 @@ def create_local_runtime_dependencies(
         paths,
         authorization_engine=authorization_engine,
     )
+    artifact_store = create_local_patch_artifact_store(paths)
+    approval_service = ApprovalArtifactService(
+        approval_queue=approval_queue,
+        artifact_store=artifact_store,
+        audit_logger=audit_logger,
+    )
 
     return LocalRuntimeDependencies(
         paths=paths,
         audit_logger=audit_logger,
         audit_store=audit_store,
         approval_queue=approval_queue,
+        artifact_store=artifact_store,
+        approval_service=approval_service,
     )
 
 
 __all__ = [
     "LocalRuntimeDependencies",
     "create_local_approval_queue",
+    "create_local_patch_artifact_store",
     "create_local_audit_logger",
     "create_local_audit_store",
     "create_local_runtime_dependencies",

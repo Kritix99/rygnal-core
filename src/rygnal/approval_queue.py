@@ -114,6 +114,43 @@ class InMemoryApprovalQueue:
             reason=reason,
         )
 
+    def record_decision(
+        self,
+        approval_id: str,
+        *,
+        approval_decision: ApprovalDecision,
+    ) -> QueuedApproval:
+        """Validate and persist an externally constructed decision."""
+        item = self.get(approval_id)
+
+        if approval_decision.approval_id != approval_id:
+            raise ApprovalQueueError("Approval decision ID does not match the queued request.")
+
+        transition = ApprovalStateMachine.validate_transition(
+            current_status=item.status,
+            next_status=approval_decision.status,
+        )
+
+        if not transition.allowed:
+            raise ApprovalStateConflictError(transition.reason)
+
+        authorization = self.authorization_engine.authorize(
+            approval_request=item.request,
+            approval_decision=approval_decision,
+            current_status=item.status,
+        )
+
+        if not authorization.allowed:
+            raise ApprovalDeniedError(authorization.reason)
+
+        updated = QueuedApproval(
+            request=item.request,
+            status=approval_decision.status,
+            decision=approval_decision,
+        )
+        self._store_item(updated)
+        return updated
+
     def _decide(
         self,
         approval_id: str,
@@ -123,15 +160,6 @@ class InMemoryApprovalQueue:
         decided_by: str,
         reason: str,
     ) -> QueuedApproval:
-        item = self.get(approval_id)
-
-        transition = ApprovalStateMachine.validate_transition(
-            current_status=item.status,
-            next_status=status,
-        )
-        if not transition.allowed:
-            raise ApprovalStateConflictError(transition.reason)
-
         decision = ApprovalDecision(
             approval_id=approval_id,
             status=status,
@@ -141,17 +169,10 @@ class InMemoryApprovalQueue:
             reason=str(redact_sensitive_value(reason)),
         )
 
-        authorization = self.authorization_engine.authorize(
-            approval_request=item.request,
+        return self.record_decision(
+            approval_id,
             approval_decision=decision,
-            current_status=item.status,
         )
-        if not authorization.allowed:
-            raise ApprovalDeniedError(authorization.reason)
-
-        updated = QueuedApproval(request=item.request, status=status, decision=decision)
-        self._store_item(updated)
-        return updated
 
     def _store_item(self, item: QueuedApproval) -> None:
         self._items[item.approval_id] = item

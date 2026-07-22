@@ -8,8 +8,17 @@ from pathlib import Path
 
 from rygnal.cli_audit import run_audit_cli
 from rygnal.cli_doctor import run_doctor_cli
+from rygnal.cli_operations import (
+    run_approval_approve_cli,
+    run_approval_list_cli,
+    run_approval_reject_cli,
+    run_approval_show_cli,
+    run_artifact_apply_cli,
+    run_artifact_show_cli,
+)
 from rygnal.cli_run import default_guarded_run_root, run_guarded_cli
 from rygnal.cli_serve import run_serve_cli
+from rygnal.models import ApprovalStatus
 from rygnal.policy_engine import PolicyEngine
 from rygnal.version import package_version
 
@@ -232,6 +241,175 @@ def build_parser() -> argparse.ArgumentParser:
         help="Command to run after --.",
     )
     run_parser.set_defaults(command=run_guarded_cli, command_name="run")
+
+    approvals_parser = subparsers.add_parser(
+        "approvals",
+        help="Operate durable guarded-patch approvals.",
+    )
+    approvals_subparsers = approvals_parser.add_subparsers(
+        dest="approval_command",
+        required=True,
+    )
+
+    approvals_list_parser = approvals_subparsers.add_parser(
+        "list",
+        help="List durable guarded-patch approvals.",
+    )
+    approvals_list_parser.add_argument(
+        "--status",
+        choices=tuple(status.value for status in ApprovalStatus),
+        default=None,
+        help="Filter approvals by lifecycle status.",
+    )
+    approvals_list_parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=None,
+        help="Override the private Rygnal data directory.",
+    )
+    approvals_list_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable output.",
+    )
+    approvals_list_parser.set_defaults(
+        command=run_approval_list_cli,
+    )
+
+    approvals_show_parser = approvals_subparsers.add_parser(
+        "show",
+        help="Inspect one durable guarded-patch approval.",
+    )
+    approvals_show_parser.add_argument("approval_id")
+    approvals_show_parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=None,
+        help="Override the private Rygnal data directory.",
+    )
+    approvals_show_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable output.",
+    )
+    approvals_show_parser.set_defaults(
+        command=run_approval_show_cli,
+    )
+
+    approvals_approve_parser = approvals_subparsers.add_parser(
+        "approve",
+        help="Approve one durable guarded-patch request.",
+    )
+    approvals_approve_parser.add_argument("approval_id")
+    approvals_approve_parser.add_argument(
+        "--decided-by",
+        required=True,
+        help="Reviewer identity recorded in the signed decision.",
+    )
+    approvals_approve_parser.add_argument(
+        "--reason",
+        required=True,
+        help="Explicit approval reason.",
+    )
+    approvals_approve_parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=None,
+        help="Override the private Rygnal data directory.",
+    )
+    approvals_approve_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable output.",
+    )
+    approvals_approve_parser.set_defaults(
+        command=run_approval_approve_cli,
+    )
+
+    approvals_reject_parser = approvals_subparsers.add_parser(
+        "reject",
+        help="Reject one durable guarded-patch request.",
+    )
+    approvals_reject_parser.add_argument("approval_id")
+    approvals_reject_parser.add_argument(
+        "--decided-by",
+        required=True,
+        help="Reviewer identity recorded in the decision.",
+    )
+    approvals_reject_parser.add_argument(
+        "--reason",
+        required=True,
+        help="Explicit rejection reason.",
+    )
+    approvals_reject_parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=None,
+        help="Override the private Rygnal data directory.",
+    )
+    approvals_reject_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable output.",
+    )
+    approvals_reject_parser.set_defaults(
+        command=run_approval_reject_cli,
+    )
+
+    artifacts_parser = subparsers.add_parser(
+        "artifacts",
+        help="Inspect and apply durable guarded-patch artifacts.",
+    )
+    artifacts_subparsers = artifacts_parser.add_subparsers(
+        dest="artifact_command",
+        required=True,
+    )
+
+    artifacts_show_parser = artifacts_subparsers.add_parser(
+        "show",
+        help="Inspect one durable guarded-patch artifact.",
+    )
+    artifacts_show_parser.add_argument("artifact_id")
+    artifacts_show_parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=None,
+        help="Override the private Rygnal data directory.",
+    )
+    artifacts_show_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable output.",
+    )
+    artifacts_show_parser.set_defaults(
+        command=run_artifact_show_cli,
+    )
+
+    artifacts_apply_parser = artifacts_subparsers.add_parser(
+        "apply",
+        help="Apply one approved durable patch artifact.",
+    )
+    artifacts_apply_parser.add_argument("artifact_id")
+    artifacts_apply_parser.add_argument(
+        "--repo",
+        type=Path,
+        required=True,
+        help="Trusted Git repository receiving the approved patch.",
+    )
+    artifacts_apply_parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=None,
+        help="Override the private Rygnal data directory.",
+    )
+    artifacts_apply_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable output.",
+    )
+    artifacts_apply_parser.set_defaults(
+        command=run_artifact_apply_cli,
+    )
 
     demo_parser = subparsers.add_parser("demo", help="Run Rygnal demo commands.")
     demo_subparsers = demo_parser.add_subparsers(dest="demo_command", required=True)
