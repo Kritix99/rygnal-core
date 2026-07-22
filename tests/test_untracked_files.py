@@ -5,9 +5,11 @@ import pytest
 
 from rygnal.audit_logger import AuditLogger
 from rygnal.recovery_session import (
+    CleanupStatus,
     RecoverySessionConfig,
     RecoverySessionError,
     create_recovery_session,
+    destroy_recovery_session,
 )
 from rygnal.untracked_files import (
     UntrackedFileDecision,
@@ -147,21 +149,35 @@ def test_preserve_policy_creates_worktree_without_copying_untracked_file(
     trusted_repo: Path,
     tmp_path: Path,
 ) -> None:
-    (trusted_repo / "scratch.txt").write_text("draft\n", encoding="utf-8")
+    trusted_untracked = trusted_repo / "scratch.txt"
+    trusted_untracked.write_text("draft\n", encoding="utf-8")
     logger = AuditLogger(tmp_path / "audit.jsonl")
 
-    worktree = create_recovery_session(
-        RecoverySessionConfig(
-            trusted_repo_path=trusted_repo,
-            rygnal_run_root=tmp_path / "runs",
-            untracked_policy=UntrackedFilePolicy.PRESERVE_AND_WARN,
-            audit_logger=logger,
-        )
+    config = RecoverySessionConfig(
+        trusted_repo_path=trusted_repo,
+        rygnal_run_root=tmp_path / "runs",
+        untracked_policy=UntrackedFilePolicy.PRESERVE_AND_WARN,
+        audit_logger=logger,
     )
+    worktree = create_recovery_session(config)
 
-    assert (trusted_repo / "scratch.txt").exists()
-    assert (worktree.workspace_path / "scratch.txt").exists()
-    assert logger.verify_integrity() is True
+    try:
+        assert worktree.workspace_path != trusted_repo.resolve()
+        assert trusted_untracked.exists()
+        assert trusted_untracked.read_text(encoding="utf-8") == "draft\n"
+
+        workspace_untracked = worktree.workspace_path / "scratch.txt"
+        assert not workspace_untracked.exists()
+
+        assert logger.verify_integrity() is True
+    finally:
+        cleanup = destroy_recovery_session(worktree, config)
+
+    assert cleanup.status == CleanupStatus.CLEANED_GIT
+    assert not worktree.workspace_path.exists()
+
+    assert trusted_untracked.exists()
+    assert trusted_untracked.read_text(encoding="utf-8") == "draft\n"
 
 
 def test_sensitive_untracked_file_blocks_worktree_creation(

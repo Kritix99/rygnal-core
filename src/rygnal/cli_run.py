@@ -181,6 +181,16 @@ def render_guarded_run_summary(result: GuardedRunResult) -> str:
             f"  Patch generated: {_yes_no(patch is not None)}",
             f"  Patch SHA-256: {patch.patch_sha256 if patch else 'none'}",
             f"  Patch size: {patch.patch_size_bytes if patch else 0} bytes",
+            (f"  Patch outcome: {getattr(result, 'patch_apply_outcome', None) or 'unknown'}"),
+            (
+                "  Trusted repo updated: "
+                f"{_yes_no(getattr(result, 'patch_apply_outcome', None) == 'applied')}"
+            ),
+            (f"  Artifact ID: {getattr(result, 'patch_artifact_id', None) or 'none'}"),
+            (
+                "  Workspace quarantined: "
+                f"{_yes_no(bool(getattr(result, 'workspace_quarantined', False)))}"
+            ),
         ]
     )
 
@@ -199,19 +209,44 @@ def render_guarded_run_summary(result: GuardedRunResult) -> str:
 
     lines.append("")
     lines.append("Next:")
+    patch_outcome = getattr(
+        result,
+        "patch_apply_outcome",
+        None,
+    )
+
     if result.status == GuardedRunStatus.APPROVAL_REQUIRED:
-        lines.append("  Review and approve the guarded patch before applying it.")
-        lines.append("  Do not apply changes directly from the disposable workspace.")
-    elif result.status == GuardedRunStatus.BLOCKED:
-        lines.append("  Fix the blocked reason and rerun the command.")
         lines.append(
-            "  For dirty tracked repos, commit/stash changes or rerun with `--allow-dirty`."
+            "  Review the durable guarded patch artifact and approve it before trusted application."
+        )
+        artifact_id = getattr(
+            result,
+            "patch_artifact_id",
+            None,
+        )
+        if artifact_id:
+            lines.append(f"  Durable artifact: {artifact_id}")
+    elif result.status == GuardedRunStatus.BLOCKED:
+        lines.append(
+            "  The generated change was isolated and was not applied to the trusted repository."
+        )
+        lines.append("  Fix the blocked reason and rerun the command.")
+    elif result.status == GuardedRunStatus.CLEANUP_FAILED:
+        lines.append("  Inspect the reported preserved or quarantined workspace before continuing.")
+    elif patch_outcome == "applied":
+        lines.append(
+            "  The verified patch was applied to the trusted "
+            "repository through the canonical safe-apply boundary."
+        )
+    elif patch_outcome == "not_generated":
+        lines.append("  No repository patch was generated.")
+    elif patch_outcome == "not_applied":
+        lines.append(
+            "  Patch evidence was retained in the result, but "
+            "the trusted repository was not changed."
         )
     else:
-        lines.append(
-            "  Review the generated patch metadata. Patch application is not "
-            "performed by `rygnal run`."
-        )
+        lines.append("  Review the final patch outcome and warnings.")
 
     return "\n".join(lines)
 
@@ -233,6 +268,12 @@ def to_safe_json_summary(result: GuardedRunResult) -> dict[str, Any]:
         "baseline_commit_sha": result.baseline_commit_sha,
         "cleanup_performed": result.cleanup_performed,
         "cleanup_status": result.cleanup_status,
+        "workspace_quarantined": bool(getattr(result, "workspace_quarantined", False)),
+        "cleanup": {
+            "performed": result.cleanup_performed,
+            "status": result.cleanup_status,
+            "quarantined": bool(getattr(result, "workspace_quarantined", False)),
+        },
         "blocked_reason": result.blocked_reason,
         "command": {
             "exit_code": command.exit_code if command else None,
@@ -248,7 +289,26 @@ def to_safe_json_summary(result: GuardedRunResult) -> dict[str, Any]:
             "generated": patch is not None,
             "sha256": patch.patch_sha256 if patch else None,
             "size_bytes": patch.patch_size_bytes if patch else 0,
+            "apply_outcome": getattr(
+                result,
+                "patch_apply_outcome",
+                None,
+            ),
+            "applied": (
+                getattr(
+                    result,
+                    "patch_apply_outcome",
+                    None,
+                )
+                == "applied"
+            ),
+            "artifact_id": getattr(
+                result,
+                "patch_artifact_id",
+                None,
+            ),
         },
+        "approval": _approval_json_summary(result),
         "normalized_actions": normalized_actions_audit_summary(
             tuple(getattr(result, "normalized_actions", ()))
         ),
@@ -326,6 +386,15 @@ def _workspace_display(result: GuardedRunResult) -> str:
     visible_path = _visible_workspace_path(result)
 
     if visible_path:
+        if bool(
+            getattr(
+                result,
+                "workspace_quarantined",
+                False,
+            )
+        ):
+            return f"quarantined: {visible_path}"
+
         return f"preserved: {visible_path}"
 
     if result.workspace_path is None:
@@ -338,6 +407,15 @@ def _workspace_display(result: GuardedRunResult) -> str:
 
 
 def _visible_workspace_path(result: GuardedRunResult) -> str | None:
+    if bool(
+        getattr(
+            result,
+            "workspace_quarantined",
+            False,
+        )
+    ):
+        return result.workspace_path
+
     if result.status == GuardedRunStatus.CLEANUP_FAILED:
         return result.workspace_path
 

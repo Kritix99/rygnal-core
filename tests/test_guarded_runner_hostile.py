@@ -26,8 +26,7 @@ def run_git(repo: Path, *args: str) -> None:
         ["git", *args],
         cwd=repo,
         check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         text=True,
     )
 
@@ -43,15 +42,21 @@ def test_hostile_parent_path_write_does_not_mutate_trusted_repo(
             trusted,
             py_command(
                 "from pathlib import Path; "
-                "Path('../escape.txt').write_text('outside workspace in unsafe local\\n')"
+                "Path('../escape.txt').write_text("
+                "'outside workspace in unsafe local\\n')"
             ),
         )
     )
 
-    assert result.status == GuardedRunStatus.COMPLETED
-    assert result.backend_name == "unsafe_local"
-    assert result.containment_verified is False
-    assert any("Unsafe local execution" in warning for warning in result.warnings)
+    assert result.status == GuardedRunStatus.CLEANUP_FAILED
+    assert result.workspace_quarantined is True
+    assert result.cleanup_status == "worktree_quarantined"
+    assert result.workspace_path is not None
+
+    quarantine = Path(result.workspace_path)
+    assert quarantine.exists()
+    assert (quarantine / "escape.txt").exists()
+
     assert head_sha(trusted) == baseline
     assert git_status_porcelain(trusted) == ""
     assert not (trusted / "escape.txt").exists()
@@ -108,7 +113,8 @@ def test_hostile_symlink_to_outside_repo_is_reported_and_blocked_by_gate(
     gate = evaluate_guarded_change_gate(result.patch_diff, risk_report=risk_report)
 
     assert gate.blocked is True
-    assert git_status_porcelain(trusted) == "?? outside_link"
+    assert git_status_porcelain(trusted) == ""
+    assert not (trusted / "outside_link").exists()
 
 
 def test_hostile_large_change_skips_auto_apply(
@@ -229,8 +235,9 @@ def test_hostile_failed_command_after_changes_keeps_evidence_and_cleans(
     assert result.changed_file_report is not None
     assert any(file.path == "before_fail.txt" for file in result.changed_file_report.files)
     assert result.patch_diff is not None
-    assert git_status_porcelain(trusted) == "?? before_fail.txt"
-    assert Path(result.workspace_path).exists()
+    assert git_status_porcelain(trusted) == ""
+    assert not (trusted / "before_fail.txt").exists()
+    assert not Path(result.workspace_path).exists()
 
 
 def test_hostile_timeout_after_changes_keeps_evidence_and_cleans(
@@ -255,8 +262,9 @@ def test_hostile_timeout_after_changes_keeps_evidence_and_cleans(
     assert result.command_result.timed_out is True
     assert result.changed_file_report is not None
     assert any(file.path == "before_timeout.txt" for file in result.changed_file_report.files)
-    assert git_status_porcelain(trusted) == "?? before_timeout.txt"
-    assert Path(result.workspace_path).exists()
+    assert git_status_porcelain(trusted) == ""
+    assert not (trusted / "before_timeout.txt").exists()
+    assert not Path(result.workspace_path).exists()
 
 
 def test_hostile_child_process_attempt_does_not_mark_trusted_repo_dirty(
@@ -310,8 +318,8 @@ def test_hostile_attempt_common_secret_path_in_workspace_is_captured_not_applied
     gate = evaluate_guarded_change_gate(result.patch_diff, risk_report=risk_report)
 
     assert gate.blocked is True
-    assert (trusted / ".aws" / "credentials").exists()
-    assert git_status_porcelain(trusted) == "?? .aws/credentials"
+    assert not (trusted / ".aws" / "credentials").exists()
+    assert git_status_porcelain(trusted) == ""
 
 
 @pytest.mark.skipif(os.name != "posix", reason="process-group cleanup is POSIX-specific")
@@ -346,7 +354,7 @@ def test_timeout_kills_same_process_group_child_before_late_host_write(
     assert result.command_result.timed_out is True
     assert git_status_porcelain(trusted) == ""
     assert result.workspace_path is not None
-    assert Path(result.workspace_path).exists()
+    assert not Path(result.workspace_path).exists()
     assert not sentinel.exists()
 
 

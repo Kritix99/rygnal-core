@@ -173,15 +173,18 @@ def test_engine_api_approval_required_summary_includes_risk_block(
     assert "dependency-file-change" in data["risk"]["reasons"]
     assert data["risk"]["counts"]["high"] >= 1
     assert "raw" not in data["patch"]
-    assert (repo / "pyproject.toml").exists()
+    assert not (repo / "pyproject.toml").exists()
+    assert data["patch"]["artifact_id"]
 
 
-def test_engine_api_approval_required_wins_over_agent_failure(tmp_path: Path) -> None:
+def test_engine_api_agent_failure_wins_over_approval_requirement(
+    tmp_path: Path,
+) -> None:
     repo = _create_repo(tmp_path / "trusted")
     request = {
         "protocol_version": "rygnal.engine.v1",
         "action": "guarded_run.start",
-        "request_id": "approval-required-agent-failure-test",
+        "request_id": "agent-failure-no-approval-test",
         "trusted_repo_path": repo.as_posix(),
         "command": [
             sys.executable,
@@ -206,20 +209,21 @@ def test_engine_api_approval_required_wins_over_agent_failure(tmp_path: Path) ->
 
     events = _parse_ndjson(completed.stdout)
     event_names = [event["event"] for event in events]
-    approval_event = next(event for event in events if event["event"] == "approval.required")
     final = events[-1]
 
-    assert event_names.index("approval.required") < event_names.index("run.completed")
-    assert approval_event["status"] == "approval_required"
-
+    assert "approval.required" not in event_names
     assert final["event"] == "run.completed"
     assert final["ok"] is True
-    assert final["status"] == "approval_required"
-    assert final["data"]["status"] == "approval_required"
-    assert final["data"]["command"]["exit_code"] == 7
-    assert final["data"]["approval"]["required"] is True
-    assert final["data"]["risk"]["present"] is True
-    assert "dependency-file-change" in final["data"]["risk"]["reasons"]
+    assert final["status"] == "command_failed"
+
+    data = final["data"]
+    assert data["status"] == "command_failed"
+    assert data["command"]["exit_code"] == 7
+    assert data["patch"]["generated"] is True
+    assert data["patch"]["apply_outcome"] == "not_applied"
+    assert data["patch"]["applied"] is False
+    assert data["patch"]["artifact_id"] is None
+    assert not (repo / "pyproject.toml").exists()
 
 
 def test_engine_api_treats_agent_failure_as_successful_engine_run(tmp_path: Path) -> None:

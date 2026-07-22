@@ -43,12 +43,11 @@ from rygnal.execution_backend import (
     detect_host_backend_capabilities,
     select_execution_backend,
 )
-from rygnal.recovery_session import (
-    RecoverySession,
-    RecoverySessionConfig,
-    RecoverySessionError,
-    create_recovery_session,
-    detect_trusted_repo_root,
+from rygnal.guarded_patch_finalizer import (
+    GuardedPatchApplyOutcome,
+    GuardedPatchFinalizationRequest,
+    GuardedPatchFinalStatus,
+    finalize_guarded_patch,
 )
 from rygnal.intent_contract import (
     IntentContract,
@@ -77,12 +76,22 @@ from rygnal.models import (
     ToolRequest,
     new_trace_id,
 )
-from rygnal.patch_approval import PatchApprovalError, create_patch_approval_request
+from rygnal.patch_approval import PatchApprovalError
 from rygnal.patch_diff import PatchDiff, PatchDiffGenerationError, generate_patch_diff_from_report
 from rygnal.process_containment import (
     LifecycleEvent,
     build_lifecycle_result,
     evaluate_containment_capabilities,
+)
+from rygnal.recovery_session import (
+    CleanupResult,
+    CleanupStatus,
+    RecoverySession,
+    RecoverySessionConfig,
+    RecoverySessionError,
+    create_recovery_session,
+    destroy_recovery_session,
+    detect_trusted_repo_root,
 )
 from rygnal.repo_state import DirtyRepositoryError, get_uncommitted_changes
 from rygnal.risk_engine import RiskLevel
@@ -91,7 +100,6 @@ from rygnal.subjective_risk import (
     collect_subjective_patch_reasons,
 )
 from rygnal.untracked_files import UntrackedFilePolicy
-from rygnal.recovery_session import CleanupResult, CleanupStatus, destroy_recovery_session
 from rygnal.workspace_mounts import MountContract, MountKind, WorkspaceMountPlan
 
 UNSAFE_LOCAL_WARNING = "Unsafe local execution is not a containment backend."
@@ -193,6 +201,10 @@ class GuardedRunResult:
     intent_review_decision: IntentReviewDecision | None = None
     approval_request: ApprovalRequest | None = None
     containment_features: dict[str, bool] = field(default_factory=dict)
+
+    patch_apply_outcome: str | None = None
+    patch_artifact_id: str | None = None
+    workspace_quarantined: bool = False
 
 
 @dataclass(frozen=True)
@@ -427,7 +439,7 @@ def _guarded_run_concurrency_guard(
 
 
 def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
-    """Run a command inside an in-repo Rygnal recovery session."""
+    """Run a command only inside a disposable worktree, then finalize its patch."""
 
     trace_id = config.trace_id or new_trace_id()
     warnings: list[str] = []
@@ -665,6 +677,10 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
         intent_fallback_evaluation: IntentFallbackEvaluation | None = None
         intent_decision_receipt: IntentDecisionReceipt | None = None
         intent_review_decision: IntentReviewDecision | None = None
+        patch_apply_outcome: str | None = None
+        patch_artifact_id: str | None = None
+        workspace_quarantined = False
+        cleanup_status_value: str | None = None
         status = GuardedRunStatus.FAILED
 
         try:
@@ -800,61 +816,9 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
                     },
                 )
 
-                if not patch_decision.allowed:
-                    approval_required = patch_decision.risk_level == RiskLevel.HIGH
-                    status = (
-                        GuardedRunStatus.APPROVAL_REQUIRED
-                        if approval_required
-                        else GuardedRunStatus.BLOCKED
-                    )
-                    blocked_reason = patch_decision.reason
-                    warnings.append(patch_decision.reason)
-
-                    if approval_required:
-                        try:
-                            approval_request = create_patch_approval_request(
-                                patch_diff,
-                                risk_report=change_risk_report,
-                                requested_by=config.user_id,
-                                agent_id=config.agent_id,
-                                environment=config.environment,
-                                trace_id=trace_id,
-                            )
-                            _submit_patch_approval_request(config, approval_request)
-                        except PatchApprovalError as exc:
-                            approval_required = False
-                            status = GuardedRunStatus.BLOCKED
-                            blocked_reason = (
-                                f"Failed to create guarded patch approval request: {exc}"
-                            )
-                            warnings.append(blocked_reason)
-
-                    _audit(
-                        config,
-                        trace_id=trace_id,
-                        event_type=(
-                            "guarded_run.patch_approval_required"
-                            if approval_required
-                            else "guarded_run.patch_blocked"
-                        ),
-                        decision=Decision.REQUIRE_APPROVAL if approval_required else Decision.BLOCK,
-                        allowed=False,
-                        severity=(
-                            Severity.CRITICAL
-                            if patch_decision.risk_level == RiskLevel.CRITICAL
-                            else Severity.HIGH
-                        ),
-                        reason=blocked_reason or patch_decision.reason,
-                        metadata={
-                            **_worktree_metadata(worktree, backend_name, containment_verified),
-                            "patch_risk": patch_decision.audit_summary,
-                            "approval_request": (
-                                approval_request.model_dump(mode="json")
-                                if approval_request is not None
-                                else None
-                            ),
-                        },
-                    )
+                # Classification records evidence only.
+                # The authoritative finalizer below combines command,
+                # patch, risk, gate, and intent before any trusted mutation.
 
             _audit(
                 config,
@@ -937,59 +901,184 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
                     },
                 )
 
-                if config.intent_contract is not None:
-                    intent_match_results, intent_fallback_evaluation = _evaluate_intent_contract(
-                        config=config,
-                        normalized_actions=normalized_actions,
-                    )
-                    intent_decision_receipt = build_intent_decision_receipt(
-                        contract=config.intent_contract,
-                        match_results=intent_match_results,
-                        fallback_evaluation=intent_fallback_evaluation,
-                        trace_id=trace_id,
-                        normalized_actions=normalized_actions,
-                    )
-                    intent_review_decision = build_intent_review_decision(
-                        contract=config.intent_contract,
-                        match_results=intent_match_results,
-                        fallback_evaluation=intent_fallback_evaluation,
-                        normalized_actions=normalized_actions,
-                        true_risk_level=_intent_true_risk_level(
-                            change_risk_report,
+                try:
+                    if config.intent_contract is not None:
+                        (
+                            intent_match_results,
                             intent_fallback_evaluation,
-                        ),
+                        ) = _evaluate_intent_contract(
+                            config=config,
+                            normalized_actions=normalized_actions,
+                        )
+                        intent_decision_receipt = build_intent_decision_receipt(
+                            contract=config.intent_contract,
+                            match_results=intent_match_results,
+                            fallback_evaluation=intent_fallback_evaluation,
+                            trace_id=trace_id,
+                            normalized_actions=normalized_actions,
+                        )
+                        intent_review_decision = build_intent_review_decision(
+                            contract=config.intent_contract,
+                            match_results=intent_match_results,
+                            fallback_evaluation=intent_fallback_evaluation,
+                            normalized_actions=normalized_actions,
+                            true_risk_level=_intent_true_risk_level(
+                                change_risk_report,
+                                intent_fallback_evaluation,
+                            ),
+                        )
+                        _audit_intent_evaluation(
+                            config,
+                            trace_id=trace_id,
+                            worktree=worktree,
+                            backend_name=backend_name,
+                            containment_verified=containment_verified,
+                            match_results=intent_match_results,
+                            fallback_evaluation=intent_fallback_evaluation,
+                            receipt=intent_decision_receipt,
+                            review_decision=intent_review_decision,
+                        )
+                except Exception as exc:
+                    status = GuardedRunStatus.FAILED
+                    blocked_reason = (
+                        f"Intent evaluation failed closed before trusted mutation: {exc}"
                     )
-                    _audit_intent_evaluation(
+                    warnings.append(blocked_reason)
+
+                    _audit(
                         config,
                         trace_id=trace_id,
-                        worktree=worktree,
-                        backend_name=backend_name,
-                        containment_verified=containment_verified,
-                        match_results=intent_match_results,
-                        fallback_evaluation=intent_fallback_evaluation,
-                        receipt=intent_decision_receipt,
-                        review_decision=intent_review_decision,
+                        event_type="guarded_run.intent_evaluation_failed",
+                        decision=Decision.BLOCK,
+                        allowed=False,
+                        severity=Severity.HIGH,
+                        reason=blocked_reason,
+                        metadata={
+                            **_worktree_metadata(
+                                worktree,
+                                backend_name,
+                                containment_verified,
+                            ),
+                            "exception_type": type(exc).__name__,
+                        },
                     )
 
-                    intent_reason = _intent_policy_reason(intent_fallback_evaluation)
-                    if intent_fallback_evaluation.should_block:
-                        status = GuardedRunStatus.BLOCKED
-                        blocked_reason = intent_reason
-                        warnings.append(intent_reason)
-                    elif (
-                        intent_fallback_evaluation.requires_approval
-                        and status != GuardedRunStatus.BLOCKED
-                    ):
-                        status = GuardedRunStatus.APPROVAL_REQUIRED
-                        blocked_reason = blocked_reason or intent_reason
-                        warnings.append(intent_reason)
+                try:
+                    finalization = finalize_guarded_patch(
+                        GuardedPatchFinalizationRequest(
+                            current_status=status.value,
+                            run_id=worktree.run_id,
+                            trace_id=trace_id,
+                            trusted_repo_path=trusted_repo,
+                            run_root=config.rygnal_run_root,
+                            user_id=config.user_id,
+                            agent_id=config.agent_id,
+                            environment=config.environment,
+                            command_exit_code=(
+                                command_result.exit_code if command_result is not None else None
+                            ),
+                            command_timed_out=bool(
+                                command_result is not None and command_result.timed_out
+                            ),
+                            patch_diff=patch_diff,
+                            risk_report=change_risk_report,
+                            intent_fallback_evaluation=(intent_fallback_evaluation),
+                            intent_decision_receipt=(intent_decision_receipt),
+                            approval_queue=config.approval_queue,
+                            audit_logger=config.audit_logger,
+                        )
+                    )
+
+                    status = GuardedRunStatus(finalization.status.value)
+                    patch_apply_outcome = finalization.apply_outcome.value
+                    patch_artifact_id = finalization.artifact_id
+                    approval_request = finalization.approval_request
+
+                    if finalization.blocked_reason:
+                        blocked_reason = finalization.blocked_reason
+
+                        if status != GuardedRunStatus.COMPLETED and blocked_reason not in warnings:
+                            warnings.append(blocked_reason)
+
+                    if finalization.apply_outcome == GuardedPatchApplyOutcome.PENDING_APPROVAL:
+                        final_event = "guarded_run.patch_approval_required"
+                        final_decision = Decision.REQUIRE_APPROVAL
+                        final_allowed = False
+                        final_severity = Severity.HIGH
+                    elif finalization.status == GuardedPatchFinalStatus.BLOCKED:
+                        final_event = "guarded_run.patch_blocked"
+                        final_decision = Decision.BLOCK
+                        final_allowed = False
+                        final_severity = Severity.CRITICAL
+                    elif finalization.apply_outcome == GuardedPatchApplyOutcome.APPLIED:
+                        final_event = "guarded_run.patch_applied"
+                        final_decision = Decision.ALLOW
+                        final_allowed = True
+                        final_severity = Severity.LOW
+                    elif finalization.apply_outcome == GuardedPatchApplyOutcome.APPLY_FAILED:
+                        final_event = "guarded_run.patch_apply_failed"
+                        final_decision = Decision.BLOCK
+                        final_allowed = False
+                        final_severity = Severity.HIGH
+                    else:
+                        final_event = "guarded_run.patch_finalized"
+                        final_decision = (
+                            Decision.ALLOW
+                            if finalization.status == GuardedPatchFinalStatus.COMPLETED
+                            else Decision.BLOCK
+                        )
+                        final_allowed = finalization.status == GuardedPatchFinalStatus.COMPLETED
+                        final_severity = Severity.LOW if final_allowed else Severity.MEDIUM
+
+                    _audit(
+                        config,
+                        trace_id=trace_id,
+                        event_type=final_event,
+                        decision=final_decision,
+                        allowed=final_allowed,
+                        severity=final_severity,
+                        reason=(
+                            finalization.blocked_reason or "Guarded patch finalization completed."
+                        ),
+                        metadata={
+                            **_worktree_metadata(
+                                worktree,
+                                backend_name,
+                                containment_verified,
+                            ),
+                            "finalization": (finalization.audit_summary),
+                        },
+                    )
+                except Exception as exc:
+                    status = GuardedRunStatus.FAILED
+                    patch_apply_outcome = GuardedPatchApplyOutcome.APPLY_FAILED.value
+                    blocked_reason = f"Authoritative patch finalization failed closed: {exc}"
+                    warnings.append(blocked_reason)
+
+                    _audit(
+                        config,
+                        trace_id=trace_id,
+                        event_type="guarded_run.patch_apply_failed",
+                        decision=Decision.BLOCK,
+                        allowed=False,
+                        severity=Severity.HIGH,
+                        reason=blocked_reason,
+                        metadata={
+                            **_worktree_metadata(
+                                worktree,
+                                backend_name,
+                                containment_verified,
+                            ),
+                            "exception_type": type(exc).__name__,
+                        },
+                    )
 
                 if config.preserve_workspace:
-                    warnings.append("Guarded workspace was preserved by explicit configuration.")
-                    cleanup_result = CleanupResult(
-                        status=CleanupStatus.RESET_SUCCESS,
-                        message="Workspace preserved by explicit configuration.",
+                    warnings.append(
+                        "Disposable guarded workspace was preserved by explicit configuration."
                     )
+                    cleanup_status_value = "preserved"
+
                     _audit(
                         config,
                         trace_id=trace_id,
@@ -997,11 +1086,18 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
                         decision=Decision.ALLOW,
                         allowed=True,
                         severity=Severity.LOW,
-                        reason="Guarded workspace preserved by explicit configuration.",
+                        reason=(
+                            "Disposable guarded workspace preserved by explicit configuration."
+                        ),
                         metadata={
-                            **_worktree_metadata(worktree, backend_name, containment_verified),
+                            **_worktree_metadata(
+                                worktree,
+                                backend_name,
+                                containment_verified,
+                            ),
                             "cleanup_performed": False,
                             "cleanup_status": "preserved",
+                            "workspace_quarantined": False,
                         },
                     )
                 else:
@@ -1017,9 +1113,17 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
                         metadata=_worktree_metadata(worktree, backend_name, containment_verified),
                     )
 
-                    cleanup_result = destroy_recovery_session(worktree, worktree_config)
+                    cleanup_result = destroy_recovery_session(
+                        worktree,
+                        worktree_config,
+                    )
+                    cleanup_status_value = cleanup_result.status.value
+                    workspace_quarantined = cleanup_result.quarantined
 
-                    if cleanup_result.status == CleanupStatus.CLEANUP_FAILED:
+                    if (
+                        cleanup_result.status == CleanupStatus.CLEANUP_FAILED
+                        or cleanup_result.quarantined
+                    ):
                         status = GuardedRunStatus.CLEANUP_FAILED
                         warnings.append(cleanup_result.message)
                         _audit(
@@ -1052,17 +1156,29 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
                             },
                         )
 
+        returned_workspace_path: str | None = None
+
+        if worktree is not None:
+            if (
+                cleanup_result is not None
+                and cleanup_result.quarantined
+                and cleanup_result.quarantine_path
+            ):
+                returned_workspace_path = cleanup_result.quarantine_path
+            else:
+                returned_workspace_path = worktree.workspace_path.as_posix()
+
         return GuardedRunResult(
             status=status,
             run_id=worktree.run_id if worktree else None,
             trusted_repo_path=trusted_repo.as_posix(),
-            workspace_path=worktree.workspace_path.as_posix() if worktree else None,
+            workspace_path=returned_workspace_path,
             baseline_commit_sha=worktree.baseline_commit_sha if worktree else None,
             backend_name=backend_name,
             backend_safe_by_default=backend_safe_by_default,
             containment_verified=containment_verified,
             cleanup_performed=cleanup_performed,
-            cleanup_status=cleanup_result.status.value if cleanup_result else None,
+            cleanup_status=cleanup_status_value,
             command_result=command_result,
             changed_file_report=changed_file_report,
             patch_diff=patch_diff,
@@ -1077,6 +1193,9 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
             intent_review_decision=intent_review_decision,
             approval_request=approval_request,
             containment_features=containment_features,
+            patch_apply_outcome=patch_apply_outcome,
+            patch_artifact_id=patch_artifact_id,
+            workspace_quarantined=workspace_quarantined,
         )
 
 

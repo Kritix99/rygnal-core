@@ -277,7 +277,11 @@ def test_scope_drift_respects_disabled_shadow_and_enforce_modes(
     assert result.intent_review_decision.decision == expected_review
     assert "target-scope-drift" in _reason_codes(result)
     assert "docs/outside.md" in _affected_resource_paths(result)
-    assert (repo / "docs" / "outside.md").exists()
+    if expected_status == GuardedRunStatus.APPROVAL_REQUIRED:
+        assert not (repo / "docs" / "outside.md").exists()
+        assert result.patch_artifact_id is not None
+    else:
+        assert (repo / "docs" / "outside.md").exists()
 
     _assert_intent_trace(result, audit)
 
@@ -406,8 +410,8 @@ def test_move_into_sensitive_boundary_is_not_missed(
     assert result.intent_review_decision is not None
     assert result.intent_review_decision.decision == IntentReviewDecisionType.POLICY_DENY
     assert ".env" in _affected_resource_paths(result)
-    assert not (repo / "src" / "app.py").exists()
-    assert (repo / ".env").exists()
+    assert (repo / "src" / "app.py").exists()
+    assert not (repo / ".env").exists()
 
     _assert_intent_trace(result, audit)
 

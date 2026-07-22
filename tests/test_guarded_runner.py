@@ -20,9 +20,9 @@ from rygnal.guarded_runner import (
     run_guarded,
 )
 from rygnal.models import ApprovalStatus
+from rygnal.recovery_session import CleanupResult, CleanupStatus
 from rygnal.risk_engine import RiskLevel
 from rygnal.untracked_files import UntrackedFilePolicy
-from rygnal.recovery_session import CleanupResult, CleanupStatus
 
 
 def run_git(repo: Path, *args: str) -> str:
@@ -420,7 +420,10 @@ def test_dirty_override_is_explicit_and_audited(tmp_path: Path) -> None:
         )
     )
 
-    assert result.status == GuardedRunStatus.COMPLETED
+    assert result.status == GuardedRunStatus.FAILED
+    assert result.patch_apply_outcome == "apply_failed"
+    assert not (repo / "agent.txt").exists()
+    assert (repo / "README.md").read_text(encoding="utf-8") == "dirty\n"
     assert any("Dirty trusted repository override" in warning for warning in result.warnings)
     assert audit.verify_integrity()
 
@@ -462,10 +465,13 @@ def test_preserve_untracked_policy_does_not_copy_unrelated_trusted_file(
 
     workspace = Path(result.workspace_path)
 
-    assert result.status == GuardedRunStatus.COMPLETED
+    assert result.status == GuardedRunStatus.FAILED
+    assert result.patch_apply_outcome == "apply_failed"
+    assert not (repo / "agent.txt").exists()
+    assert (repo / "notes.txt").read_text(encoding="utf-8") == "local note\n"
     assert workspace.exists()
     assert (workspace / "agent.txt").exists()
-    assert (workspace / "notes.txt").exists()
+    assert not (workspace / "notes.txt").exists()
     assert (repo / "notes.txt").exists()
 
 
@@ -755,8 +761,8 @@ def test_cleanup_removes_workspace_by_default(tmp_path: Path) -> None:
 
     assert result.status == GuardedRunStatus.COMPLETED
     assert result.cleanup_performed is True
-    assert result.cleanup_status == "recovery_session_preserved"
-    assert Path(result.workspace_path).exists()
+    assert result.cleanup_status == "worktree_removed"
+    assert not Path(result.workspace_path).exists()
 
 
 def test_preserve_workspace_is_explicit(tmp_path: Path) -> None:
@@ -772,7 +778,7 @@ def test_preserve_workspace_is_explicit(tmp_path: Path) -> None:
 
     assert result.status == GuardedRunStatus.COMPLETED
     assert result.cleanup_performed is False
-    assert result.cleanup_status == "reset_success"
+    assert result.cleanup_status == "preserved"
     assert Path(result.workspace_path).exists()
 
 
@@ -938,6 +944,9 @@ def test_high_risk_dependency_patch_requires_approval_before_completion(tmp_path
     assert result.approval_request.requested_by == "local_user"
     assert result.approval_request.agent_id == "local_agent"
     assert result.approval_request.environment == "local"
+    assert result.patch_apply_outcome == "pending_approval"
+    assert result.patch_artifact_id is not None
+    assert result.approval_request.metadata["artifact_id"] == result.patch_artifact_id
     assert result.change_risk_report is not None
     assert result.change_risk_report.overall_risk_level == RiskLevel.HIGH
     assert "requires approval" in result.blocked_reason
@@ -945,7 +954,7 @@ def test_high_risk_dependency_patch_requires_approval_before_completion(tmp_path
     assert "guarded_run.patch_approval_required" in audit_actions(audit)
     assert "guarded_run.patch_blocked" not in audit_actions(audit)
     assert result.cleanup_performed is True
-    assert Path(result.workspace_path).exists()
+    assert not Path(result.workspace_path).exists()
     assert audit.verify_integrity()
 
 
@@ -1047,7 +1056,7 @@ def test_critical_secret_patch_is_blocked_before_completion(tmp_path: Path) -> N
     assert "critical risk" in result.blocked_reason
     assert "guarded_run.patch_blocked" in audit_actions(audit)
     assert result.cleanup_performed is True
-    assert Path(result.workspace_path).exists()
+    assert not Path(result.workspace_path).exists()
     assert audit.verify_integrity()
 
 
@@ -1104,7 +1113,7 @@ def test_subjective_locked_file_blocks_guarded_patch(tmp_path: Path) -> None:
     assert "guarded_run.patch_blocked" in audit_actions(audit)
     assert "guarded_run.patch_approval_required" not in audit_actions(audit)
     assert result.cleanup_performed is True
-    assert Path(result.workspace_path).exists()
+    assert not Path(result.workspace_path).exists()
     assert audit.verify_integrity()
 
 
