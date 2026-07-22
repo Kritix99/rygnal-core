@@ -11,7 +11,8 @@ requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.7.0",
     "PyYAML>=6.0.1",
-    "fastapi>=0.115.0"
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0"
 ]
 
 [project.scripts]
@@ -45,3 +46,6 @@ where = ["src"]
 live-openai = [
     "openai>=1.0.0"
 ]
+
+[tool.setuptools.package-data]
+"rygnal.resources.policies" = ["*.yaml"]
