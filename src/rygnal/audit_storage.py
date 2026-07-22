@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from rygnal.models import AuditEvent
+from rygnal.sqlite_migrations import migrate_audit_database
 from rygnal.sqlite_runtime import (
     connect_sqlite,
     initialize_sqlite_database,
@@ -199,72 +200,8 @@ class SQLiteAuditStore:
             return {name: connection.execute(f"PRAGMA {name}").fetchone()[0] for name in names}
 
     def _initialize(self) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS audit_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_id TEXT NOT NULL UNIQUE,
-                    timestamp TEXT NOT NULL,
-                    trace_id TEXT NOT NULL,
-                    user_id TEXT NOT NULL,
-                    agent_id TEXT NOT NULL,
-                    environment TEXT NOT NULL,
-                    tool_name TEXT NOT NULL,
-                    action TEXT,
-                    decision TEXT NOT NULL,
-                    allowed INTEGER NOT NULL,
-                    severity TEXT NOT NULL,
-                    policy_id TEXT,
-                    reason TEXT NOT NULL,
-                    prev_event_hash TEXT,
-                    event_hash TEXT NOT NULL UNIQUE,
-                    payload_json TEXT NOT NULL
-                )
-                """
-            )
-
-            columns = {
-                str(row["name"])
-                for row in connection.execute("PRAGMA table_info(audit_events)").fetchall()
-            }
-
-            if "prev_event_hash" not in columns:
-                connection.execute(
-                    """
-                    ALTER TABLE audit_events
-                    ADD COLUMN prev_event_hash TEXT
-                    """
-                )
-
-            connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS
-                idx_audit_events_trace_id
-                ON audit_events(trace_id)
-                """
-            )
-            connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS
-                idx_audit_events_policy_id
-                ON audit_events(policy_id)
-                """
-            )
-            connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS
-                idx_audit_events_tool_name
-                ON audit_events(tool_name)
-                """
-            )
-            connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS
-                idx_audit_events_decision
-                ON audit_events(decision)
-                """
-            )
+        """Apply the versioned schema contract."""
+        migrate_audit_database(self.db_path)
 
     def _insert_event(
         self,

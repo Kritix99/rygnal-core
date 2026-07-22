@@ -12,6 +12,7 @@ from rygnal.approval_authorization import ApprovalAuthorizationEngine
 from rygnal.approval_state import ApprovalStateMachine
 from rygnal.models import ApprovalDecision, ApprovalRequest, ApprovalStatus, utc_now_iso
 from rygnal.security import redact_sensitive_value
+from rygnal.sqlite_migrations import migrate_approval_database
 from rygnal.sqlite_runtime import (
     connect_sqlite,
     initialize_sqlite_database,
@@ -438,34 +439,8 @@ class SQLiteApprovalQueue(InMemoryApprovalQueue):
         )
 
     def _initialize(self) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS approval_queue (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    approval_id TEXT NOT NULL UNIQUE,
-                    status TEXT NOT NULL,
-                    request_json TEXT NOT NULL,
-                    decision_json TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    CHECK (
-                        (status = 'pending'
-                         AND decision_json IS NULL)
-                        OR
-                        (status IN ('approved', 'rejected')
-                         AND decision_json IS NOT NULL)
-                    )
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS
-                idx_approval_queue_status
-                ON approval_queue(status)
-                """
-            )
+        """Apply the versioned schema contract."""
+        migrate_approval_database(self.db_path)
 
     def _load_items(self) -> None:
         with self._connect() as connection:

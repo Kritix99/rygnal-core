@@ -8,6 +8,9 @@ import webbrowser
 
 from rygnal.local_app import create_local_app
 from rygnal.local_paths import resolve_local_paths
+from rygnal.runtime_config import (
+    load_runtime_config,
+)
 
 
 def is_loopback_host(host: str) -> bool:
@@ -39,7 +42,7 @@ def _browser_host(host: str) -> str:
 
 
 def run_serve_cli(args: object) -> int:
-    """Start the persistent local FastAPI service."""
+    """Start the validated local FastAPI service."""
     host = str(getattr(args, "host", "127.0.0.1"))
     port = int(getattr(args, "port", 8787))
     allow_network = bool(getattr(args, "allow_network", False))
@@ -50,15 +53,33 @@ def run_serve_cli(args: object) -> int:
     if not is_loopback_host(host) and not allow_network:
         raise ValueError(
             "Refusing non-loopback binding. "
-            "Use --allow-network only when remote access "
-            "is intentionally required."
+            "Use --allow-network only when remote "
+            "access is intentionally required."
         )
 
+    runtime_config = load_runtime_config(
+        overrides={
+            "api": {
+                "host": host,
+                "port": port,
+                "allow_remote": allow_network,
+            }
+        },
+        allow_implicit_development=True,
+    )
+    data_dir = getattr(
+        args,
+        "data_dir",
+        None,
+    )
     paths = resolve_local_paths(
-        data_dir=getattr(args, "data_dir", None),
+        data_dir=(data_dir if data_dir is not None else runtime_config.storage.data_dir),
         create=True,
     )
-    app = create_local_app(data_dir=paths.root)
+    app = create_local_app(
+        data_dir=paths.root,
+        runtime_config=runtime_config,
+    )
 
     browser_host = _browser_host(host)
     base_url = f"http://{browser_host}:{port}"
@@ -66,19 +87,24 @@ def run_serve_cli(args: object) -> int:
 
     print("Rygnal local service")
     print(f"API:  {base_url}")
-    print(f"Docs: {docs_url}")
+
+    if runtime_config.api.docs_enabled:
+        print(f"Docs: {docs_url}")
+
     print(f"Data: {paths.root}")
     print("Stop: Ctrl+C")
 
     if not is_loopback_host(host):
         print()
-        print(
-            "WARNING: Rygnal is listening beyond localhost. "
-            "The local API does not provide enterprise "
-            "authentication."
-        )
+        print("WARNING: Rygnal is listening beyond localhost. Bearer authentication is required.")
 
-    if bool(getattr(args, "open_browser", False)):
+    if runtime_config.api.docs_enabled and bool(
+        getattr(
+            args,
+            "open_browser",
+            False,
+        )
+    ):
         timer = threading.Timer(
             0.8,
             webbrowser.open,
@@ -93,9 +119,25 @@ def run_serve_cli(args: object) -> int:
         app,
         host=host,
         port=port,
-        log_level=str(getattr(args, "log_level", "info")),
-        access_log=not bool(getattr(args, "no_access_log", False)),
+        log_level=str(
+            getattr(
+                args,
+                "log_level",
+                "info",
+            )
+        ),
+        access_log=not bool(
+            getattr(
+                args,
+                "no_access_log",
+                False,
+            )
+        ),
         reload=False,
+        limit_concurrency=(runtime_config.api.max_concurrency),
+        timeout_keep_alive=5,
+        server_header=False,
+        date_header=False,
     )
 
     return 0

@@ -6,7 +6,7 @@ import hmac
 import ipaddress
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -17,6 +17,11 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from rygnal.api_security import (
+    ApiRequestGuardMiddleware,
+    bearer_token_from_headers,
+    normalize_request_id,
+)
 from rygnal.approval_queue import (
     APPROVAL_QUEUE_DB_PATH_ENV,
     ApprovalDeniedError,
@@ -37,6 +42,10 @@ from rygnal.models import ApprovalRequest, ApprovalStatus, AuditEvent, PolicyDec
 from rygnal.patch_approval import write_patch_approval_decision_audit_event
 from rygnal.policy_engine import PolicyEngine, load_default_policy_engine
 from rygnal.risk_engine import RiskAssessment, RiskEngine
+from rygnal.runtime_config import (
+    RuntimeConfigV1,
+    load_runtime_config,
+)
 
 REDACTED_VALUE = "[REDACTED]"
 OPERATOR_TOKEN_ENV = "RYGNAL_OPERATOR_TOKEN"
@@ -149,16 +158,36 @@ def create_app(
     approval_queue_db_path: str | Path | None = None,
     approval_service: ApprovalArtifactService | None = None,
     operator_token: str | None = None,
+    runtime_config: RuntimeConfigV1 | None = None,
+    readiness_probe: Callable[[], bool] | None = None,
 ) -> FastAPI:
     """Create the local Rygnal FastAPI app."""
     active_approval_service = approval_service
+    active_runtime_config = (
+        runtime_config
+        if runtime_config is not None
+        else load_runtime_config(
+            environ=os.environ,
+            allow_implicit_development=True,
+        )
+    )
     active_operator_token = (
-        operator_token if operator_token is not None else os.environ.get(OPERATOR_TOKEN_ENV)
+        operator_token
+        if operator_token is not None
+        else active_runtime_config.api.operator_token_value()
     )
     app = FastAPI(
         title="Rygnal Core Local API",
         version="0.1.0",
         description="Local API for evaluating AI-agent tool actions.",
+        docs_url=("/docs" if active_runtime_config.api.docs_enabled else None),
+        redoc_url=("/redoc" if active_runtime_config.api.docs_enabled else None),
+        openapi_url=("/openapi.json" if active_runtime_config.api.docs_enabled else None),
+    )
+    app.add_middleware(
+        ApiRequestGuardMiddleware,
+        config=active_runtime_config.api,
+        token=active_operator_token,
     )
 
     active_policy_engine = policy_engine or load_default_policy_engine()
@@ -177,7 +206,11 @@ def create_app(
 
     @app.middleware("http")
     async def attach_request_id(request: Request, call_next):  # type: ignore[no-untyped-def]
-        request.state.request_id = request.headers.get("X-Request-ID") or f"req_{uuid4().hex}"
+        request.state.request_id = getattr(
+            request.state,
+            "request_id",
+            None,
+        ) or normalize_request_id(request.headers.get("X-Request-ID"))
 
         try:
             response = await call_next(request)
@@ -237,6 +270,21 @@ def create_app(
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok", "service": "rygnal-core"}
+
+    @app.get("/ready", response_model=None)
+    def ready() -> JSONResponse:
+        try:
+            is_ready = readiness_probe() if readiness_probe is not None else True
+        except Exception:
+            is_ready = False
+
+        return JSONResponse(
+            status_code=200 if is_ready else 503,
+            content={
+                "status": ("ready" if is_ready else "not_ready"),
+                "service": "rygnal-core",
+            },
+        )
 
     @app.get("/v1/audit/events", response_model=None)
     def audit_events(
@@ -312,11 +360,23 @@ def create_app(
         return {"approval": redact_for_api(queued.to_dict())}
 
     @app.get("/v1/approvals", response_model=None)
-    def list_approvals(status: ApprovalStatus | None = None) -> dict[str, Any]:
-        approvals = tuple(item.to_dict() for item in active_approval_queue.list(status=status))
+    def list_approvals(
+        status: ApprovalStatus | None = None,
+        limit: int = Query(default=100, ge=1),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict[str, Any]:
+        bounded_limit = min(
+            limit,
+            active_runtime_config.api.max_page_size,
+        )
+        all_approvals = tuple(item.to_dict() for item in active_approval_queue.list(status=status))
+        approvals = all_approvals[offset : offset + bounded_limit]
+
         return {
             "approvals": redact_for_api(approvals),
             "returned_count": len(approvals),
+            "limit": bounded_limit,
+            "offset": offset,
         }
 
     @app.get("/v1/approvals/{approval_id}", response_model=None)
@@ -373,17 +433,27 @@ def create_app(
     )
     def list_patch_approvals(
         status: ApprovalStatus | None = None,
+        limit: int = Query(default=100, ge=1),
+        offset: int = Query(default=0, ge=0),
     ) -> dict[str, Any]:
         service = require_patch_operation_service(active_approval_service)
 
         try:
-            views = service.list(status=status)
+            all_views = service.list(status=status)
         except Exception as exc:
             raise_patch_operation_http_error(exc)
+
+        bounded_limit = min(
+            limit,
+            active_runtime_config.api.max_page_size,
+        )
+        views = all_views[offset : offset + bounded_limit]
 
         return {
             "approvals": tuple(view.to_dict() for view in views),
             "returned_count": len(views),
+            "limit": bounded_limit,
+            "offset": offset,
         }
 
     @app.get(
@@ -529,6 +599,9 @@ def create_app(
             }
         )
 
+    app.state.rygnal_runtime_config = active_runtime_config
+    app.state.rygnal_ready_probe = readiness_probe
+
     return app
 
 
@@ -621,12 +694,15 @@ def require_patch_operator(
     *,
     operator_token: str | None,
 ) -> None:
-    """Require an operator token or a loopback client."""
+    """Require the configured operator credential."""
     if operator_token:
         candidate = request.headers.get(
             "x-rygnal-operator-token",
             "",
         )
+
+        if not candidate:
+            candidate = bearer_token_from_headers(request.headers)
 
         if not hmac.compare_digest(
             candidate,
@@ -650,9 +726,7 @@ def require_patch_operator(
     if not loopback:
         raise HTTPException(
             status_code=403,
-            detail=(
-                "Patch mutation endpoints require either loopback access or an operator token."
-            ),
+            detail=("Patch mutation endpoints require authenticated or loopback access."),
         )
 
 

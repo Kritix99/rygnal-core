@@ -10,30 +10,60 @@ from fastapi import FastAPI
 
 from rygnal.api import create_app
 from rygnal.local_runtime import create_local_runtime_dependencies
+from rygnal.runtime_config import (
+    RuntimeConfigV1,
+    load_runtime_config,
+)
+from rygnal.sqlite_migrations import (
+    approval_schema_ready,
+    audit_schema_ready,
+    operation_schema_ready,
+)
 
 
 def create_local_app(
     *,
     data_dir: str | Path | None = None,
     environ: Mapping[str, str] | None = None,
+    runtime_config: RuntimeConfigV1 | None = None,
 ) -> FastAPI:
-    """Create a private local app backed by durable local storage."""
+    """Create a validated durable local application."""
+    environment = os.environ if environ is None else environ
+    active_config = (
+        runtime_config
+        if runtime_config is not None
+        else load_runtime_config(
+            environ=environment,
+            allow_implicit_development=True,
+        )
+    )
+    configured_data_dir = data_dir if data_dir is not None else active_config.storage.data_dir
+
     dependencies = create_local_runtime_dependencies(
-        data_dir=data_dir,
-        environ=environ,
+        data_dir=configured_data_dir,
+        environ=environment,
     )
 
-    environment = os.environ if environ is None else environ
+    def readiness_probe() -> bool:
+        return (
+            audit_schema_ready(dependencies.paths.audit_db)
+            and approval_schema_ready(dependencies.paths.approval_db)
+            and operation_schema_ready(dependencies.operation_store.db_path)
+            and dependencies.audit_logger.verify_integrity()
+        )
 
     app = create_app(
         audit_logger=dependencies.audit_logger,
         approval_queue=dependencies.approval_queue,
         approval_service=dependencies.approval_service,
-        operator_token=environment.get("RYGNAL_OPERATOR_TOKEN"),
+        operator_token=(active_config.api.operator_token_value()),
+        runtime_config=active_config,
+        readiness_probe=readiness_probe,
     )
 
     app.state.rygnal_local_paths = dependencies.paths
     app.state.rygnal_local_dependencies = dependencies
+    app.state.rygnal_runtime_config = active_config
 
     return app
 

@@ -17,6 +17,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from rygnal.sqlite_migrations import migrate_operation_database
 from rygnal.sqlite_runtime import (
     connect_sqlite,
     initialize_sqlite_database,
@@ -663,65 +664,8 @@ class SQLiteOperationStore:
             connection.close()
 
     def _initialize(self) -> None:
-        connection = self._connect()
-
-        try:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS operations (
-                    schema_version TEXT NOT NULL,
-                    operation_key TEXT PRIMARY KEY,
-                    operation_type TEXT NOT NULL,
-                    resource_key TEXT NOT NULL,
-                    artifact_id TEXT NOT NULL,
-                    approval_id TEXT NOT NULL,
-                    patch_sha256 TEXT NOT NULL,
-                    baseline_commit_sha TEXT NOT NULL,
-                    target_repo_path TEXT NOT NULL,
-                    state TEXT NOT NULL,
-                    owner_token TEXT NOT NULL,
-                    owner_pid INTEGER NOT NULL,
-                    owner_start_token TEXT NOT NULL,
-                    created_at_unix REAL NOT NULL,
-                    updated_at_unix REAL NOT NULL,
-                    retryable INTEGER NOT NULL DEFAULT 0,
-                    result_json TEXT,
-                    error_text TEXT
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS resource_leases (
-                    resource_key TEXT PRIMARY KEY,
-                    operation_key TEXT NOT NULL UNIQUE,
-                    owner_token TEXT NOT NULL,
-                    owner_pid INTEGER NOT NULL,
-                    owner_start_token TEXT NOT NULL,
-                    created_at_unix REAL NOT NULL,
-                    FOREIGN KEY(operation_key)
-                        REFERENCES operations(operation_key)
-                        ON DELETE CASCADE
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS
-                idx_operations_state
-                ON operations(state)
-                """
-            )
-            connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS
-                idx_operations_artifact
-                ON operations(artifact_id)
-                """
-            )
-            connection.commit()
-        finally:
-            connection.close()
+        """Apply the versioned schema contract."""
+        migrate_operation_database(self.db_path)
 
     def _connect(self) -> sqlite3.Connection:
         return connect_sqlite(self.db_path)
