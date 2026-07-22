@@ -67,6 +67,11 @@ jobs:
       - name: Ruff format check
         run: ruff format --check .
 
+      - name: Install Bubblewrap containment backend
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+
       - name: Run tests
         run: pytest -q
 
