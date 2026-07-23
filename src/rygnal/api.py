@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hmac
+import ipaddress
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -15,6 +17,11 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from rygnal.api_security import (
+    ApiRequestGuardMiddleware,
+    bearer_token_from_headers,
+    normalize_request_id,
+)
 from rygnal.approval_queue import (
     APPROVAL_QUEUE_DB_PATH_ENV,
     ApprovalDeniedError,
@@ -23,14 +30,25 @@ from rygnal.approval_queue import (
     InMemoryApprovalQueue,
     SQLiteApprovalQueue,
 )
+from rygnal.approval_service import (
+    ApprovalArtifactBindingError,
+    ApprovalArtifactService,
+    ApprovalOperationError,
+    ApprovalOperationStateError,
+)
 from rygnal.audit_logger import AuditLogger
 from rygnal.audit_query import AuditQuery, AuditQueryError, query_audit_events
 from rygnal.models import ApprovalRequest, ApprovalStatus, AuditEvent, PolicyDecision, ToolRequest
 from rygnal.patch_approval import write_patch_approval_decision_audit_event
 from rygnal.policy_engine import PolicyEngine, load_default_policy_engine
 from rygnal.risk_engine import RiskAssessment, RiskEngine
+from rygnal.runtime_config import (
+    RuntimeConfigV1,
+    load_runtime_config,
+)
 
 REDACTED_VALUE = "[REDACTED]"
+OPERATOR_TOKEN_ENV = "RYGNAL_OPERATOR_TOKEN"
 SECRET_KEYWORDS = {
     "api_key",
     "apikey",
@@ -59,6 +77,15 @@ class ApprovalDecisionRequest(BaseModel):
 
     decided_by: str = Field(min_length=1)
     reason: str = Field(min_length=1)
+
+
+class ArtifactApplyRequest(BaseModel):
+    """Request to apply a previously approved patch artifact."""
+
+    target_repo_path: str = Field(
+        min_length=1,
+        max_length=4096,
+    )
 
 
 class _EmptyAuditSource:
@@ -129,12 +156,38 @@ def create_app(
     audit_logger: AuditLogger | None = None,
     approval_queue: InMemoryApprovalQueue | None = None,
     approval_queue_db_path: str | Path | None = None,
+    approval_service: ApprovalArtifactService | None = None,
+    operator_token: str | None = None,
+    runtime_config: RuntimeConfigV1 | None = None,
+    readiness_probe: Callable[[], bool] | None = None,
 ) -> FastAPI:
     """Create the local Rygnal FastAPI app."""
+    active_approval_service = approval_service
+    active_runtime_config = (
+        runtime_config
+        if runtime_config is not None
+        else load_runtime_config(
+            environ=os.environ,
+            allow_implicit_development=True,
+        )
+    )
+    active_operator_token = (
+        operator_token
+        if operator_token is not None
+        else active_runtime_config.api.operator_token_value()
+    )
     app = FastAPI(
         title="Rygnal Core Local API",
         version="0.1.0",
         description="Local API for evaluating AI-agent tool actions.",
+        docs_url=("/docs" if active_runtime_config.api.docs_enabled else None),
+        redoc_url=("/redoc" if active_runtime_config.api.docs_enabled else None),
+        openapi_url=("/openapi.json" if active_runtime_config.api.docs_enabled else None),
+    )
+    app.add_middleware(
+        ApiRequestGuardMiddleware,
+        config=active_runtime_config.api,
+        token=active_operator_token,
     )
 
     active_policy_engine = policy_engine or load_default_policy_engine()
@@ -153,7 +206,11 @@ def create_app(
 
     @app.middleware("http")
     async def attach_request_id(request: Request, call_next):  # type: ignore[no-untyped-def]
-        request.state.request_id = request.headers.get("X-Request-ID") or f"req_{uuid4().hex}"
+        request.state.request_id = getattr(
+            request.state,
+            "request_id",
+            None,
+        ) or normalize_request_id(request.headers.get("X-Request-ID"))
 
         try:
             response = await call_next(request)
@@ -213,6 +270,21 @@ def create_app(
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok", "service": "rygnal-core"}
+
+    @app.get("/ready", response_model=None)
+    def ready() -> JSONResponse:
+        try:
+            is_ready = readiness_probe() if readiness_probe is not None else True
+        except Exception:
+            is_ready = False
+
+        return JSONResponse(
+            status_code=200 if is_ready else 503,
+            content={
+                "status": ("ready" if is_ready else "not_ready"),
+                "service": "rygnal-core",
+            },
+        )
 
     @app.get("/v1/audit/events", response_model=None)
     def audit_events(
@@ -288,11 +360,23 @@ def create_app(
         return {"approval": redact_for_api(queued.to_dict())}
 
     @app.get("/v1/approvals", response_model=None)
-    def list_approvals(status: ApprovalStatus | None = None) -> dict[str, Any]:
-        approvals = tuple(item.to_dict() for item in active_approval_queue.list(status=status))
+    def list_approvals(
+        status: ApprovalStatus | None = None,
+        limit: int = Query(default=100, ge=1),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict[str, Any]:
+        bounded_limit = min(
+            limit,
+            active_runtime_config.api.max_page_size,
+        )
+        all_approvals = tuple(item.to_dict() for item in active_approval_queue.list(status=status))
+        approvals = all_approvals[offset : offset + bounded_limit]
+
         return {
             "approvals": redact_for_api(approvals),
             "returned_count": len(approvals),
+            "limit": bounded_limit,
+            "offset": offset,
         }
 
     @app.get("/v1/approvals/{approval_id}", response_model=None)
@@ -343,6 +427,149 @@ def create_app(
             audit_logger=active_audit_logger,
         )
 
+    @app.get(
+        "/v1/patch-approvals",
+        response_model=None,
+    )
+    def list_patch_approvals(
+        status: ApprovalStatus | None = None,
+        limit: int = Query(default=100, ge=1),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict[str, Any]:
+        service = require_patch_operation_service(active_approval_service)
+
+        try:
+            all_views = service.list(status=status)
+        except Exception as exc:
+            raise_patch_operation_http_error(exc)
+
+        bounded_limit = min(
+            limit,
+            active_runtime_config.api.max_page_size,
+        )
+        views = all_views[offset : offset + bounded_limit]
+
+        return {
+            "approvals": tuple(view.to_dict() for view in views),
+            "returned_count": len(views),
+            "limit": bounded_limit,
+            "offset": offset,
+        }
+
+    @app.get(
+        "/v1/patch-approvals/{approval_id}",
+        response_model=None,
+    )
+    def inspect_patch_approval(
+        approval_id: str,
+    ) -> dict[str, Any]:
+        service = require_patch_operation_service(active_approval_service)
+
+        try:
+            return service.inspect_approval(approval_id).to_dict()
+        except Exception as exc:
+            raise_patch_operation_http_error(exc)
+
+    @app.post(
+        "/v1/patch-approvals/{approval_id}/approve",
+        response_model=None,
+    )
+    def approve_patch_approval(
+        approval_id: str,
+        body: ApprovalDecisionRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        require_patch_operator(
+            request,
+            operator_token=active_operator_token,
+        )
+        service = require_patch_operation_service(active_approval_service)
+
+        try:
+            return service.approve(
+                approval_id,
+                decided_by=body.decided_by,
+                reason=body.reason,
+            ).to_dict()
+        except Exception as exc:
+            raise_patch_operation_http_error(exc)
+
+    @app.post(
+        "/v1/patch-approvals/{approval_id}/reject",
+        response_model=None,
+    )
+    def reject_patch_approval(
+        approval_id: str,
+        body: ApprovalDecisionRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        require_patch_operator(
+            request,
+            operator_token=active_operator_token,
+        )
+        service = require_patch_operation_service(active_approval_service)
+
+        try:
+            return service.reject(
+                approval_id,
+                decided_by=body.decided_by,
+                reason=body.reason,
+            ).to_dict()
+        except Exception as exc:
+            raise_patch_operation_http_error(exc)
+
+    @app.get(
+        "/v1/patch-artifacts/{artifact_id}",
+        response_model=None,
+    )
+    def inspect_patch_artifact(
+        artifact_id: str,
+    ) -> dict[str, Any]:
+        service = require_patch_operation_service(active_approval_service)
+
+        try:
+            return service.inspect_artifact(artifact_id).to_dict()
+        except Exception as exc:
+            raise_patch_operation_http_error(exc)
+
+    @app.post(
+        "/v1/patch-artifacts/{artifact_id}/apply",
+        response_model=None,
+    )
+    def apply_patch_artifact(
+        artifact_id: str,
+        body: ArtifactApplyRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        require_patch_operator(
+            request,
+            operator_token=active_operator_token,
+        )
+        service = require_patch_operation_service(active_approval_service)
+
+        try:
+            result = service.apply_artifact(
+                artifact_id,
+                Path(body.target_repo_path),
+            )
+        except Exception as exc:
+            raise_patch_operation_http_error(exc)
+
+        summary = getattr(
+            result,
+            "audit_summary",
+            None,
+        )
+
+        if callable(summary):
+            summary = summary()
+
+        return {
+            "artifact_id": artifact_id,
+            "applied": bool(getattr(result, "applied", False)),
+            "result": redact_for_api(summary),
+        }
+
     @app.post("/v1/evaluate")
     def evaluate(payload: EvaluateRequest) -> dict[str, Any]:
         request = payload.to_tool_request()
@@ -371,6 +598,9 @@ def create_app(
                 "audit_event": audit_event.model_dump(mode="json") if audit_event else None,
             }
         )
+
+    app.state.rygnal_runtime_config = active_runtime_config
+    app.state.rygnal_ready_probe = readiness_probe
 
     return app
 
@@ -444,6 +674,89 @@ def _decide_approval(
             audit_event.model_dump(mode="json") if audit_event is not None else None
         ),
     }
+
+
+def require_patch_operation_service(
+    service: ApprovalArtifactService | None,
+) -> ApprovalArtifactService:
+    """Return the configured operation service or fail safely."""
+    if service is None:
+        raise HTTPException(
+            status_code=503,
+            detail=("Durable patch operations are unavailable for this application instance."),
+        )
+
+    return service
+
+
+def require_patch_operator(
+    request: Request,
+    *,
+    operator_token: str | None,
+) -> None:
+    """Require the configured operator credential."""
+    if operator_token:
+        candidate = request.headers.get(
+            "x-rygnal-operator-token",
+            "",
+        )
+
+        if not candidate:
+            candidate = bearer_token_from_headers(request.headers)
+
+        if not hmac.compare_digest(
+            candidate,
+            operator_token,
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Operator authentication failed.",
+            )
+
+        return
+
+    client = request.client
+    host = client.host if client is not None else ""
+
+    try:
+        loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = host.lower() == "localhost"
+
+    if not loopback:
+        raise HTTPException(
+            status_code=403,
+            detail=("Patch mutation endpoints require authenticated or loopback access."),
+        )
+
+
+def raise_patch_operation_http_error(
+    exc: Exception,
+) -> None:
+    """Map operational failures to safe HTTP responses."""
+    if isinstance(exc, ApprovalNotFoundError):
+        status_code = 404
+    elif isinstance(
+        exc,
+        ApprovalArtifactBindingError,
+    ):
+        status_code = 404 if str(exc).startswith("No approval") else 409
+    elif isinstance(
+        exc,
+        ApprovalOperationStateError,
+    ):
+        status_code = 409
+    elif isinstance(exc, ApprovalOperationError):
+        status_code = 400
+    else:
+        status_code = 500
+
+    message = str(exc) if status_code < 500 else "Patch operation failed safely."
+
+    raise HTTPException(
+        status_code=status_code,
+        detail=message,
+    ) from exc
 
 
 def api_error_response(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 import subprocess  # nosec B404
 from dataclasses import dataclass
@@ -17,7 +18,7 @@ from rygnal.change_gate import (
 )
 from rygnal.change_risk import ChangeRiskReport, FileRiskClassification, classify_patch_risk
 from rygnal.models import Decision, PolicyDecision, Severity, ToolRequest, new_trace_id
-from rygnal.patch_diff import PatchDiff
+from rygnal.patch_diff import PatchDiff, generate_patch_diff
 from rygnal.path_safety import (
     PathSafetyError,
     ensure_patch_paths_safe,
@@ -110,6 +111,11 @@ def auto_apply_safe_patch(
         raise SafePatchApplyError(str(exc)) from exc
 
     _ensure_clean_repo(target_repo)
+    _ensure_patch_integrity(patch_diff)
+    _ensure_target_at_baseline(
+        target_repo,
+        patch_diff.baseline_commit_sha,
+    )
 
     report = risk_report or classify_patch_risk(patch_diff)
     gate = gate_decision or evaluate_guarded_change_gate(patch_diff, risk_report=report)
@@ -129,16 +135,30 @@ def auto_apply_safe_patch(
     _check_patch_applies(target_repo, patch_diff.patch)
     _apply_patch(target_repo, patch_diff.patch)
 
-    result = _result(SafePatchApplyOutcome.APPLIED, target_repo, patch_diff, report, ())
+    try:
+        _verify_applied_patch(target_repo, patch_diff)
+        result = _result(
+            SafePatchApplyOutcome.APPLIED,
+            target_repo,
+            patch_diff,
+            report,
+            (),
+        )
 
-    if logger is not None:
-        write_safe_patch_apply_audit_event(
-            logger,
-            result,
-            user_id=user_id,
-            agent_id=agent_id,
-            environment=environment,
-            trace_id=trace_id,
+        if logger is not None:
+            write_safe_patch_apply_audit_event(
+                logger,
+                result,
+                user_id=user_id,
+                agent_id=agent_id,
+                environment=environment,
+                trace_id=trace_id,
+            )
+    except Exception as exc:
+        _rollback_after_failed_apply(
+            target_repo,
+            patch_diff,
+            failure=exc,
         )
 
     return result
@@ -351,6 +371,111 @@ def _ensure_clean_repo(path: Path) -> None:
         raise SafePatchApplyError("Target repository must be clean before auto-apply.")
 
 
+def _ensure_patch_integrity(
+    patch_diff: PatchDiff,
+) -> None:
+    patch_bytes = patch_diff.patch.encode(
+        "utf-8",
+        errors="surrogateescape",
+    )
+    actual_sha256 = hashlib.sha256(patch_bytes).hexdigest()
+
+    if actual_sha256 != patch_diff.patch_sha256:
+        raise SafePatchApplyError("Patch content does not match its declared SHA-256.")
+
+    if len(patch_bytes) != patch_diff.patch_size_bytes:
+        raise SafePatchApplyError("Patch content does not match its declared byte length.")
+
+
+def _ensure_target_at_baseline(
+    path: Path,
+    baseline_commit_sha: str,
+) -> None:
+    head = _run_git(
+        path,
+        "rev-parse",
+        "HEAD",
+    )
+    actual_head = head.stdout.decode(
+        "utf-8",
+        errors="replace",
+    ).strip()
+
+    if actual_head != baseline_commit_sha:
+        raise SafePatchApplyError("Target repository HEAD does not match the patch baseline.")
+
+
+def _verify_applied_patch(
+    path: Path,
+    expected: PatchDiff,
+) -> None:
+    actual = generate_patch_diff(
+        path,
+        expected.baseline_commit_sha,
+    )
+
+    if actual.patch_sha256 != expected.patch_sha256:
+        raise SafePatchApplyError(
+            "Applied repository diff does not match the approved patch digest."
+        )
+
+    if actual.patch_size_bytes != expected.patch_size_bytes:
+        raise SafePatchApplyError(
+            "Applied repository diff does not match the approved patch length."
+        )
+
+    if actual.files != expected.files:
+        raise SafePatchApplyError(
+            "Applied repository file metadata does not match the approved patch."
+        )
+
+    if actual.ignored_files != expected.ignored_files:
+        raise SafePatchApplyError("Applied repository contains ignored changes outside the patch.")
+
+
+def _rollback_after_failed_apply(
+    path: Path,
+    patch_diff: PatchDiff,
+    *,
+    failure: Exception,
+) -> None:
+    try:
+        _run_git(
+            path,
+            "apply",
+            "--reverse",
+            "--whitespace=error",
+            "-",
+            input_bytes=_patch_bytes(patch_diff.patch),
+        )
+
+        _ensure_target_at_baseline(
+            path,
+            patch_diff.baseline_commit_sha,
+        )
+        _ensure_clean_repo(path)
+
+    except Exception as rollback_error:
+        raise SafePatchApplyError(
+            "Automatic apply failed and rollback "
+            "could not restore the trusted repository: "
+            f"{rollback_error}"
+        ) from failure
+
+    raise SafePatchApplyError(
+        "Automatic apply failed after mutation; "
+        "the trusted repository was rolled back "
+        f"safely: {failure}"
+    ) from failure
+
+
+def _patch_bytes(patch: str) -> bytes:
+    return patch.encode(
+        "utf-8",
+        errors="surrogateescape",
+    )
+
+
 def _check_patch_applies(path: Path, patch: str) -> None:
     _run_git(
         path,
@@ -358,7 +483,7 @@ def _check_patch_applies(path: Path, patch: str) -> None:
         "--check",
         "--whitespace=error",
         "-",
-        input_bytes=patch.encode("utf-8"),
+        input_bytes=_patch_bytes(patch),
     )
 
 
@@ -368,7 +493,7 @@ def _apply_patch(path: Path, patch: str) -> None:
         "apply",
         "--whitespace=error",
         "-",
-        input_bytes=patch.encode("utf-8"),
+        input_bytes=_patch_bytes(patch),
     )
 
 

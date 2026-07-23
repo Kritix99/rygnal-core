@@ -118,7 +118,9 @@ def apply_approved_patch(
         risk_report=report,
         gate_decision=gate,
     )
-    if not requirement.required:
+    forced_approval = bool(approval_request.metadata.get("forced_approval", False))
+
+    if not requirement.required and not forced_approval:
         raise ApprovedPatchApplyError(
             "Patch does not require approval; use the safe auto-apply flow."
         )
@@ -286,7 +288,14 @@ def _validate_request_for_apply(approval_request: ApprovalRequest) -> None:
     if approval_request.action != "approve_patch_apply":
         raise ApprovedPatchApplyError("Approval request action mismatch.")
 
-    if approval_request.policy_id != "guarded-workspace-risky-patch-approval":
+    supported_policy_ids = {
+        "guarded-workspace-risky-patch-approval",
+        "guarded-workspace-intent-approval",
+        "guarded-workspace-non-auto-apply-approval",
+        "guarded-workspace-explicit-approval",
+    }
+
+    if approval_request.policy_id not in supported_policy_ids:
         raise ApprovedPatchApplyError("Approval request policy mismatch.")
 
 

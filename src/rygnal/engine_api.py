@@ -288,6 +288,11 @@ def _approval_summary(result: GuardedRunResult) -> dict[str, Any]:
         "policy_id": approval_request.policy_id,
         "severity": approval_request.severity.value,
         "reason": approval_request.reason,
+        "artifact_id": getattr(
+            result,
+            "patch_artifact_id",
+            None,
+        ),
     }
 
 
@@ -314,6 +319,13 @@ def _guarded_result_summary(result: GuardedRunResult, request: EngineRequest) ->
         "cleanup": {
             "performed": result.cleanup_performed,
             "status": result.cleanup_status,
+            "quarantined": bool(
+                getattr(
+                    result,
+                    "workspace_quarantined",
+                    False,
+                )
+            ),
         },
         "command": (
             _command_result_summary(result, request)
@@ -419,8 +431,23 @@ def _command_result_summary(result: GuardedRunResult, request: EngineRequest) ->
     return summary
 
 
-def _patch_summary(result: GuardedRunResult, request: EngineRequest) -> dict[str, Any]:
+def _patch_summary(
+    result: GuardedRunResult,
+    request: EngineRequest,
+) -> dict[str, Any]:
+    """Return safe patch metadata and final application state."""
     patch_diff = result.patch_diff
+    apply_outcome = getattr(
+        result,
+        "patch_apply_outcome",
+        None,
+    )
+    artifact_id = getattr(
+        result,
+        "patch_artifact_id",
+        None,
+    )
+
     if patch_diff is None:
         return {
             "generated": False,
@@ -432,6 +459,9 @@ def _patch_summary(result: GuardedRunResult, request: EngineRequest) -> dict[str
             "total_deletions": 0,
             "binary_file_count": 0,
             "files": (),
+            "apply_outcome": apply_outcome,
+            "applied": False,
+            "artifact_id": artifact_id,
         }
 
     summary: dict[str, Any] = {
@@ -444,6 +474,9 @@ def _patch_summary(result: GuardedRunResult, request: EngineRequest) -> dict[str
         "total_deletions": patch_diff.total_deletions,
         "binary_file_count": patch_diff.binary_file_count,
         "files": tuple(file.audit_summary for file in patch_diff.files),
+        "apply_outcome": apply_outcome,
+        "applied": apply_outcome == "applied",
+        "artifact_id": artifact_id,
     }
 
     if request.debug.include_raw_patch:
