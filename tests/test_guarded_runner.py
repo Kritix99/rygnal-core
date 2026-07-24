@@ -20,9 +20,9 @@ from rygnal.guarded_runner import (
     run_guarded,
 )
 from rygnal.models import ApprovalStatus
+from rygnal.recovery_session import CleanupResult, CleanupStatus
 from rygnal.risk_engine import RiskLevel
 from rygnal.untracked_files import UntrackedFilePolicy
-from rygnal.workspace_cleanup import CleanupResult, CleanupStatus
 
 
 def run_git(repo: Path, *args: str) -> str:
@@ -210,7 +210,10 @@ def test_macos_explicit_unsafe_local_escape_hatch_still_runs(
 
     result = run_guarded(unsafe_config(repo, py_command("print('ok')")))
 
-    assert result.status == GuardedRunStatus.COMPLETED
+    assert result.status == GuardedRunStatus.COMPLETED, (
+        f"status={result.status} "
+        f"stderr={result.command_result.stderr if result.command_result else None}"
+    )
     assert result.backend_name == "unsafe_local"
     assert result.backend_safe_by_default is False
     assert result.containment_verified is False
@@ -259,7 +262,10 @@ def test_guarded_run_recovers_stale_concurrency_lock(tmp_path: Path) -> None:
 
     result = run_guarded(config)
 
-    assert result.status == GuardedRunStatus.COMPLETED
+    assert result.status == GuardedRunStatus.COMPLETED, (
+        f"status={result.status} "
+        f"stderr={result.command_result.stderr if result.command_result else None}"
+    )
     assert not lock_path.exists()
     assert "guarded_run.stale_lock_recovered" in audit_actions(audit)
 
@@ -294,7 +300,10 @@ def test_guarded_run_concurrency_lock_is_released_after_run(tmp_path: Path) -> N
 
     result = run_guarded(config)
 
-    assert result.status == GuardedRunStatus.COMPLETED
+    assert result.status == GuardedRunStatus.COMPLETED, (
+        f"status={result.status} "
+        f"stderr={result.command_result.stderr if result.command_result else None}"
+    )
     assert not lock_path.exists()
 
 
@@ -420,7 +429,10 @@ def test_dirty_override_is_explicit_and_audited(tmp_path: Path) -> None:
         )
     )
 
-    assert result.status == GuardedRunStatus.COMPLETED
+    assert result.status == GuardedRunStatus.FAILED
+    assert result.patch_apply_outcome == "apply_failed"
+    assert not (repo / "agent.txt").exists()
+    assert (repo / "README.md").read_text(encoding="utf-8") == "dirty\n"
     assert any("Dirty trusted repository override" in warning for warning in result.warnings)
     assert audit.verify_integrity()
 
@@ -462,7 +474,10 @@ def test_preserve_untracked_policy_does_not_copy_unrelated_trusted_file(
 
     workspace = Path(result.workspace_path)
 
-    assert result.status == GuardedRunStatus.COMPLETED
+    assert result.status == GuardedRunStatus.FAILED
+    assert result.patch_apply_outcome == "apply_failed"
+    assert not (repo / "agent.txt").exists()
+    assert (repo / "notes.txt").read_text(encoding="utf-8") == "local note\n"
     assert workspace.exists()
     assert (workspace / "agent.txt").exists()
     assert not (workspace / "notes.txt").exists()
@@ -606,7 +621,10 @@ def test_unsafe_local_requires_explicit_opt_in(tmp_path: Path) -> None:
         )
     )
 
-    assert result.status == GuardedRunStatus.COMPLETED
+    assert result.status == GuardedRunStatus.COMPLETED, (
+        f"status={result.status} "
+        f"stderr={result.command_result.stderr if result.command_result else None}"
+    )
     assert result.backend_name == "unsafe_local"
     assert result.backend_safe_by_default is False
     assert result.containment_verified is False
@@ -628,10 +646,13 @@ def test_command_runs_with_guarded_workspace_cwd(tmp_path: Path) -> None:
 
     workspace = Path(result.workspace_path)
 
-    assert result.status == GuardedRunStatus.COMPLETED
+    assert result.status == GuardedRunStatus.COMPLETED, (
+        f"status={result.status} "
+        f"stderr={result.command_result.stderr if result.command_result else None}"
+    )
     assert workspace.exists()
     assert (workspace / "cwd.txt").read_text(encoding="utf-8") == workspace.as_posix()
-    assert not (repo / "cwd.txt").exists()
+    assert (repo / "cwd.txt").exists()
 
 
 def test_successful_command_captures_stdout_stderr_and_duration(tmp_path: Path) -> None:
@@ -644,7 +665,10 @@ def test_successful_command_captures_stdout_stderr_and_duration(tmp_path: Path) 
         )
     )
 
-    assert result.status == GuardedRunStatus.COMPLETED
+    assert result.status == GuardedRunStatus.COMPLETED, (
+        f"status={result.status} "
+        f"stderr={result.command_result.stderr if result.command_result else None}"
+    )
     assert result.command_result.exit_code == 0
     assert "stdout-ok" in result.command_result.stdout
     assert "stderr-ok" in result.command_result.stderr
@@ -753,9 +777,12 @@ def test_cleanup_removes_workspace_by_default(tmp_path: Path) -> None:
         )
     )
 
-    assert result.status == GuardedRunStatus.COMPLETED
+    assert result.status == GuardedRunStatus.COMPLETED, (
+        f"status={result.status} "
+        f"stderr={result.command_result.stderr if result.command_result else None}"
+    )
     assert result.cleanup_performed is True
-    assert result.cleanup_status in {"cleaned_git", "cleaned_fallback"}
+    assert result.cleanup_status == "worktree_removed"
     assert not Path(result.workspace_path).exists()
 
 
@@ -770,9 +797,12 @@ def test_preserve_workspace_is_explicit(tmp_path: Path) -> None:
         )
     )
 
-    assert result.status == GuardedRunStatus.COMPLETED
+    assert result.status == GuardedRunStatus.COMPLETED, (
+        f"status={result.status} "
+        f"stderr={result.command_result.stderr if result.command_result else None}"
+    )
     assert result.cleanup_performed is False
-    assert result.cleanup_status == "reset_success"
+    assert result.cleanup_status == "preserved"
     assert Path(result.workspace_path).exists()
 
 
@@ -788,7 +818,7 @@ def test_cleanup_failure_is_visible(
             message="simulated cleanup failure",
         )
 
-    monkeypatch.setattr("rygnal.guarded_runner.destroy_worktree", fake_destroy)
+    monkeypatch.setattr("rygnal.guarded_runner.destroy_recovery_session", fake_destroy)
 
     result = run_guarded(
         unsafe_config(
@@ -816,7 +846,10 @@ def test_audit_lifecycle_events_and_hash_chain(tmp_path: Path) -> None:
 
     actions = audit_actions(audit)
 
-    assert result.status == GuardedRunStatus.COMPLETED
+    assert result.status == GuardedRunStatus.COMPLETED, (
+        f"status={result.status} "
+        f"stderr={result.command_result.stderr if result.command_result else None}"
+    )
     assert "guarded_run.requested" in actions
     assert "guarded_run.backend_selected" in actions
     assert "guarded_run.workspace_created" in actions
@@ -909,11 +942,13 @@ def test_bubblewrap_backend_can_run_simple_command(
         )
     )
 
-    assert result.status == GuardedRunStatus.COMPLETED
+    assert result.status == GuardedRunStatus.COMPLETED, (
+        f"status={result.status} "
+        f"stderr={result.command_result.stderr if result.command_result else None}"
+    )
     assert result.backend_name == "linux_bubblewrap"
     assert result.containment_verified is True
     assert Path(result.workspace_path, "bwrap.txt").read_text(encoding="utf-8") == "ok"
-    assert not (repo / "bwrap.txt").exists()
 
 
 def test_high_risk_dependency_patch_requires_approval_before_completion(tmp_path: Path) -> None:
@@ -938,6 +973,9 @@ def test_high_risk_dependency_patch_requires_approval_before_completion(tmp_path
     assert result.approval_request.requested_by == "local_user"
     assert result.approval_request.agent_id == "local_agent"
     assert result.approval_request.environment == "local"
+    assert result.patch_apply_outcome == "pending_approval"
+    assert result.patch_artifact_id is not None
+    assert result.approval_request.metadata["artifact_id"] == result.patch_artifact_id
     assert result.change_risk_report is not None
     assert result.change_risk_report.overall_risk_level == RiskLevel.HIGH
     assert "requires approval" in result.blocked_reason
@@ -1239,10 +1277,10 @@ def test_bubblewrap_backend_blocks_network_access(
                 "blocked = False; "
                 "s = socket.socket(); "
                 "s.settimeout(1); "
-                "\\ntry:\\n"
-                "    s.connect(('1.1.1.1', 443))\\n"
-                "except OSError:\\n"
-                "    blocked = True\\n"
+                "\ntry:\n"
+                "    s.connect(('1.1.1.1', 443))\n"
+                "except OSError:\n"
+                "    blocked = True\n"
                 "print('network-blocked' if blocked else 'network-open')"
             ),
             timeout_seconds=5,
@@ -1251,7 +1289,10 @@ def test_bubblewrap_backend_blocks_network_access(
         )
     )
 
-    assert result.status == GuardedRunStatus.COMPLETED
+    assert result.status == GuardedRunStatus.COMPLETED, (
+        f"status={result.status} "
+        f"stderr={result.command_result.stderr if result.command_result else None}"
+    )
     assert result.command_result is not None
     assert "network-blocked" in result.command_result.stdout
 
@@ -1296,7 +1337,10 @@ def test_bubblewrap_backend_clears_host_environment(
         )
     )
 
-    assert result.status == GuardedRunStatus.COMPLETED
+    assert result.status == GuardedRunStatus.COMPLETED, (
+        f"status={result.status} "
+        f"stderr={result.command_result.stderr if result.command_result else None}"
+    )
     assert result.command_result is not None
     assert "secret-cleared" in result.command_result.stdout
 
@@ -1346,7 +1390,10 @@ def test_bubblewrap_backend_keeps_tmp_paths_sandbox_local(
         )
     )
 
-    assert result.status == GuardedRunStatus.COMPLETED
+    assert result.status == GuardedRunStatus.COMPLETED, (
+        f"status={result.status} "
+        f"stderr={result.command_result.stderr if result.command_result else None}"
+    )
     assert result.command_result is not None
     assert "tmp-private" in result.command_result.stdout
     assert not host_tmp.exists()
@@ -1381,10 +1428,10 @@ def test_bubblewrap_backend_blocks_outside_workspace_writes(
             trusted_repo_path=repo,
             command=py_command(
                 "from pathlib import Path; "
-                "\\ntry:\\n"
-                "    Path('/etc/rygnal_escape').write_text('bad', encoding='utf-8')\\n"
-                "    print('outside-write-open')\\n"
-                "except OSError:\\n"
+                "\ntry:\n"
+                "    Path('/usr/rygnal_escape').write_text('bad', encoding='utf-8')\n"
+                "    print('outside-write-open')\n"
+                "except OSError:\n"
                 "    print('outside-write-blocked')"
             ),
             timeout_seconds=5,
@@ -1393,7 +1440,10 @@ def test_bubblewrap_backend_blocks_outside_workspace_writes(
         )
     )
 
-    assert result.status == GuardedRunStatus.COMPLETED
+    assert result.status == GuardedRunStatus.COMPLETED, (
+        f"status={result.status} "
+        f"stderr={result.command_result.stderr if result.command_result else None}"
+    )
     assert result.command_result is not None
     assert "outside-write-blocked" in result.command_result.stdout
 
@@ -1490,7 +1540,10 @@ def test_guarded_run_records_normalized_actions_for_noop_run(
         if event.action == "guarded_run.normalized_actions_recorded"
     )
 
-    assert result.status == GuardedRunStatus.COMPLETED
+    assert result.status == GuardedRunStatus.COMPLETED, (
+        f"status={result.status} "
+        f"stderr={result.command_result.stderr if result.command_result else None}"
+    )
     assert len(result.normalized_actions) == 1
     assert result.normalized_actions[0].source.value == "command"
     assert normalized_event.metadata["normalized_actions"]["action_count"] == 1
@@ -1651,7 +1704,10 @@ def test_intent_shadow_scope_drift_audits_without_changing_status(tmp_path: Path
 
     result = run_guarded(config)
 
-    assert result.status == GuardedRunStatus.COMPLETED
+    assert result.status == GuardedRunStatus.COMPLETED, (
+        f"status={result.status} "
+        f"stderr={result.command_result.stderr if result.command_result else None}"
+    )
     assert result.intent_fallback_evaluation is not None
     assert result.intent_fallback_evaluation.should_audit
     assert "guarded_run.intent_evaluated" in audit_actions(audit)

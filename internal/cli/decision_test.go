@@ -18,7 +18,7 @@ func testDecisionRunRecord(status string, approvalRequired bool) runReviewRecord
 			Required: approvalRequired,
 		},
 		Decision: &localDecisionRecord{
-			Schema:            localDecisionSchema,
+			Schema:            localDecisionSchemaV1,
 			RunID:             "run_test",
 			Status:            status,
 			PatchSHA256:       "patch123",

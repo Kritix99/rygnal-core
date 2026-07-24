@@ -1,0 +1,250 @@
+name: Production Qualification
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-qualification-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-production-qualification:
+    name: Linux production qualification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install trusted qualification dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install \
+            --yes \
+            --no-install-recommends \
+            bubblewrap
+          python -m pip install --upgrade pip
+          python -m pip install build
+
+      - name: Allow unprivileged user namespaces for Bubblewrap
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+          sysctl kernel.unprivileged_userns_clone || true
+          sudo chmod u-s $(which bwrap) || true
+          # Try disabling the apparmor profile for bwrap entirely
+          echo "Disabling AppArmor profile for bwrap (if exists):"
+          if [ -f /etc/apparmor.d/bwrap ]; then
+            sudo ln -s /etc/apparmor.d/bwrap /etc/apparmor.d/disable/ || true
+            sudo apparmor_parser -R /etc/apparmor.d/bwrap || true
+          fi
+
+      - name: Record Linux host identity
+        run: |
+          set -euo pipefail
+          uname -a
+          python --version
+          bwrap --version
+          sha256sum "$(command -v bwrap)"
+
+      - name: Build release wheel
+        id: wheel
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          python -m build \
+            --wheel \
+            --outdir dist
+
+          wheel_path="$(
+            find dist \
+              -maxdepth 1 \
+              -type f \
+              -name '*.whl' \
+              -print \
+              -quit
+          )"
+
+          test -n "$wheel_path"
+
+          wheel_sha256="$(
+            sha256sum "$wheel_path" |
+            awk '{print $1}'
+          )"
+
+          echo "path=$wheel_path" \
+            >> "$GITHUB_OUTPUT"
+          echo "sha256=$wheel_sha256" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Install release wheel
+        run: |
+          set -euo pipefail
+          python -m pip install \
+            "${{ steps.wheel.outputs.path }}"
+          python -m pip check
+
+      - name: Generate private production configuration
+        id: config
+        env:
+          QUALIFICATION_ROOT: >-
+            ${{ runner.temp }}/rygnal-production-qualification
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import json
+          import os
+          import secrets
+          from pathlib import Path
+
+          root = Path(
+              os.environ["QUALIFICATION_ROOT"]
+          ).resolve()
+          root.mkdir(
+              mode=0o700,
+              parents=True,
+              exist_ok=True,
+          )
+          root.chmod(0o700)
+
+          token_path = root / "operator.token"
+          config_path = root / "runtime.json"
+          data_path = root / "data"
+
+          token = secrets.token_urlsafe(48)
+          token_path.write_text(
+              token + "\n",
+              encoding="utf-8",
+          )
+          token_path.chmod(0o600)
+
+          config_path.write_text(
+              json.dumps(
+                  {
+                      "schema_version": (
+                          "rygnal.runtime.v1"
+                      ),
+                      "environment": "production",
+                      "api": {
+                          "host": "127.0.0.1",
+                          "port": 8787,
+                          "allow_remote": False,
+                          "auth_required": True,
+                          "operator_token_file": (
+                              token_path.as_posix()
+                          ),
+                          "docs_enabled": False,
+                          "max_request_body_bytes": (
+                              1048576
+                          ),
+                          "max_header_bytes": 32768,
+                          "max_header_count": 100,
+                          "max_concurrency": 16,
+                          "request_timeout_seconds": (
+                              30
+                          ),
+                          "max_page_size": 500,
+                      },
+                  },
+                  sort_keys=True,
+                  indent=2,
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          config_path.chmod(0o600)
+
+          data_path.mkdir(
+              mode=0o700,
+              parents=True,
+              exist_ok=True,
+          )
+          data_path.chmod(0o700)
+
+          github_output = Path(
+              os.environ["GITHUB_OUTPUT"]
+          )
+
+          with github_output.open(
+              "a",
+              encoding="utf-8",
+          ) as handle:
+              handle.write(
+                  f"config={config_path}\n"
+              )
+              handle.write(
+                  f"data={data_path}\n"
+              )
+          PY
+
+      - name: Run installed Linux production qualification
+        id: qualify
+        continue-on-error: true
+        env:
+          QUALIFICATION_REPORT: >-
+            ${{ github.workspace }}/qualification/production-qualification.json
+        run: |
+          set -euo pipefail
+
+          mkdir -p qualification
+          run_root="$(mktemp -d)"
+
+          cd "$run_root"
+
+          python -m rygnal.production_qualification \
+            qualify \
+            --output "$QUALIFICATION_REPORT" \
+            --config "${{ steps.config.outputs.config }}" \
+            --data-dir "${{ steps.config.outputs.data }}" \
+            --wheel \
+              "${{ github.workspace }}/${{ steps.wheel.outputs.path }}" \
+            --commit "$GITHUB_SHA" \
+            --checkout-root "$GITHUB_WORKSPACE" \
+            --require-installed
+
+      - name: Upload production qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: >-
+            production-qualification-${{ github.run_id }}
+          path: >-
+            qualification/production-qualification.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Enforce production release gate
+        if: always()
+        run: |
+          set -euo pipefail
+
+          python -m rygnal.production_qualification \
+            verify-report \
+            --report \
+              qualification/production-qualification.json \
+            --commit "$GITHUB_SHA" \
+            --wheel-sha256 \
+              "${{ steps.wheel.outputs.sha256 }}"

@@ -225,7 +225,7 @@ def test_matched_intent_inside_scope_permits_and_records_true_risk(
     assert result.intent_review_decision.true_risk_level == "low"
     assert result.intent_review_decision.decision == IntentReviewDecisionType.SILENT_PERMIT
     assert "docs/allowed/new.md" in _affected_resource_paths(result)
-    assert not (repo / "docs" / "allowed" / "new.md").exists()
+    assert (repo / "docs" / "allowed" / "new.md").exists()
 
     _assert_intent_trace(result, audit)
 
@@ -277,7 +277,11 @@ def test_scope_drift_respects_disabled_shadow_and_enforce_modes(
     assert result.intent_review_decision.decision == expected_review
     assert "target-scope-drift" in _reason_codes(result)
     assert "docs/outside.md" in _affected_resource_paths(result)
-    assert not (repo / "docs" / "outside.md").exists()
+    if expected_status == GuardedRunStatus.APPROVAL_REQUIRED:
+        assert not (repo / "docs" / "outside.md").exists()
+        assert result.patch_artifact_id is not None
+    else:
+        assert (repo / "docs" / "outside.md").exists()
 
     _assert_intent_trace(result, audit)
 

@@ -1,0 +1,65 @@
+policy_version: policy.v2
+default_decision: block
+rules:
+  - id: block-env-read
+    priority: 10
+    tool_name: file_read
+    target_contains: ".env"
+    decision: block
+    severity: high
+    reason: "Reading environment secret files is not allowed."
+
+  - id: block-sensitive-path-read
+    priority: 15
+    tool_name: file_read
+    target_matches: "(^/etc/|(^|/)(secrets|\\.ssh)(/|$)|\\.pem$|(^|/)id_rsa$)"
+    decision: block
+    severity: critical
+    reason: "Reading sensitive system, secret, or private-key paths is not allowed."
+
+  - id: block-dangerous-shell
+    priority: 20
+    tool_name: shell_command
+    input_contains: "rm -rf"
+    decision: block
+    severity: critical
+    reason: "Dangerous shell command detected."
+
+  - id: approval-file-delete
+    priority: 30
+    tool_name: file_delete
+    decision: require_approval
+    severity: high
+    reason: "File deletion requires human approval."
+
+  - id: simulate-external-api-send
+    priority: 40
+    tool_name: external_api_send
+    decision: simulate
+    severity: medium
+    reason: "External API send should be simulated during MVP testing."
+
+  - id: allow-readme-read
+    priority: 50
+    tool_name: file_read
+    target_matches: "^README\\.md$"
+    target_not_matches: "(^/etc/|(^|/)(secrets|\\.ssh)(/|$)|\\.pem$|(^|/)id_rsa$|\\.env$)"
+    decision: allow
+    severity: low
+    reason: "Reading README.md is explicitly allowed."
+
+  - id: allow-demo-list-command
+    priority: 60
+    tool_name: shell_command
+    input_equals: "ls"
+    decision: allow
+    severity: low
+    reason: "The local demo list command is explicitly allowed."
+
+  - id: allow-demo-project-notes-write
+    priority: 70
+    tool_name: file_write
+    target_equals: "project_notes.txt"
+    decision: allow
+    severity: low
+    reason: "Writing demo project notes is explicitly allowed."

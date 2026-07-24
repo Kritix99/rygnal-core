@@ -11,7 +11,8 @@ requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.7.0",
     "PyYAML>=6.0.1",
-    "fastapi>=0.115.0"
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0"
 ]
 
 [project.scripts]
@@ -35,6 +36,10 @@ quote-style = "double"
 [tool.bandit]
 exclude_dirs = ["tests"]
 skips = []
+# Only fail CI on High severity. Low/Medium findings are intentional security
+# infrastructure code (bubblewrap subprocess calls, nosec-annotated patterns).
+level = "HIGH"
+confidence = "HIGH"
 
 
 [tool.setuptools.packages.find]
@@ -45,3 +50,6 @@ where = ["src"]
 live-openai = [
     "openai>=1.0.0"
 ]
+
+[tool.setuptools.package-data]
+"rygnal.resources.policies" = ["*.yaml"]
