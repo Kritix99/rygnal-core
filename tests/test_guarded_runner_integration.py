@@ -2,17 +2,24 @@ from pathlib import Path
 
 import pytest
 
-from rygnal.approved_apply import ApprovedPatchApplyError, apply_approved_patch
+from rygnal.approved_apply import (
+    ApprovedPatchApplyError,
+)
 from rygnal.audit_logger import AuditLogger
-from rygnal.change_gate import evaluate_guarded_change_gate
+from rygnal.change_gate import (
+    evaluate_guarded_change_gate,
+)
 from rygnal.change_risk import classify_patch_risk
-from rygnal.guarded_runner import GuardedRunStatus, run_guarded
+from rygnal.guarded_runner import (
+    GuardedRunStatus,
+    run_guarded,
+)
 from rygnal.patch_approval import (
     PatchApprovalError,
     approve_patch_request,
     create_patch_approval_request,
 )
-from rygnal.safe_apply import SafePatchApplyOutcome, auto_apply_safe_patch
+from rygnal.patch_artifact import PatchArtifactStore
 from tests.guarded_runner_helpers import (
     audit_actions,
     audit_text,
@@ -25,7 +32,7 @@ from tests.guarded_runner_helpers import (
 )
 
 
-def test_runner_docs_patch_auto_applies_only_after_runner_completes(
+def test_runner_docs_patch_auto_applies_only_after_final_decision(
     tmp_path: Path,
 ) -> None:
     trusted = create_trusted_repo(tmp_path / "trusted")
@@ -45,27 +52,31 @@ def test_runner_docs_patch_auto_applies_only_after_runner_completes(
     assert result.status == GuardedRunStatus.COMPLETED
     assert result.baseline_commit_sha == baseline
     assert result.patch_diff is not None
-    assert git_status_porcelain(trusted) == ""
-    assert (trusted / "docs" / "usage.md").read_text(encoding="utf-8") == "before docs\n"
+    assert result.patch_apply_outcome == "applied"
+    assert result.patch_artifact_id is None
+    assert result.cleanup_performed is True
+    assert result.cleanup_status == "worktree_removed"
+    assert result.workspace_path is not None
+    assert not Path(result.workspace_path).exists()
 
-    apply_result = auto_apply_safe_patch(
-        result.patch_diff,
-        trusted,
-        logger=audit,
-        trace_id="trace_integration",
-    )
-
-    assert apply_result.outcome == SafePatchApplyOutcome.APPLIED
-    assert apply_result.applied is True
+    assert git_status_porcelain(trusted) == "M docs/usage.md"
     assert (trusted / "docs" / "usage.md").read_text(encoding="utf-8") == "updated docs\n"
+
+    actions = audit_actions(audit)
+    assert (
+        actions.index("guarded_run.intent_evaluated") < actions.index("guarded_run.patch_applied")
+        if "guarded_run.intent_evaluated" in actions
+        else True
+    )
     assert audit.verify_integrity()
 
 
-def test_runner_dependency_patch_requires_approval_before_apply(
+def test_runner_dependency_patch_persists_artifact_before_approval(
     tmp_path: Path,
 ) -> None:
     trusted = create_trusted_repo(tmp_path / "trusted")
     audit = AuditLogger(tmp_path / "audit.jsonl")
+    run_root = trusted.parent / "rygnal-runs"
 
     result = run_guarded(
         unsafe_runner_config(
@@ -84,33 +95,34 @@ def test_runner_dependency_patch_requires_approval_before_apply(
     assert result.patch_diff is not None
     assert result.change_risk_report is not None
     assert result.approval_request is not None
+    assert result.patch_apply_outcome == "pending_approval"
+    assert result.patch_artifact_id is not None
+
     assert result.approval_request.target == result.patch_diff.patch_sha256
+    assert result.approval_request.metadata["artifact_id"] == result.patch_artifact_id
+
     assert git_status_porcelain(trusted) == ""
-
-    safe_result = auto_apply_safe_patch(
-        result.patch_diff,
-        trusted,
-        risk_report=result.change_risk_report,
-        logger=audit,
-        trace_id="trace_integration",
-    )
-
-    assert safe_result.outcome == SafePatchApplyOutcome.SKIPPED
-    assert safe_result.applied is False
     assert not (trusted / "pyproject.toml").exists()
+    assert result.workspace_path is not None
+    assert not Path(result.workspace_path).exists()
+
+    artifact = PatchArtifactStore(run_root / "artifacts").load(result.patch_artifact_id)
+
+    assert artifact.patch_sha256 == result.patch_diff.patch_sha256
+    assert artifact.baseline_commit_sha == result.baseline_commit_sha
+    assert artifact.approval_request_id == result.approval_request.approval_id
 
     approval_decision = approve_patch_request(
         result.approval_request,
         decided_by="test_reviewer",
-        patch_sha256=result.patch_diff.patch_sha256,
+        patch_sha256=(result.patch_diff.patch_sha256),
     )
 
-    approved_result = apply_approved_patch(
-        result.patch_diff,
+    approved_result = PatchArtifactStore(run_root / "artifacts").apply_approved(
+        result.patch_artifact_id,
         trusted,
         approval_request=result.approval_request,
         approval_decision=approval_decision,
-        risk_report=result.change_risk_report,
         logger=audit,
     )
 
@@ -121,7 +133,7 @@ def test_runner_dependency_patch_requires_approval_before_apply(
     assert audit.verify_integrity()
 
 
-def test_runner_dangerous_secret_patch_is_blocked_by_existing_gate(
+def test_runner_dangerous_secret_patch_isolated_and_blocked(
     tmp_path: Path,
 ) -> None:
     trusted = create_trusted_repo(tmp_path / "trusted")
@@ -142,15 +154,24 @@ def test_runner_dangerous_secret_patch_is_blocked_by_existing_gate(
     assert result.patch_diff is not None
     assert result.change_risk_report is not None
     assert result.blocked_reason is not None
+    assert result.patch_apply_outcome == "not_applied"
+    assert result.patch_artifact_id is None
+
     assert not (trusted / ".env").exists()
     assert git_status_porcelain(trusted) == ""
 
     risk_report = classify_patch_risk(result.patch_diff)
-    gate = evaluate_guarded_change_gate(result.patch_diff, risk_report=risk_report)
+    gate = evaluate_guarded_change_gate(
+        result.patch_diff,
+        risk_report=risk_report,
+    )
 
     assert gate.blocked is True
 
-    with pytest.raises(PatchApprovalError, match="Blocked patches cannot be approved"):
+    with pytest.raises(
+        PatchApprovalError,
+        match="Blocked patches cannot be approved",
+    ):
         create_patch_approval_request(
             result.patch_diff,
             requested_by="test_reviewer",
@@ -159,15 +180,16 @@ def test_runner_dangerous_secret_patch_is_blocked_by_existing_gate(
             trace_id="trace_integration",
         )
 
-    assert not (trusted / ".env").exists()
     assert fake_secret not in audit_text(tmp_path / "audit.jsonl")
     assert audit.verify_integrity()
 
 
-def test_runner_patch_stale_baseline_rejected_by_approved_apply(
+def test_runner_patch_stale_baseline_rejected_by_artifact_apply(
     tmp_path: Path,
 ) -> None:
     trusted = create_trusted_repo(tmp_path / "trusted")
+    audit = AuditLogger(tmp_path / "audit.jsonl")
+    run_root = trusted.parent / "rygnal-runs"
 
     result = run_guarded(
         unsafe_runner_config(
@@ -178,6 +200,7 @@ def test_runner_patch_stale_baseline_rejected_by_approved_apply(
                 "'[project]\\nname = \"changed\"\\n'"
                 ")"
             ),
+            audit_logger=audit,
         )
     )
 
@@ -185,30 +208,37 @@ def test_runner_patch_stale_baseline_rejected_by_approved_apply(
     assert result.patch_diff is not None
     assert result.change_risk_report is not None
     assert result.approval_request is not None
+    assert result.patch_artifact_id is not None
 
     approval_decision = approve_patch_request(
         result.approval_request,
         decided_by="test_reviewer",
-        patch_sha256=result.patch_diff.patch_sha256,
+        patch_sha256=(result.patch_diff.patch_sha256),
     )
 
-    (trusted / "docs" / "usage.md").write_text("different trusted commit\n", encoding="utf-8")
-    commit_all(trusted, "advance trusted repo")
+    (trusted / "docs" / "usage.md").write_text(
+        "different trusted commit\n",
+        encoding="utf-8",
+    )
+    commit_all(
+        trusted,
+        "advance trusted repo",
+    )
 
     with pytest.raises(
         ApprovedPatchApplyError,
-        match="HEAD does not match guarded patch baseline",
+        match=("HEAD does not match guarded patch baseline"),
     ):
-        apply_approved_patch(
-            result.patch_diff,
+        PatchArtifactStore(run_root / "artifacts").apply_approved(
+            result.patch_artifact_id,
             trusted,
-            approval_request=result.approval_request,
+            approval_request=(result.approval_request),
             approval_decision=approval_decision,
-            risk_report=result.change_risk_report,
+            logger=audit,
         )
 
 
-def test_runner_emits_expected_audit_order_for_successful_integration_run(
+def test_runner_emits_finalization_before_cleanup(
     tmp_path: Path,
 ) -> None:
     trusted = create_trusted_repo(tmp_path / "trusted")
@@ -241,5 +271,8 @@ def test_runner_emits_expected_audit_order_for_successful_integration_run(
     assert actions.index("guarded_run.changed_files_detected") < actions.index(
         "guarded_run.patch_generated"
     )
-    assert "guarded_run.cleanup_completed" in actions
+    assert actions.index("guarded_run.patch_generated") < actions.index("guarded_run.patch_applied")
+    assert actions.index("guarded_run.patch_applied") < actions.index(
+        "guarded_run.cleanup_completed"
+    )
     assert audit.verify_integrity()

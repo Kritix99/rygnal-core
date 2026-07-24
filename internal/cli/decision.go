@@ -1,45 +1,63 @@
 package cli
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/Rygnal/rygnal-core/internal/engineclient"
 	"github.com/spf13/cobra"
 )
 
 const (
-	decisionRecordFileName   = "decision.json"
-	localDecisionSchema      = "rygnal.local_decision.v1"
-	localDecisionEventSchema = "rygnal.local_decision_event.v1"
+	decisionRecordFileName          = "decision.json"
+	localDecisionSchemaV1           = "rygnal.local_decision.v1"
+	localDecisionSchema             = "rygnal.local_decision.v2"
+	localDecisionEventSchema        = "rygnal.local_decision_event.v2"
+	localDecisionAuthorityLocal     = "local"
+	localDecisionAuthoritySharedAPI = "shared_api"
 
 	localDecisionApproved = "approved"
 	localDecisionRejected = "rejected"
 )
 
 type localDecisionRecord struct {
-	Schema            string `json:"schema"`
-	RunID             string `json:"run_id"`
-	Status            string `json:"status"`
-	DecidedAt         string `json:"decided_at"`
-	DecidedBy         string `json:"decided_by"`
-	Reason            string `json:"reason,omitempty"`
-	PatchSHA256       string `json:"patch_sha256,omitempty"`
-	BaselineCommitSHA string `json:"baseline_commit_sha,omitempty"`
+	Schema                string `json:"schema"`
+	RunID                 string `json:"run_id"`
+	ApprovalID            string `json:"approval_id,omitempty"`
+	Status                string `json:"status"`
+	DecidedAt             string `json:"decided_at"`
+	DecidedBy             string `json:"decided_by"`
+	Reason                string `json:"reason,omitempty"`
+	PatchSHA256           string `json:"patch_sha256,omitempty"`
+	BaselineCommitSHA     string `json:"baseline_commit_sha,omitempty"`
+	EngineProtocolVersion string `json:"engine_protocol_version,omitempty"`
+	RygnalVersion         string `json:"rygnal_version,omitempty"`
+	Authority             string `json:"authority,omitempty"`
+	AuthoritySynchronized bool   `json:"authority_synchronized"`
+	ReceiptSHA256         string `json:"receipt_sha256,omitempty"`
 }
 
 type localDecisionAuditEvent struct {
-	Schema            string `json:"schema"`
-	Event             string `json:"event"`
-	RunID             string `json:"run_id"`
-	Status            string `json:"status"`
-	DecidedAt         string `json:"decided_at"`
-	DecidedBy         string `json:"decided_by"`
-	Reason            string `json:"reason,omitempty"`
-	PatchSHA256       string `json:"patch_sha256,omitempty"`
-	BaselineCommitSHA string `json:"baseline_commit_sha,omitempty"`
+	Schema                string `json:"schema"`
+	Event                 string `json:"event"`
+	RunID                 string `json:"run_id"`
+	ApprovalID            string `json:"approval_id,omitempty"`
+	Status                string `json:"status"`
+	DecidedAt             string `json:"decided_at"`
+	DecidedBy             string `json:"decided_by"`
+	Reason                string `json:"reason,omitempty"`
+	PatchSHA256           string `json:"patch_sha256,omitempty"`
+	BaselineCommitSHA     string `json:"baseline_commit_sha,omitempty"`
+	EngineProtocolVersion string `json:"engine_protocol_version,omitempty"`
+	RygnalVersion         string `json:"rygnal_version,omitempty"`
+	Authority             string `json:"authority,omitempty"`
+	AuthoritySynchronized bool   `json:"authority_synchronized"`
+	ReceiptSHA256         string `json:"receipt_sha256,omitempty"`
 }
 
 type decisionOptions struct {
@@ -134,19 +152,49 @@ func runDecisionCommandLocked(cmd *cobra.Command, store localReviewStore, runID 
 		return fmt.Errorf("run %s already has a decision: %s", record.RunID, decisionStatus(record))
 	}
 
-	if record.Patch.SHA256 == "" {
-		return fmt.Errorf("run %s has no patch digest to bind a decision to", record.RunID)
+	if err := validateReviewBindingForDecision(record); err != nil {
+		return err
 	}
 
 	decision := localDecisionRecord{
-		Schema:            localDecisionSchema,
-		RunID:             record.RunID,
-		Status:            opts.status,
-		DecidedAt:         time.Now().UTC().Format(time.RFC3339),
-		DecidedBy:         opts.decidedBy,
-		Reason:            opts.reason,
-		PatchSHA256:       record.Patch.SHA256,
-		BaselineCommitSHA: record.Baseline,
+		Schema:                localDecisionSchema,
+		RunID:                 record.RunID,
+		ApprovalID:            record.Approval.ApprovalID,
+		Status:                opts.status,
+		DecidedAt:             time.Now().UTC().Format(time.RFC3339Nano),
+		DecidedBy:             opts.decidedBy,
+		Reason:                opts.reason,
+		PatchSHA256:           record.Patch.SHA256,
+		BaselineCommitSHA:     record.Baseline,
+		EngineProtocolVersion: engineclient.ProtocolVersion,
+		RygnalVersion:         Version,
+	}
+
+	synchronization, err := synchronizeSharedApprovalDecision(
+		cmd.Context(),
+		record,
+		decision,
+	)
+	if err != nil {
+		return err
+	}
+
+	decision.Authority = synchronization.authority
+	decision.AuthoritySynchronized = synchronization.synchronized
+
+	if synchronization.decidedAt != "" {
+		decision.DecidedAt = synchronization.decidedAt
+	}
+	if synchronization.decidedBy != "" {
+		decision.DecidedBy = synchronization.decidedBy
+	}
+	if synchronization.reason != "" {
+		decision.Reason = synchronization.reason
+	}
+
+	decision.ReceiptSHA256, err = calculateLocalDecisionReceipt(decision)
+	if err != nil {
+		return err
 	}
 
 	decisionPath := store.runDir(record.RunID) + "/" + decisionRecordFileName
@@ -183,19 +231,41 @@ func runDecisionCommandLocked(cmd *cobra.Command, store localReviewStore, runID 
 }
 
 func writeLocalDecisionRecord(path string, decision localDecisionRecord) error {
-	if _, err := os.Stat(path); err == nil {
-		return fmt.Errorf("decision record already exists")
-	}
-
 	payload, err := json.MarshalIndent(decision, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode decision record: %w", err)
 	}
 
-	if err := os.WriteFile(path, append(payload, '\n'), 0o600); err != nil {
-		return fmt.Errorf("write decision record: %w", err)
+	file, err := os.OpenFile(
+		path,
+		os.O_CREATE|os.O_EXCL|os.O_WRONLY,
+		0o600,
+	)
+	if os.IsExist(err) {
+		return fmt.Errorf("decision record already exists")
+	}
+	if err != nil {
+		return fmt.Errorf("create decision record: %w", err)
 	}
 
+	closed := false
+	defer func() {
+		if !closed {
+			_ = file.Close()
+		}
+	}()
+
+	if _, err := file.Write(append(payload, '\n')); err != nil {
+		return fmt.Errorf("write decision record: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("sync decision record: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close decision record: %w", err)
+	}
+
+	closed = true
 	return nil
 }
 
@@ -215,15 +285,21 @@ func readLocalDecisionRecord(path string) (localDecisionRecord, error) {
 
 func appendLocalDecisionAuditEvent(store localReviewStore, decision localDecisionRecord) error {
 	event := localDecisionAuditEvent{
-		Schema:            localDecisionEventSchema,
-		Event:             "local_decision." + decision.Status,
-		RunID:             decision.RunID,
-		Status:            decision.Status,
-		DecidedAt:         decision.DecidedAt,
-		DecidedBy:         decision.DecidedBy,
-		Reason:            decision.Reason,
-		PatchSHA256:       decision.PatchSHA256,
-		BaselineCommitSHA: decision.BaselineCommitSHA,
+		Schema:                localDecisionEventSchema,
+		Event:                 "local_decision." + decision.Status,
+		RunID:                 decision.RunID,
+		ApprovalID:            decision.ApprovalID,
+		Status:                decision.Status,
+		DecidedAt:             decision.DecidedAt,
+		DecidedBy:             decision.DecidedBy,
+		Reason:                decision.Reason,
+		PatchSHA256:           decision.PatchSHA256,
+		BaselineCommitSHA:     decision.BaselineCommitSHA,
+		EngineProtocolVersion: decision.EngineProtocolVersion,
+		RygnalVersion:         decision.RygnalVersion,
+		Authority:             decision.Authority,
+		AuthoritySynchronized: decision.AuthoritySynchronized,
+		ReceiptSHA256:         decision.ReceiptSHA256,
 	}
 
 	payload, err := json.Marshal(event)
@@ -231,7 +307,11 @@ func appendLocalDecisionAuditEvent(store localReviewStore, decision localDecisio
 		return fmt.Errorf("encode decision audit event: %w", err)
 	}
 
-	file, err := os.OpenFile(store.auditPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	file, err := os.OpenFile(
+		store.auditPath,
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
+		0o600,
+	)
 	if err != nil {
 		return fmt.Errorf("open decision audit log: %w", err)
 	}
@@ -239,6 +319,9 @@ func appendLocalDecisionAuditEvent(store localReviewStore, decision localDecisio
 
 	if _, err := file.Write(append(payload, '\n')); err != nil {
 		return fmt.Errorf("append decision audit event: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("sync decision audit event: %w", err)
 	}
 
 	return nil
@@ -271,6 +354,101 @@ func defaultDecisionActor(store localReviewStore) string {
 	return "unknown-local-user"
 }
 
+type localDecisionReceiptPayload struct {
+	Schema                string `json:"schema"`
+	RunID                 string `json:"run_id"`
+	ApprovalID            string `json:"approval_id"`
+	Status                string `json:"status"`
+	DecidedAt             string `json:"decided_at"`
+	DecidedBy             string `json:"decided_by"`
+	Reason                string `json:"reason"`
+	PatchSHA256           string `json:"patch_sha256"`
+	BaselineCommitSHA     string `json:"baseline_commit_sha"`
+	EngineProtocolVersion string `json:"engine_protocol_version"`
+	RygnalVersion         string `json:"rygnal_version"`
+	Authority             string `json:"authority"`
+	AuthoritySynchronized bool   `json:"authority_synchronized"`
+}
+
+func validateReviewBindingForDecision(record runReviewRecord) error {
+	if record.Patch.SHA256 == "" {
+		return fmt.Errorf(
+			"run %s has no patch digest to bind a decision to",
+			record.RunID,
+		)
+	}
+
+	if record.Baseline == "" {
+		return fmt.Errorf(
+			"run %s has no baseline commit to bind a decision to",
+			record.RunID,
+		)
+	}
+
+	if !record.Approval.Required {
+		return nil
+	}
+
+	if record.Approval.ApprovalID == "" {
+		return fmt.Errorf(
+			"run %s is missing the Python approval identity",
+			record.RunID,
+		)
+	}
+
+	if record.Approval.Target == "" {
+		return fmt.Errorf(
+			"run %s is missing the approval target digest",
+			record.RunID,
+		)
+	}
+
+	if record.Approval.Target != record.Patch.SHA256 {
+		return fmt.Errorf(
+			"approval target does not match review patch digest for run %s",
+			record.RunID,
+		)
+	}
+
+	return nil
+}
+
+func calculateLocalDecisionReceipt(
+	decision localDecisionRecord,
+) (string, error) {
+	payload := localDecisionReceiptPayload{
+		Schema:                decision.Schema,
+		RunID:                 decision.RunID,
+		ApprovalID:            decision.ApprovalID,
+		Status:                decision.Status,
+		DecidedAt:             decision.DecidedAt,
+		DecidedBy:             decision.DecidedBy,
+		Reason:                decision.Reason,
+		PatchSHA256:           decision.PatchSHA256,
+		BaselineCommitSHA:     decision.BaselineCommitSHA,
+		EngineProtocolVersion: decision.EngineProtocolVersion,
+		RygnalVersion:         decision.RygnalVersion,
+		Authority:             decision.Authority,
+		AuthoritySynchronized: decision.AuthoritySynchronized,
+	}
+
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf(
+			"encode local decision receipt: %w",
+			err,
+		)
+	}
+
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func isSupportedLocalDecisionSchema(schema string) bool {
+	return schema == localDecisionSchema ||
+		schema == localDecisionSchemaV1
+}
+
 func decisionStatus(record runReviewRecord) string {
 	if record.DecisionInvalidReason != "" {
 		return "invalid"
@@ -280,20 +458,11 @@ func decisionStatus(record runReviewRecord) string {
 		return "undecided"
 	}
 
-	if record.Decision.Schema != localDecisionSchema {
+	if err := validateDecisionRecordForRun(record); err != nil {
 		return "invalid"
 	}
 
-	if record.Decision.RunID != record.RunID {
-		return "invalid"
-	}
-
-	switch record.Decision.Status {
-	case localDecisionApproved, localDecisionRejected:
-		return record.Decision.Status
-	default:
-		return "invalid"
-	}
+	return record.Decision.Status
 }
 
 func renderDecision(out interface{ Write([]byte) (int, error) }, record runReviewRecord) {
@@ -339,7 +508,11 @@ func renderDecision(out interface{ Write([]byte) (int, error) }, record runRevie
 
 func validateDecisionRecordForRun(record runReviewRecord) error {
 	if record.DecisionInvalidReason != "" {
-		return fmt.Errorf("decision record for run %s is invalid or corrupt: %s", record.RunID, record.DecisionInvalidReason)
+		return fmt.Errorf(
+			"decision record for run %s is invalid or corrupt: %s",
+			record.RunID,
+			record.DecisionInvalidReason,
+		)
 	}
 
 	if record.Decision == nil {
@@ -348,34 +521,143 @@ func validateDecisionRecordForRun(record runReviewRecord) error {
 
 	decision := record.Decision
 
-	if decision.Schema != localDecisionSchema {
-		return fmt.Errorf("decision record for run %s has unsupported schema %q", record.RunID, decision.Schema)
+	if !isSupportedLocalDecisionSchema(decision.Schema) {
+		return fmt.Errorf(
+			"decision record for run %s has unsupported schema %q",
+			record.RunID,
+			decision.Schema,
+		)
 	}
 
 	if decision.RunID != record.RunID {
-		return fmt.Errorf("decision record run_id %q does not match requested run %s", decision.RunID, record.RunID)
+		return fmt.Errorf(
+			"decision record run_id %q does not match requested run %s",
+			decision.RunID,
+			record.RunID,
+		)
 	}
 
 	switch decision.Status {
 	case localDecisionApproved, localDecisionRejected:
 	default:
-		return fmt.Errorf("decision record for run %s has unsupported status %q", record.RunID, decision.Status)
+		return fmt.Errorf(
+			"decision record for run %s has unsupported status %q",
+			record.RunID,
+			decision.Status,
+		)
 	}
 
 	if decision.PatchSHA256 == "" {
-		return fmt.Errorf("decision record for run %s is missing patch digest", record.RunID)
+		return fmt.Errorf(
+			"decision record for run %s is missing patch digest",
+			record.RunID,
+		)
 	}
 
-	if record.Patch.SHA256 != "" && decision.PatchSHA256 != record.Patch.SHA256 {
-		return fmt.Errorf("decision patch digest does not match review patch digest for run %s", record.RunID)
+	if record.Patch.SHA256 != "" &&
+		decision.PatchSHA256 != record.Patch.SHA256 {
+		return fmt.Errorf(
+			"decision patch digest does not match review patch digest for run %s",
+			record.RunID,
+		)
 	}
 
 	if decision.BaselineCommitSHA == "" {
-		return fmt.Errorf("decision record for run %s is missing baseline commit", record.RunID)
+		return fmt.Errorf(
+			"decision record for run %s is missing baseline commit",
+			record.RunID,
+		)
 	}
 
-	if record.Baseline != "" && decision.BaselineCommitSHA != record.Baseline {
-		return fmt.Errorf("decision baseline does not match review baseline for run %s", record.RunID)
+	if record.Baseline != "" &&
+		decision.BaselineCommitSHA != record.Baseline {
+		return fmt.Errorf(
+			"decision baseline does not match review baseline for run %s",
+			record.RunID,
+		)
+	}
+
+	if decision.Schema == localDecisionSchemaV1 {
+		return nil
+	}
+
+	if decision.EngineProtocolVersion != engineclient.ProtocolVersion {
+		return fmt.Errorf(
+			"decision record for run %s has unsupported engine protocol %q",
+			record.RunID,
+			decision.EngineProtocolVersion,
+		)
+	}
+
+	if decision.RygnalVersion == "" {
+		return fmt.Errorf(
+			"decision record for run %s is missing Rygnal version",
+			record.RunID,
+		)
+	}
+
+	if record.Approval.Required {
+		if decision.ApprovalID == "" {
+			return fmt.Errorf(
+				"decision record for run %s is missing approval identity",
+				record.RunID,
+			)
+		}
+
+		if decision.ApprovalID != record.Approval.ApprovalID {
+			return fmt.Errorf(
+				"decision approval identity does not match review approval for run %s",
+				record.RunID,
+			)
+		}
+	}
+
+	switch decision.Authority {
+	case localDecisionAuthorityLocal:
+		if decision.AuthoritySynchronized {
+			return fmt.Errorf(
+				"local decision for run %s cannot claim shared synchronization",
+				record.RunID,
+			)
+		}
+	case localDecisionAuthoritySharedAPI:
+		if !record.Approval.Required {
+			return fmt.Errorf(
+				"shared decision for run %s has no approval requirement",
+				record.RunID,
+			)
+		}
+		if !decision.AuthoritySynchronized {
+			return fmt.Errorf(
+				"shared decision for run %s is not synchronized",
+				record.RunID,
+			)
+		}
+	default:
+		return fmt.Errorf(
+			"decision record for run %s has unsupported authority %q",
+			record.RunID,
+			decision.Authority,
+		)
+	}
+
+	if decision.ReceiptSHA256 == "" {
+		return fmt.Errorf(
+			"decision record for run %s is missing receipt digest",
+			record.RunID,
+		)
+	}
+
+	expectedReceipt, err := calculateLocalDecisionReceipt(*decision)
+	if err != nil {
+		return err
+	}
+
+	if decision.ReceiptSHA256 != expectedReceipt {
+		return fmt.Errorf(
+			"decision receipt digest does not match record contents for run %s",
+			record.RunID,
+		)
 	}
 
 	return nil
@@ -386,17 +668,31 @@ func assertDecisionAllowsApply(record runReviewRecord) error {
 		return err
 	}
 
-	if record.Decision != nil && record.Decision.Status == localDecisionRejected {
-		return fmt.Errorf("run %s was rejected: %s", record.RunID, valueOrDash(record.Decision.Reason))
+	if record.Decision != nil &&
+		record.Decision.Status == localDecisionRejected {
+		return fmt.Errorf(
+			"run %s was rejected: %s",
+			record.RunID,
+			valueOrDash(record.Decision.Reason),
+		)
 	}
 
 	if record.Approval.Required {
 		if record.Decision == nil {
-			return fmt.Errorf("run %s requires approval before apply; run `rygnal approve %s --yes` or `rygnal reject %s --reason ...`", record.RunID, record.RunID, record.RunID)
+			return fmt.Errorf(
+				"run %s requires approval before apply; run `rygnal approve %s --yes` or `rygnal reject %s --reason ...`",
+				record.RunID,
+				record.RunID,
+				record.RunID,
+			)
 		}
 
 		if record.Decision.Status != localDecisionApproved {
-			return fmt.Errorf("run %s requires an approved decision before apply; current decision: %s", record.RunID, record.Decision.Status)
+			return fmt.Errorf(
+				"run %s requires an approved decision before apply; current decision: %s",
+				record.RunID,
+				record.Decision.Status,
+			)
 		}
 	}
 

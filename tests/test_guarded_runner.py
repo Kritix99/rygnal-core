@@ -20,9 +20,9 @@ from rygnal.guarded_runner import (
     run_guarded,
 )
 from rygnal.models import ApprovalStatus
+from rygnal.recovery_session import CleanupResult, CleanupStatus
 from rygnal.risk_engine import RiskLevel
 from rygnal.untracked_files import UntrackedFilePolicy
-from rygnal.workspace_cleanup import CleanupResult, CleanupStatus
 
 
 def run_git(repo: Path, *args: str) -> str:
@@ -420,7 +420,10 @@ def test_dirty_override_is_explicit_and_audited(tmp_path: Path) -> None:
         )
     )
 
-    assert result.status == GuardedRunStatus.COMPLETED
+    assert result.status == GuardedRunStatus.FAILED
+    assert result.patch_apply_outcome == "apply_failed"
+    assert not (repo / "agent.txt").exists()
+    assert (repo / "README.md").read_text(encoding="utf-8") == "dirty\n"
     assert any("Dirty trusted repository override" in warning for warning in result.warnings)
     assert audit.verify_integrity()
 
@@ -462,7 +465,10 @@ def test_preserve_untracked_policy_does_not_copy_unrelated_trusted_file(
 
     workspace = Path(result.workspace_path)
 
-    assert result.status == GuardedRunStatus.COMPLETED
+    assert result.status == GuardedRunStatus.FAILED
+    assert result.patch_apply_outcome == "apply_failed"
+    assert not (repo / "agent.txt").exists()
+    assert (repo / "notes.txt").read_text(encoding="utf-8") == "local note\n"
     assert workspace.exists()
     assert (workspace / "agent.txt").exists()
     assert not (workspace / "notes.txt").exists()
@@ -631,7 +637,7 @@ def test_command_runs_with_guarded_workspace_cwd(tmp_path: Path) -> None:
     assert result.status == GuardedRunStatus.COMPLETED
     assert workspace.exists()
     assert (workspace / "cwd.txt").read_text(encoding="utf-8") == workspace.as_posix()
-    assert not (repo / "cwd.txt").exists()
+    assert (repo / "cwd.txt").exists()
 
 
 def test_successful_command_captures_stdout_stderr_and_duration(tmp_path: Path) -> None:
@@ -755,7 +761,7 @@ def test_cleanup_removes_workspace_by_default(tmp_path: Path) -> None:
 
     assert result.status == GuardedRunStatus.COMPLETED
     assert result.cleanup_performed is True
-    assert result.cleanup_status in {"cleaned_git", "cleaned_fallback"}
+    assert result.cleanup_status == "worktree_removed"
     assert not Path(result.workspace_path).exists()
 
 
@@ -772,7 +778,7 @@ def test_preserve_workspace_is_explicit(tmp_path: Path) -> None:
 
     assert result.status == GuardedRunStatus.COMPLETED
     assert result.cleanup_performed is False
-    assert result.cleanup_status == "reset_success"
+    assert result.cleanup_status == "preserved"
     assert Path(result.workspace_path).exists()
 
 
@@ -788,7 +794,7 @@ def test_cleanup_failure_is_visible(
             message="simulated cleanup failure",
         )
 
-    monkeypatch.setattr("rygnal.guarded_runner.destroy_worktree", fake_destroy)
+    monkeypatch.setattr("rygnal.guarded_runner.destroy_recovery_session", fake_destroy)
 
     result = run_guarded(
         unsafe_config(
@@ -938,6 +944,9 @@ def test_high_risk_dependency_patch_requires_approval_before_completion(tmp_path
     assert result.approval_request.requested_by == "local_user"
     assert result.approval_request.agent_id == "local_agent"
     assert result.approval_request.environment == "local"
+    assert result.patch_apply_outcome == "pending_approval"
+    assert result.patch_artifact_id is not None
+    assert result.approval_request.metadata["artifact_id"] == result.patch_artifact_id
     assert result.change_risk_report is not None
     assert result.change_risk_report.overall_risk_level == RiskLevel.HIGH
     assert "requires approval" in result.blocked_reason

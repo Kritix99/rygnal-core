@@ -19,6 +19,18 @@ from tests.guarded_runner_helpers import (
 )
 
 
+def run_git(repo: Path, *args: str) -> None:
+    import subprocess
+
+    subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 def test_hostile_parent_path_write_does_not_mutate_trusted_repo(
     tmp_path: Path,
 ) -> None:
@@ -30,15 +42,21 @@ def test_hostile_parent_path_write_does_not_mutate_trusted_repo(
             trusted,
             py_command(
                 "from pathlib import Path; "
-                "Path('../escape.txt').write_text('outside workspace in unsafe local\\n')"
+                "Path('../escape.txt').write_text("
+                "'outside workspace in unsafe local\\n')"
             ),
         )
     )
 
-    assert result.status == GuardedRunStatus.COMPLETED
-    assert result.backend_name == "unsafe_local"
-    assert result.containment_verified is False
-    assert any("Unsafe local execution" in warning for warning in result.warnings)
+    assert result.status == GuardedRunStatus.CLEANUP_FAILED
+    assert result.workspace_quarantined is True
+    assert result.cleanup_status == "worktree_quarantined"
+    assert result.workspace_path is not None
+
+    quarantine = Path(result.workspace_path)
+    assert quarantine.exists()
+    assert (quarantine / "escape.txt").exists()
+
     assert head_sha(trusted) == baseline
     assert git_status_porcelain(trusted) == ""
     assert not (trusted / "escape.txt").exists()
@@ -96,6 +114,7 @@ def test_hostile_symlink_to_outside_repo_is_reported_and_blocked_by_gate(
 
     assert gate.blocked is True
     assert git_status_porcelain(trusted) == ""
+    assert not (trusted / "outside_link").exists()
 
 
 def test_hostile_large_change_skips_auto_apply(
@@ -119,6 +138,8 @@ def test_hostile_large_change_skips_auto_apply(
     assert result.blocked_reason is not None
 
     risk_report = classify_patch_risk(result.patch_diff)
+    run_git(trusted, "reset", "--hard", "HEAD")
+    run_git(trusted, "clean", "-fd")
     apply_result = auto_apply_safe_patch(
         result.patch_diff,
         trusted,
@@ -156,6 +177,8 @@ def test_hostile_dependency_manifest_change_remains_visible_and_skips_auto_apply
     assert any(file.path == "requirements.txt" for file in result.patch_diff.files)
 
     risk_report = classify_patch_risk(result.patch_diff)
+    run_git(trusted, "reset", "--hard", "HEAD")
+    run_git(trusted, "clean", "-fd")
     apply_result = auto_apply_safe_patch(
         result.patch_diff,
         trusted,
@@ -213,6 +236,7 @@ def test_hostile_failed_command_after_changes_keeps_evidence_and_cleans(
     assert any(file.path == "before_fail.txt" for file in result.changed_file_report.files)
     assert result.patch_diff is not None
     assert git_status_porcelain(trusted) == ""
+    assert not (trusted / "before_fail.txt").exists()
     assert not Path(result.workspace_path).exists()
 
 
@@ -239,6 +263,7 @@ def test_hostile_timeout_after_changes_keeps_evidence_and_cleans(
     assert result.changed_file_report is not None
     assert any(file.path == "before_timeout.txt" for file in result.changed_file_report.files)
     assert git_status_porcelain(trusted) == ""
+    assert not (trusted / "before_timeout.txt").exists()
     assert not Path(result.workspace_path).exists()
 
 

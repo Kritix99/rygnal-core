@@ -7,6 +7,7 @@ allowed, blocked, simulated, or sent for human approval.
 import os
 import re
 from dataclasses import dataclass
+from importlib import resources
 from pathlib import Path
 from typing import Any
 
@@ -23,8 +24,17 @@ from rygnal.models import (
     ToolRequest,
 )
 
-DEFAULT_POLICY_PATH = Path("policies/default_policy.yaml")
-PRODUCTION_SAFE_POLICY_PATH = Path("policies/production_safe_policy.yaml")
+# Legacy filesystem locations remain overridable for callers and tests.
+# When they retain these default values, installed package resources are used.
+_REPOSITORY_DEFAULT_POLICY_PATH = Path("policies/default_policy.yaml")
+_REPOSITORY_PRODUCTION_SAFE_POLICY_PATH = Path("policies/production_safe_policy.yaml")
+
+DEFAULT_POLICY_PATH = _REPOSITORY_DEFAULT_POLICY_PATH
+PRODUCTION_SAFE_POLICY_PATH = _REPOSITORY_PRODUCTION_SAFE_POLICY_PATH
+
+BUNDLED_POLICY_PACKAGE = "rygnal.resources.policies"
+DEFAULT_POLICY_RESOURCE = "default_policy.yaml"
+PRODUCTION_SAFE_POLICY_RESOURCE = "production_safe_policy.yaml"
 
 DEFAULT_POLICY_REGEX_MAX_PATTERN_BYTES = 2_048
 DEFAULT_POLICY_REGEX_MAX_TARGET_BYTES = 8_192
@@ -137,18 +147,48 @@ class PolicyEngine:
         *,
         validation_profile: PolicyValidationProfile | None = None,
     ) -> "PolicyEngine":
-        """Load policy rules from a YAML file."""
+        """Load policy rules from an explicit filesystem path."""
         path = Path(policy_path)
 
         if not path.exists():
             raise FileNotFoundError(f"Policy file not found: {path}")
 
-        data = yaml.safe_load(path.read_text()) or {}
+        if not path.is_file():
+            raise PolicyLoadError(f"Policy path is not a regular file: {path}")
+
+        try:
+            policy_text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise PolicyLoadError(f"Unable to read policy file {path}: {exc}") from exc
+
+        return cls.from_yaml_text(
+            policy_text,
+            source=str(path),
+            validation_profile=validation_profile,
+        )
+
+    @classmethod
+    def from_yaml_text(
+        cls,
+        policy_text: str,
+        *,
+        source: str = "<policy>",
+        validation_profile: PolicyValidationProfile | None = None,
+    ) -> "PolicyEngine":
+        """Load policy rules from YAML text using the canonical validator."""
+        try:
+            data = yaml.safe_load(policy_text) or {}
+        except yaml.YAMLError as exc:
+            raise PolicyLoadError(f"Unable to parse policy source {source}: {exc}") from exc
 
         if not isinstance(data, dict):
-            raise ValueError("Policy file must be a YAML mapping.")
+            raise PolicyLoadError(f"Policy source {source} must be a YAML mapping.")
 
-        policy_schema = PolicySchema(**data)
+        try:
+            policy_schema = PolicySchema(**data)
+        except ValueError as exc:
+            raise PolicyLoadError(f"Invalid policy source {source}: {exc}") from exc
+
         cls._validate_policy_schema(
             policy_schema,
             validation_profile=validation_profile,
@@ -535,19 +575,83 @@ class PolicyEngine:
         return str(value)
 
 
+def _read_bundled_policy(resource_name: str) -> str:
+    """Read one policy bundled with the installed Rygnal package."""
+    logical_name = f"{BUNDLED_POLICY_PACKAGE}:{resource_name}"
+
+    try:
+        resource = resources.files(BUNDLED_POLICY_PACKAGE).joinpath(resource_name)
+
+        if not resource.is_file():
+            raise PolicyLoadError(f"Bundled Rygnal policy resource is missing: {logical_name}")
+
+        return resource.read_text(encoding="utf-8")
+    except PolicyLoadError:
+        raise
+    except (
+        FileNotFoundError,
+        ModuleNotFoundError,
+        OSError,
+        TypeError,
+    ) as exc:
+        raise PolicyLoadError(
+            f"Unable to read bundled Rygnal policy resource {logical_name}: {exc}"
+        ) from exc
+
+
+def _load_bundled_policy_engine(
+    resource_name: str,
+    *,
+    validation_profile: PolicyValidationProfile | None = None,
+) -> PolicyEngine:
+    return PolicyEngine.from_yaml_text(
+        _read_bundled_policy(resource_name),
+        source=f"packaged Rygnal policy {resource_name!r}",
+        validation_profile=validation_profile,
+    )
+
+
+def _load_default_or_overridden_policy(
+    *,
+    configured_path: str | Path,
+    repository_default_path: Path,
+    bundled_resource: str,
+    validation_profile: PolicyValidationProfile | None = None,
+) -> PolicyEngine:
+    """Load an explicit override or fall back to the packaged policy."""
+    path = Path(configured_path)
+
+    if path != repository_default_path:
+        return PolicyEngine.from_file(
+            path,
+            validation_profile=validation_profile,
+        )
+
+    return _load_bundled_policy_engine(
+        bundled_resource,
+        validation_profile=validation_profile,
+    )
+
+
 def load_default_policy_engine(
     runtime_mode: RuntimeMode | str = RuntimeMode.ENFORCE,
 ) -> PolicyEngine:
-    """Load the default Rygnal policy engine for the requested runtime mode."""
+    """Load the configured or bundled policy for the requested runtime mode."""
     mode = RuntimeMode(runtime_mode)
 
     if mode == RuntimeMode.PRODUCTION_SAFE:
-        return PolicyEngine.from_file(
-            PRODUCTION_SAFE_POLICY_PATH,
+        return _load_default_or_overridden_policy(
+            configured_path=PRODUCTION_SAFE_POLICY_PATH,
+            repository_default_path=_REPOSITORY_PRODUCTION_SAFE_POLICY_PATH,
+            bundled_resource=PRODUCTION_SAFE_POLICY_RESOURCE,
             validation_profile=PRODUCTION_SAFE_POLICY_PROFILE,
         )
 
-    engine = PolicyEngine.from_file(DEFAULT_POLICY_PATH)
+    engine = _load_default_or_overridden_policy(
+        configured_path=DEFAULT_POLICY_PATH,
+        repository_default_path=_REPOSITORY_DEFAULT_POLICY_PATH,
+        bundled_resource=DEFAULT_POLICY_RESOURCE,
+    )
 
     if engine.default_decision != Decision.BLOCK:
         raise PolicyLoadError(

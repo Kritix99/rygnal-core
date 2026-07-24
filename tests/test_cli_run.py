@@ -561,3 +561,44 @@ def test_json_summary_includes_intent_review_decision() -> None:
     assert payload["intent"]["review"]["recommended_next_action"] == (
         "request_scope_expansion_approval"
     )
+
+
+def test_run_emits_experimental_security_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        cli_run,
+        "run_guarded",
+        lambda _config: fake_result(),
+    )
+
+    exit_code = main(
+        [
+            "run",
+            "--unsafe-local",
+            "--",
+            "python",
+            "-c",
+            "print('ok')",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert cli_run.EXPERIMENTAL_RUN_WARNING in captured.err
+    assert "trusted prevention or rollback boundary" in captured.err
+
+
+def test_run_help_marks_command_as_experimental(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        main(["run", "--help"])
+
+    captured = capsys.readouterr()
+    normalized_help = " ".join(captured.out.split())
+
+    assert exc_info.value.code == 0
+    assert "EXPERIMENTAL DEVELOPER PREVIEW" in normalized_help
+    assert "does not guarantee prevention or rollback" in normalized_help
