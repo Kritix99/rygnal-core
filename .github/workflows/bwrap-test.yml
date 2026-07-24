@@ -1,0 +1,38 @@
+name: Bwrap Test
+on:
+  push:
+    branches: [main]
+
+jobs:
+  test-bwrap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install and test bwrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          bwrap --version
+          echo "Trying without sysctls (default bwrap):"
+          bwrap --unshare-user --unshare-pid -- /bin/echo "hello" || echo "failed"
+          
+          echo "Applying sysctls:"
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+          
+          echo "Trying with sysctls (default bwrap):"
+          bwrap --unshare-user --unshare-pid -- /bin/echo "hello" || echo "failed"
+          
+          echo "Stripping setuid:"
+          sudo chmod u-s $(which bwrap) || true
+          
+          echo "Trying stripped bwrap:"
+          bwrap --unshare-user --unshare-pid -- /bin/echo "hello" || echo "failed"
+          
+          echo "Disabling AppArmor profile for bwrap (if exists):"
+          if [ -f /etc/apparmor.d/bwrap ]; then
+            sudo ln -s /etc/apparmor.d/bwrap /etc/apparmor.d/disable/
+            sudo apparmor_parser -R /etc/apparmor.d/bwrap || true
+          fi
+          
+          echo "Trying stripped bwrap after AppArmor disable:"
+          bwrap --unshare-user --unshare-pid -- /bin/echo "hello" || echo "failed"
