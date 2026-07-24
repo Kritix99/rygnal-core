@@ -898,7 +898,7 @@ def _first_existing(
 ) -> str | None:
     for value in paths:
         if Path(value).exists():
-            return value
+            return os.path.realpath(value)
 
     return None
 
