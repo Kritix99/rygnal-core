@@ -83,6 +83,10 @@ jobs:
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
           sysctl kernel.apparmor_restrict_unprivileged_userns || true
           sysctl kernel.unprivileged_userns_clone || true
+          # Remove setuid bit from bwrap. GitHub Actions environments block setuid 
+          # elevation, causing bwrap to fail with "No permissions to try setuid".
+          # Stripping setuid forces bwrap to use unprivileged user namespaces.
+          sudo chmod u-s $(which bwrap) || true
 
       - name: Run tests
         run: pytest -q

@@ -53,6 +53,7 @@ jobs:
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
           sysctl kernel.apparmor_restrict_unprivileged_userns || true
           sysctl kernel.unprivileged_userns_clone || true
+          sudo chmod u-s $(which bwrap) || true
 
       - name: Record Linux host identity
         run: |
