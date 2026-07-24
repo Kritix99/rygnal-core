@@ -723,7 +723,11 @@ def _run_behavioral_probe(
     )
 
     if not features["host_environment_cleared"]:
-        reasons.append("Host environment variables leaked into the Bubblewrap self-test.")
+        reasons.append(
+            "Host environment variables leaked into the Bubblewrap self-test. "
+            f"Unexpected: {unexpected_environment}, "
+            f"RYGNAL_SHOULD_NOT_LEAK in env: {'RYGNAL_SHOULD_NOT_LEAK' in environment_names}"
+        )
 
     features["host_tmp_hidden"] = parsed.get("secret_visible") == "no"
 
