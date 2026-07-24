@@ -28,10 +28,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
@@ -48,7 +48,11 @@ jobs:
           python -m pip install build
 
       - name: Allow unprivileged user namespaces for Bubblewrap
-        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+          sysctl kernel.unprivileged_userns_clone || true
 
       - name: Record Linux host identity
         run: |
@@ -237,9 +241,3 @@ jobs:
             --commit "$GITHUB_SHA" \
             --wheel-sha256 \
               "${{ steps.wheel.outputs.sha256 }}"
-      - name: Allow unprivileged user namespaces for Bubblewrap
-        run: |
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
-          sysctl kernel.apparmor_restrict_unprivileged_userns || true
-          sysctl kernel.unprivileged_userns_clone || true
