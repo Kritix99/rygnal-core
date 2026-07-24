@@ -482,7 +482,7 @@ def test_actual_linux_production_containment(
 ) -> None:
     verification = verify_production_bubblewrap()
 
-    assert verification.eligible is True
+    assert verification.eligible is True, f"Failed reasons: {verification.reasons}"
     assert verification.features["behavioral_self_test"]
     assert verification.features["network_namespace"]
     assert verification.features["cgroup_namespace"]
