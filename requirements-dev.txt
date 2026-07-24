@@ -1,15 +1,16 @@
 pytest>=9.1.1
-ruff>=0.4.0
+ruff>=0.15.20
 bandit>=1.7.9
 pip-audit>=2.10.1
 
 pydantic>=2.7.0
 PyYAML>=6.0.1
-langchain-core>=0.1.0
+langchain-core>=1.4.8
 
 fastapi>=0.115.0
 httpx>=0.28.1
+httpx2>=2.5.0
 uvicorn>=0.30.0
 
-maturin>=1.4.0,<2.0
+maturin>=1.14.1,<2.0
 openai>=1.0.0

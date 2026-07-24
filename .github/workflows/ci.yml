@@ -59,6 +59,8 @@ jobs:
         run: cargo clippy --manifest-path rust-kernel/Cargo.toml --no-default-features -- -D warnings
 
       - name: Build and install Rust kernel Python extension wheel
+        env:
+          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
         run: |
           cd rust-kernel
           python -m maturin build --release --out dist
