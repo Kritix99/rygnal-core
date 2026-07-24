@@ -59,6 +59,7 @@ _ALLOWED_PROBE_ENVIRONMENT = {
     "LC_ALL",
     "LOGNAME",
     "PATH",
+    "PWD",
     "RYGNAL_HOST_SECRET",
     "RYGNAL_PROBE",
     "TMPDIR",

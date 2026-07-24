@@ -1278,10 +1278,10 @@ def test_bubblewrap_backend_blocks_network_access(
                 "blocked = False; "
                 "s = socket.socket(); "
                 "s.settimeout(1); "
-                "\\ntry:\\n"
-                "    s.connect(('1.1.1.1', 443))\\n"
-                "except OSError:\\n"
-                "    blocked = True\\n"
+                "\ntry:\n"
+                "    s.connect(('1.1.1.1', 443))\n"
+                "except OSError:\n"
+                "    blocked = True\n"
                 "print('network-blocked' if blocked else 'network-open')"
             ),
             timeout_seconds=5,
@@ -1429,10 +1429,10 @@ def test_bubblewrap_backend_blocks_outside_workspace_writes(
             trusted_repo_path=repo,
             command=py_command(
                 "from pathlib import Path; "
-                "\\ntry:\\n"
-                "    Path('/etc/rygnal_escape').write_text('bad', encoding='utf-8')\\n"
-                "    print('outside-write-open')\\n"
-                "except OSError:\\n"
+                "\ntry:\n"
+                "    Path('/etc/rygnal_escape').write_text('bad', encoding='utf-8')\n"
+                "    print('outside-write-open')\n"
+                "except OSError:\n"
                 "    print('outside-write-blocked')"
             ),
             timeout_seconds=5,
