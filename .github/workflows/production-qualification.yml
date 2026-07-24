@@ -237,3 +237,9 @@ jobs:
             --commit "$GITHUB_SHA" \
             --wheel-sha256 \
               "${{ steps.wheel.outputs.sha256 }}"
+      - name: Allow unprivileged user namespaces for Bubblewrap
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+          sysctl kernel.unprivileged_userns_clone || true
