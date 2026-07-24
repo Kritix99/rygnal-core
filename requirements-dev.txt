@@ -1,5 +1,5 @@
 pytest>=9.1.1
-ruff>=0.15.18
+ruff>=0.15.20
 bandit>=1.7.9
 pip-audit>=2.10.1
 
@@ -9,7 +9,7 @@ langchain-core>=1.4.8
 
 fastapi>=0.115.0
 httpx>=0.28.1
-httpx2>=2.4.0
+httpx2>=2.5.0
 uvicorn>=0.49.0
 
 maturin>=1.14.1,<2.0
