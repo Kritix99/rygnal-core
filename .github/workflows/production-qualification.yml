@@ -54,6 +54,12 @@ jobs:
           sysctl kernel.apparmor_restrict_unprivileged_userns || true
           sysctl kernel.unprivileged_userns_clone || true
           sudo chmod u-s $(which bwrap) || true
+          # Try disabling the apparmor profile for bwrap entirely
+          echo "Disabling AppArmor profile for bwrap (if exists):"
+          if [ -f /etc/apparmor.d/bwrap ]; then
+            sudo ln -s /etc/apparmor.d/bwrap /etc/apparmor.d/disable/ || true
+            sudo apparmor_parser -R /etc/apparmor.d/bwrap || true
+          fi
 
       - name: Record Linux host identity
         run: |

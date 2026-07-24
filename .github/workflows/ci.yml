@@ -87,6 +87,19 @@ jobs:
           # elevation, causing bwrap to fail with "No permissions to try setuid".
           # Stripping setuid forces bwrap to use unprivileged user namespaces.
           sudo chmod u-s $(which bwrap) || true
+          
+      - name: Diagnose bwrap failure
+        run: |
+          bwrap --unshare-user --unshare-pid -- /bin/echo "hello from bwrap" || echo "bwrap failed!"
+          
+          # Try disabling the apparmor profile for bwrap entirely
+          echo "Disabling AppArmor profile for bwrap (if exists):"
+          if [ -f /etc/apparmor.d/bwrap ]; then
+            sudo ln -s /etc/apparmor.d/bwrap /etc/apparmor.d/disable/ || true
+            sudo apparmor_parser -R /etc/apparmor.d/bwrap || true
+          fi
+          
+          bwrap --unshare-user --unshare-pid -- /bin/echo "hello from bwrap after apparmor disable" || echo "bwrap failed again!"
 
       - name: Run tests
         run: pytest -q
