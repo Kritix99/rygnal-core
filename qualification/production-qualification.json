@@ -1,0 +1,107 @@
+{
+  "bubblewrap": {
+    "executable_sha256": "52231e1caf55bcbc667b269f49c63599a6f7db4767ae6a039580d0ff853db712",
+    "version": "0.9.0"
+  },
+  "checks": [
+    {
+      "code": "ok",
+      "duration_ms": 0,
+      "name": "host.linux",
+      "passed": true,
+      "required": true
+    },
+    {
+      "code": "ok",
+      "duration_ms": 0,
+      "name": "package.wheel_identity",
+      "passed": true,
+      "required": true
+    },
+    {
+      "code": "ok",
+      "duration_ms": 0,
+      "name": "package.installed_boundary",
+      "passed": true,
+      "required": true
+    },
+    {
+      "code": "ok",
+      "duration_ms": 11,
+      "name": "bubblewrap.behavioral_verification",
+      "passed": true,
+      "required": true
+    },
+    {
+      "code": "ok",
+      "duration_ms": 12,
+      "name": "runtime.production_config",
+      "passed": true,
+      "required": true
+    },
+    {
+      "code": "ok",
+      "duration_ms": 4657,
+      "name": "sandbox.hostile_boundary",
+      "passed": true,
+      "required": true
+    },
+    {
+      "code": "ok",
+      "duration_ms": 4657,
+      "name": "sandbox.output_bounded",
+      "passed": true,
+      "required": true
+    },
+    {
+      "code": "ok",
+      "duration_ms": 4657,
+      "name": "sandbox.descendant_timeout_cleanup",
+      "passed": true,
+      "required": true
+    },
+    {
+      "code": "ok",
+      "duration_ms": 4657,
+      "name": "runtime.production_api_startup",
+      "passed": true,
+      "required": true
+    }
+  ],
+  "features": {
+    "behavioral_self_test": true,
+    "capabilities_dropped": true,
+    "cgroup_namespace": true,
+    "host_environment_cleared": true,
+    "host_tmp_hidden": true,
+    "inherited_fds_closed": true,
+    "ipc_namespace": true,
+    "linux_host": true,
+    "net_namespace": true,
+    "no_new_privileges": true,
+    "output_bounded": true,
+    "pid_namespace": true,
+    "production_mode": true,
+    "required_flags_verified": true,
+    "resource_limits_enforced": true,
+    "secure_executable": true,
+    "user_namespace": true,
+    "uts_namespace": true,
+    "version_verified": true
+  },
+  "generated_at": "2026-08-06T10:32:04.686866+00:00",
+  "package": {
+    "commit_sha": "72eba540f3aca88ebc4c7c1a8925d5c2e72c28be",
+    "installed_boundary_verified": true,
+    "version": "0.1.0",
+    "wheel_sha256": "8d4df9990c600869f84880c395b274396ecb9783ae3256a7b1be727ea65c26f9"
+  },
+  "platform": {
+    "machine": "x86_64",
+    "python": "3.12.3",
+    "release": "6.17.0-1020-azure",
+    "system": "linux"
+  },
+  "qualified": true,
+  "schema_version": "rygnal.production-qualification.v1"
+}
