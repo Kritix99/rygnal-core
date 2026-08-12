@@ -1,12 +1,8 @@
 """Process-tree containment modeling and enforcement for guarded execution.
 
-This module defines the strict security boundaries for process execution.
-POSIX process groups, sessions, and `killpg()` are NOT security boundaries;
-they are easily bypassed via `setsid()`, double-forking, or backgrounding.
-
-True guarded execution requires atomic tree-kill capabilities, primarily
-provided by Linux PID namespaces (e.g., Bubblewrap) or `cgroups`. Backends
-lacking these primitives must explicitly report leaky containment boundaries.
+POSIX process groups, sessions, and `killpg()` are not security boundaries.
+Backends lacking atomic process-tree isolation must explicitly report their
+limitations rather than claiming strong containment.
 """
 
 from __future__ import annotations
@@ -65,22 +61,20 @@ class ProcessContainmentCapabilities:
     workspace_only_writable: bool = False
 
     @property
-    def isolation_features(
-        self,
-    ) -> dict[str, bool]:
+    def isolation_features(self) -> dict[str, bool]:
         """Return the established backend feature contract."""
         return {
             "network_isolated": self.network_isolated,
-            "pid_namespace": (self.supports_pid_namespace),
+            "pid_namespace": self.supports_pid_namespace,
             "ipc_namespace": self.ipc_namespace,
             "uts_namespace": self.uts_namespace,
             "tmpfs_isolated": self.tmpfs_isolated,
-            "var_tmpfs_isolated": (self.var_tmpfs_isolated),
+            "var_tmpfs_isolated": self.var_tmpfs_isolated,
             "dev_sandboxed": self.dev_sandboxed,
             "identity_masked": self.identity_masked,
-            "host_environment_cleared": (self.host_environment_cleared),
-            "workspace_only_writable": (self.workspace_only_writable),
-            "atomic_tree_kill": (self.supports_atomic_tree_kill),
+            "host_environment_cleared": self.host_environment_cleared,
+            "workspace_only_writable": self.workspace_only_writable,
+            "atomic_tree_kill": self.supports_atomic_tree_kill,
         }
 
 
@@ -98,41 +92,7 @@ class ProcessContainmentResult:
 def evaluate_containment_capabilities(
     backend: ExecutionBackendName,
 ) -> ProcessContainmentCapabilities:
-    """Evaluate backend capabilities, preventing POSIX groups from claiming security."""
-
-    if backend in {
-        ExecutionBackendName.LINUX_BUBBLEWRAP,
-        ExecutionBackendName.LINUX_BUBBLEWRAP_HELPER,
-    }:
-        return ProcessContainmentCapabilities(
-            backend_name=backend,
-            level=ContainmentLevel.STRONG,
-            cleanup_guarantee=CleanupGuarantee.ATOMIC_TREE_KILL,
-            supports_pid_namespace=True,
-            supports_atomic_tree_kill=True,
-            unsafe_local=False,
-            limitations=(),
-            network_isolated=True,
-            ipc_namespace=True,
-            uts_namespace=True,
-            tmpfs_isolated=True,
-            var_tmpfs_isolated=True,
-            dev_sandboxed=True,
-            identity_masked=True,
-            host_environment_cleared=True,
-            workspace_only_writable=True,
-        )
-
-    if backend == ExecutionBackendName.LINUX_SYSTEMD_USER:
-        return ProcessContainmentCapabilities(
-            backend_name=backend,
-            level=ContainmentLevel.STRONG,
-            cleanup_guarantee=CleanupGuarantee.ATOMIC_TREE_KILL,
-            supports_pid_namespace=False,
-            supports_atomic_tree_kill=True,  # cgroups v2 guarantee atomic kill
-            unsafe_local=False,
-            limitations=(),
-        )
+    """Evaluate backend capabilities without overstating containment."""
 
     if backend == ExecutionBackendName.UNSAFE_LOCAL:
         return ProcessContainmentCapabilities(
@@ -152,7 +112,6 @@ def evaluate_containment_capabilities(
             ),
         )
 
-    # CONFIGURED_CONTAINER or unknown backends without explicit tree-kill verification
     return ProcessContainmentCapabilities(
         backend_name=backend,
         level=ContainmentLevel.UNSUPPORTED,
@@ -171,11 +130,7 @@ def build_lifecycle_result(
     capabilities: ProcessContainmentCapabilities,
     event: LifecycleEvent,
 ) -> ProcessContainmentResult:
-    """
-    Build a secure lifecycle audit result.
-    Prevents "Success Desync" by ensuring a parent exit code of 0 cannot
-    falsely claim verified containment if the backend leaks child processes.
-    """
+    """Build a lifecycle result without claiming unverified containment."""
     verified = capabilities.supports_atomic_tree_kill
 
     if verified:
