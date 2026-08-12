@@ -12,9 +12,7 @@ from rygnal.execution_backend import (
 )
 
 
-def test_detect_host_backend_capabilities_is_lazy(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_detect_host_backend_capabilities_is_lazy(monkeypatch: pytest.MonkeyPatch) -> None:
     def fail_probe(*args: object, **kwargs: object) -> bool:
         raise AssertionError("probe should not run during capability construction")
 
@@ -67,15 +65,11 @@ def test_verified_rootless_container_can_be_selected() -> None:
 
 
 @pytest.mark.parametrize("unsafe_local_requested", [True, False])
-def test_unsafe_local_is_explicit_dev_escape_hatch(
-    unsafe_local_requested: bool,
-) -> None:
+def test_unsafe_local_is_explicit_dev_escape_hatch(unsafe_local_requested: bool) -> None:
     if not unsafe_local_requested:
         return
 
-    selection = select_execution_backend(
-        HostBackendCapabilities(unsafe_local_requested=True)
-    )
+    selection = select_execution_backend(HostBackendCapabilities(unsafe_local_requested=True))
 
     assert selection.name == ExecutionBackendName.UNSAFE_LOCAL
     assert selection.safe_by_default is False
