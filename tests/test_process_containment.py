@@ -60,6 +60,4 @@ def test_model_prevents_parent_only_kill_from_claiming_security() -> None:
 
     assert result.cleanup_guarantee == CleanupGuarantee.POSIX_PROCESS_GROUP
     assert result.containment_verified is False
-    assert any(
-        "Parent exit code 0 does not guarantee" in lim for lim in result.limitations
-    )
+    assert any("Parent exit code 0 does not guarantee" in lim for lim in result.limitations)
