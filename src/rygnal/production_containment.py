@@ -59,7 +59,6 @@ _ALLOWED_PROBE_ENVIRONMENT = {
     "LC_ALL",
     "LOGNAME",
     "PATH",
-    "PWD",
     "RYGNAL_HOST_SECRET",
     "RYGNAL_PROBE",
     "TMPDIR",
@@ -181,7 +180,7 @@ def minimal_launcher_environment() -> dict[str, str]:
         "LC_ALL": "C.UTF-8",
         "LOGNAME": "rygnal",
         "PATH": "/usr/bin:/bin",
-        "TMPDIR": "/tmp",
+        "TMPDIR": "/tmp",  # nosec B108 - Bubblewrap sandbox-local temporary directory
         "USER": "rygnal",
     }
 
@@ -236,7 +235,7 @@ def _verify_production_bubblewrap(
         "pid_namespace": False,
         "ipc_namespace": False,
         "uts_namespace": False,
-        "net_namespace": False,
+        "network_namespace": False,
         "cgroup_namespace": False,
         "capabilities_dropped": False,
         "no_new_privileges": False,
@@ -356,7 +355,7 @@ def _verify_production_bubblewrap(
         "pid_namespace",
         "ipc_namespace",
         "uts_namespace",
-        "net_namespace",
+        "network_namespace",
         "cgroup_namespace",
         "capabilities_dropped",
         "no_new_privileges",
@@ -524,7 +523,7 @@ def _run_behavioral_probe(
         "pid_namespace": False,
         "ipc_namespace": False,
         "uts_namespace": False,
-        "net_namespace": False,
+        "network_namespace": False,
         "cgroup_namespace": False,
         "capabilities_dropped": False,
         "no_new_privileges": False,
@@ -606,11 +605,11 @@ def _run_behavioral_probe(
             "--dev",
             "/dev",
             "--tmpfs",
-            "/tmp",
+            "/tmp",  # nosec B108 - Bubblewrap sandbox-local tmpfs mount
             "--dir",
             "/var",
             "--tmpfs",
-            "/var/tmp",
+            "/var/tmp",  # nosec B108 - Bubblewrap sandbox-local tmpfs mount
             "--tmpfs",
             "/run",
             "--dir",
@@ -623,7 +622,7 @@ def _run_behavioral_probe(
             "/nonexistent",
             "--setenv",
             "TMPDIR",
-            "/tmp",
+            "/tmp",  # nosec B108 - Bubblewrap sandbox-local tmpfs mount
             "--setenv",
             "USER",
             "rygnal",
@@ -724,11 +723,7 @@ def _run_behavioral_probe(
     )
 
     if not features["host_environment_cleared"]:
-        reasons.append(
-            "Host environment variables leaked into the Bubblewrap self-test. "
-            f"Unexpected: {unexpected_environment}, "
-            f"RYGNAL_SHOULD_NOT_LEAK in env: {'RYGNAL_SHOULD_NOT_LEAK' in environment_names}"
-        )
+        reasons.append("Host environment variables leaked into the Bubblewrap self-test.")
 
     features["host_tmp_hidden"] = parsed.get("secret_visible") == "no"
 
@@ -903,7 +898,7 @@ def _first_existing(
 ) -> str | None:
     for value in paths:
         if Path(value).exists():
-            return os.path.realpath(value)
+            return value
 
     return None
 

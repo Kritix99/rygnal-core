@@ -10,7 +10,7 @@ langchain-core>=1.4.8
 fastapi>=0.115.0
 httpx>=0.28.1
 httpx2>=2.5.0
-uvicorn>=0.30.0
+uvicorn>=0.49.0
 
 maturin>=1.14.1,<2.0
 openai>=1.0.0

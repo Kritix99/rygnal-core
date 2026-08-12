@@ -36,10 +36,6 @@ quote-style = "double"
 [tool.bandit]
 exclude_dirs = ["tests"]
 skips = []
-# Only fail CI on High severity. Low/Medium findings are intentional security
-# infrastructure code (bubblewrap subprocess calls, nosec-annotated patterns).
-level = "HIGH"
-confidence = "HIGH"
 
 
 [tool.setuptools.packages.find]

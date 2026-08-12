@@ -105,7 +105,7 @@ def eligible() -> BubblewrapVerification:
             "pid_namespace": True,
             "ipc_namespace": True,
             "uts_namespace": True,
-            "net_namespace": True,
+            "network_namespace": True,
             "cgroup_namespace": True,
             "capabilities_dropped": True,
             "no_new_privileges": True,
@@ -482,9 +482,9 @@ def test_actual_linux_production_containment(
 ) -> None:
     verification = verify_production_bubblewrap()
 
-    assert verification.eligible is True, f"Failed reasons: {verification.reasons}"
+    assert verification.eligible is True
     assert verification.features["behavioral_self_test"]
-    assert verification.features["net_namespace"]
+    assert verification.features["network_namespace"]
     assert verification.features["cgroup_namespace"]
     assert verification.features["capabilities_dropped"]
     assert verification.features["no_new_privileges"]

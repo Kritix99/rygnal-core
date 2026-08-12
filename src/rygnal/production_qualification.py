@@ -17,7 +17,6 @@ import os
 import platform
 import re
 import shlex
-import shutil
 import stat
 import sys
 import tempfile
@@ -650,12 +649,6 @@ def _run_output_bound_probe(
     verification: BubblewrapVerification,
 ) -> bool:
     limits = _qualification_limits()
-    awk_path = shutil.which("awk")
-
-    if awk_path is None:
-        return False
-
-    awk_executable = Path(awk_path).resolve(strict=False).as_posix()
 
     with tempfile.TemporaryDirectory(prefix="rygnal-m18-output-") as temporary:
         workspace = Path(temporary).resolve() / "workspace"
@@ -668,7 +661,7 @@ def _run_output_bound_probe(
         try:
             result = backend.run(
                 (
-                    awk_executable,
+                    "/usr/bin/awk",
                     ('BEGIN { for (i = 0; i < 100000; i++) printf "x" }'),
                 ),
                 workspace,
@@ -930,7 +923,7 @@ def _qualification_limits() -> ProductionContainmentLimits:
         address_space_bytes=512 * 1024**2,
         file_size_bytes=2 * 1024**2,
         open_files=64,
-        processes=512,
+        processes=16,
         max_output_bytes=4096,
         termination_grace_seconds=1.0,
     )

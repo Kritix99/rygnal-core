@@ -28,10 +28,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
@@ -54,7 +54,6 @@ jobs:
           sysctl kernel.apparmor_restrict_unprivileged_userns || true
           sysctl kernel.unprivileged_userns_clone || true
           sudo chmod u-s $(which bwrap) || true
-          # Try disabling the apparmor profile for bwrap entirely
           echo "Disabling AppArmor profile for bwrap (if exists):"
           if [ -f /etc/apparmor.d/bwrap ]; then
             sudo ln -s /etc/apparmor.d/bwrap /etc/apparmor.d/disable/ || true

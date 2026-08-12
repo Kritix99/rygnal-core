@@ -2046,7 +2046,7 @@ def _build_bubblewrap_command(
     if production:
         args[1:1] = list(production_bubblewrap_hardening_flags())
 
-    for runtime_path in ("/usr", "/bin", "/lib", "/lib64", "/opt"):
+    for runtime_path in ("/usr", "/bin", "/lib", "/lib64"):
         if Path(runtime_path).exists():
             args.extend(["--ro-bind", runtime_path, runtime_path])
 
