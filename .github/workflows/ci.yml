@@ -93,6 +93,28 @@ jobs:
           fi
           bwrap --unshare-user --unshare-pid -- /bin/echo "hello from bwrap after apparmor disable" || echo "bwrap failed again!"
 
+      - name: Prepare Bubblewrap environment
+        run: |
+          set -eux
+          echo "=== Kernel settings ==="
+          uname -a
+          sysctl kernel.unprivileged_userns_clone || true
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+
+          echo "=== Enable unprivileged user namespaces ==="
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+          echo "=== Remove bwrap setuid bit ==="
+          sudo chmod u-s "$(which bwrap)" || true
+          ls -la "$(which bwrap)"
+
+          echo "=== Bubblewrap version ==="
+          bwrap --version
+
+          echo "=== Bubblewrap smoke test ==="
+          bwrap --unshare-user --unshare-pid -- /bin/echo "BWRAP_WORKS"
+
       - name: Run tests
         run: pytest -q
 
