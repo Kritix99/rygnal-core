@@ -1,0 +1,140 @@
+name: Finish remove-linux-support cleanup
+
+on:
+  push:
+    branches: [remove-linux-support]
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v6
+        with:
+          ref: remove-linux-support
+          fetch-depth: 0
+
+      - name: Remove stale Linux containment code
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          def replace_once(text: str, pattern: str, replacement: str, label: str) -> str:
+              new, count = re.subn(pattern, replacement, text, flags=re.S | re.M)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly 1 match, found {count}")
+              return new
+
+          p = Path("src/rygnal/guarded_runner.py")
+          s = p.read_text(encoding="utf-8")
+
+          s = replace_once(
+              s,
+              r"from rygnal\.production_containment import \(.*?\n\)\n",
+              "",
+              "production_containment import",
+          )
+          s = replace_once(
+              s,
+              r"from rygnal\.workspace_mounts import .*?\n",
+              "",
+              "workspace_mounts import",
+          )
+          s = replace_once(
+              s,
+              r"_IMPLEMENTED_COMMAND_BACKENDS = frozenset\(\n.*?\n\)\n",
+              "_IMPLEMENTED_COMMAND_BACKENDS = frozenset({ExecutionBackendName.UNSAFE_LOCAL})\n",
+              "implemented backend set",
+          )
+          s = replace_once(
+              s,
+              r"\n    containment_limits: ProductionContainmentLimits = field\(\n        default_factory=ProductionContainmentLimits\n    \)\n",
+              "\n",
+              "containment limits config field",
+          )
+          s = replace_once(
+              s,
+              r"\nclass BubblewrapCommandBackend:.*?(?=\n@dataclass\(frozen=True\)\nclass UnsupportedCommandBackend:)",
+              "\n",
+              "Bubblewrap command backend",
+          )
+          s = replace_once(
+              s,
+              r"\ndef _select_backend\(\n    config: GuardedRunConfig,\n\) -> ExecutionBackendSelection:.*?(?=\ndef _command_backend_for\()",
+              '''\ndef _select_backend(\n    config: GuardedRunConfig,\n) -> ExecutionBackendSelection:\n    env = os.environ.copy()\n\n    if config.unsafe_local_requested:\n        env["RYGNAL_UNSAFE_LOCAL"] = "1"\n    else:\n        env.pop("RYGNAL_UNSAFE_LOCAL", None)\n\n    capabilities = detect_host_backend_capabilities(env=env)\n    return select_execution_backend(capabilities)\n\n''',
+              "backend selector",
+          )
+          s = replace_once(
+              s,
+              r"\ndef _command_backend_for\(\n    backend_name: ExecutionBackendName,\n    \*,\n    config: GuardedRunConfig \| None = None,\n\) -> CommandBackend:.*?(?=\ndef _unsupported_command_backend_reason\()",
+              '''\ndef _command_backend_for(\n    backend_name: ExecutionBackendName,\n    *,\n    config: GuardedRunConfig | None = None,\n) -> CommandBackend:\n    if backend_name == ExecutionBackendName.UNSAFE_LOCAL:\n        return UnsafeLocalCommandBackend()\n\n    return UnsupportedCommandBackend(_unsupported_command_backend_reason(backend_name))\n\n''',
+              "command backend factory",
+          )
+          s = re.sub(
+              r"\ndef _build_bubblewrap_command\(.*?(?=\n(?:def |class ))",
+              "\n",
+              s,
+              flags=re.S,
+          )
+          p.write_text(s, encoding="utf-8")
+
+          p = Path("tests/test_guarded_runner.py")
+          s = p.read_text(encoding="utf-8")
+          s = s.replace("import shutil\n", "")
+          s = s.replace("from rygnal.recovery_session import CleanupResult, CleanupStatus\n", "")
+          s = re.sub(
+              r"\ndef bwrap_probe_available\(\) -> bool:.*?(?=\n\ndef )",
+              "\n",
+              s,
+              flags=re.S,
+          )
+          s = re.sub(
+              r"\n@pytest\.mark\.skipif\(\n\s*not bwrap_probe_available\(\),\n\s*reason=\"bubblewrap not installed or namespace probe unavailable\",\n\)\n\ndef test_bubblewrap_backend_.*?(?=\n(?:@pytest\.mark|def ))",
+              "\n",
+              s,
+              flags=re.S,
+          )
+          p.write_text(s, encoding="utf-8")
+
+          p = Path("tests/test_execution_backend.py")
+          p.write_text('''from rygnal.execution_backend import (\n    ExecutionBackendName,\n    ExecutionBackendSelectionError,\n    HostBackendCapabilities,\n    select_execution_backend,\n)\n\n\ndef test_unsafe_local_is_explicit_and_never_default() -> None:\n    selection = select_execution_backend(\n        HostBackendCapabilities(os_name="darwin", unsafe_local_requested=True)\n    )\n    assert selection.name == ExecutionBackendName.UNSAFE_LOCAL\n    assert selection.safe_by_default is False\n\n\ndef test_verified_rootless_container_is_selected() -> None:\n    selection = select_execution_backend(\n        HostBackendCapabilities(\n            os_name="linux",\n            configured_container_backend="podman",\n            verified_rootless_container_available=True,\n        )\n    )\n    assert selection.name == ExecutionBackendName.CONFIGURED_CONTAINER\n    assert selection.safe_by_default is True\n\n\ndef test_unverified_host_has_no_safe_fallback() -> None:\n    with pytest.raises(ExecutionBackendSelectionError):\n        select_execution_backend(\n            HostBackendCapabilities(\n                os_name="linux",\n                configured_container_backend="podman",\n                verified_rootless_container_available=False,\n            )\n        )\n'''.replace('from rygnal.execution_backend import (', 'import pytest\n\nfrom rygnal.execution_backend import ('), encoding="utf-8")
+
+          for path in [Path("src/rygnal/workspace_mounts.py"), Path("tests/test_workspace_mounts.py")]:
+              if path.exists():
+                  path.unlink()
+
+          workflow = Path(".github/workflows/finish-remove-linux-support.yml")
+          if workflow.exists():
+              workflow.unlink()
+          PY
+
+      - name: Format and lint
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ruff pytest
+          ruff format src tests
+          ruff check src tests
+
+      - name: Compile Python sources
+        run: python -m compileall -q src
+
+      - name: Run test suite
+        run: pytest -q
+
+      - name: Commit and push verified cleanup
+        run: |
+          if git diff --quiet; then
+            echo "No cleanup changes required."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "refactor: complete Linux backend removal"
+          git push origin remove-linux-support
