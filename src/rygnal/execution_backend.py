@@ -113,9 +113,7 @@ def detect_host_backend_capabilities(
     return HostBackendCapabilities(env=env)
 
 
-def _probe_verified_rootless_container(
-    backend_name: str | None,
-) -> bool:
+def _probe_verified_rootless_container(backend_name: str | None) -> bool:
     if backend_name == "podman":
         return _probe_podman_rootless()
     if backend_name == "docker":
