@@ -1,70 +1,82 @@
 # Known Limitations
 
-Rygnal Core is intentionally scoped as a local-first safety and containment kernel.
+Rygnal Core is intentionally scoped as a local-first safety and governance architecture foundation.
 
-## Not Production-Ready Yet
+## Not production-ready
 
-Rygnal Core should not be presented as an enterprise-grade production runtime security layer yet. It is designed as a local prototype and architecture foundation.
+Rygnal Core must not be presented as an enterprise-grade production runtime security layer. The project contains substantial policy, risk, approval, audit, recovery, CLI, and Rust safety-kernel work, but several product and containment boundaries remain incomplete.
 
-## AI-Agent Integration Status
+## No production containment backend
 
-Rygnal Core includes adapter wrappers and examples to integrate with popular AI agent frameworks:
+The current command backend implementation supports only explicit `unsafe_local` execution. A configured container backend may be detected, but it is not implemented as an executable guarded-command backend and does not provide verified containment.
 
-- **OpenAI Tool Calling**: Integrated via [openai_tool_calling_adapter.py](file:///Users/bicky/Desktop/rygnal-core/examples/openai_tool_calling_adapter.py).
-- **LangChain**: Integrated via [langchain_tool_wrapper.py](file:///Users/bicky/Desktop/rygnal-core/examples/langchain_tool_wrapper.py).
-- **MCP (Model Context Protocol)**: Integrated via [mcp_tool_call_adapter.py](file:///Users/bicky/Desktop/rygnal-core/examples/mcp_tool_call_adapter.py).
+A disposable Git workspace protects the trusted working tree from direct mutation during review, but it is not an OS-level sandbox. Process-group cleanup is lifecycle management, not a security boundary.
 
-Direct, out-of-the-box integration with other production orchestration frameworks (e.g., AutoGen, CrewAI) is not yet supported.
+Track the unresolved containment decision in [issue #274](https://github.com/Rygnal/rygnal-core/issues/274).
 
-## Approval Workflow Status
+## AI-agent integration status
 
-A local approval workflow is fully supported, including:
-- **Durable Approval Queue**: Supported via [InMemoryApprovalQueue](file:///Users/bicky/Desktop/rygnal-core/src/rygnal/approval_queue.py#L65) and [SQLiteApprovalQueue](file:///Users/bicky/Desktop/rygnal-core/src/rygnal/approval_queue.py#L160) configurations.
-- **REST API Endpoints**: Exposed via `/v1/approvals` endpoints in [api.py](file:///Users/bicky/Desktop/rygnal-core/src/rygnal/api.py).
-- **Role-Based Approvals**: Configured via [roles.yaml](file:///Users/bicky/Desktop/rygnal-core/policies/roles.yaml) and evaluated by the [ApprovalAuthorizationEngine](file:///Users/bicky/Desktop/rygnal-core/src/rygnal/approval_authorization.py).
-- **Self-Approval Protection**: Requesters are blocked from approving their own actions.
+Rygnal Core provides local adapter examples:
 
-Missing/Planned:
-- Frontend user interface (Approval UI Dashboard)
-- Notification system (e.g., Slack/Email triggers)
-- Sophisticated timeout logic for distributed multi-user approval environments
+- [OpenAI tool-calling adapter](../examples/openai_tool_calling_adapter.py)
+- [LangChain tool wrapper](../examples/langchain_tool_wrapper.py)
+- [MCP tool-call adapter](../examples/mcp_tool_call_adapter.py)
 
-## Policy Engine Status
+These are controlled examples, not a production, provider-neutral interception gateway. The first real agent-agnostic AI Reviewer pipeline is tracked in [issue #370](https://github.com/Rygnal/rygnal-core/issues/370).
 
-The Policy Engine supports:
-- **Prioritized Rules**: Policy rules are sorted by a `priority` field and evaluated sequentially (precedence-based decisions).
-- **Policy Versioning**: Policies specify a schema-validated version (e.g., `policy.v2`).
-- **Richer Match Conditions**: Evaluation supports metadata matching, input scanning, and risk thresholds.
+## Approval workflow status
 
-Limitations:
-- No OPA/Rego support yet
-- No complex contextual logic (e.g., temporal or multi-stage state conditions)
-- No organization-level policy management
+Implemented local components include:
 
-## Risk Engine Status
+- [In-memory and SQLite approval queues](../src/rygnal/approval_queue.py)
+- [Approval API endpoints](../src/rygnal/api.py)
+- [Role-based authorization](../src/rygnal/approval_authorization.py)
+- [Role policy](../policies/roles.yaml)
+- Self-approval protection
+- Patch digest and baseline binding
+- Durable patch artifacts and recovery reconciliation
 
-The Risk Engine leverages both high-performance Rust safety primitives and PyO3 native extensions (e.g. AST parsing, path safety checks) alongside subjective risk evaluations (survival ratios, ownership multipliers).
+The Go local approval flow is not yet fully connected to the shared Python approval queue. This remaining contract is tracked in [issue #333](https://github.com/Rygnal/rygnal-core/issues/333).
 
-Limitations:
-- Static secret pattern matching (limited regex patterns)
-- Gaps in dynamic threat intelligence
-- No agent behavior history tracking
+Still missing:
 
-## Tool Adapters are Local/Sandboxed
+- Frontend approval dashboard
+- Notification delivery
+- Distributed multi-user approval coordination
+- Enterprise identity and SSO
 
-Current adapters are controlled local adapters. They are not full production adapters.
+## UI/TUI status
 
-## External API Adapter is Dry-Run
+The Go CLI and terminal approval components exist, but a canonical user-experience proposal covering event mapping, privacy defaults, risk presentation, and the minimum first TUI milestone remains open in [issue #348](https://github.com/Rygnal/rygnal-core/issues/348).
 
-External send does not perform real network transmission. This is intentional for safety.
+## Policy-engine limitations
 
-## SaaS and Dashboard Status
+The policy engine supports prioritized rules, schema validation, metadata conditions, input matching, and risk thresholds.
 
-A full SaaS layer remains out of scope for the current local-first CLI/Core release.
-- **Audit Queries**: Supported via the local FastAPI service query endpoints.
-- **No SaaS Frontend UI**: Missing a visual dashboard, policy editor, user authentication (SSO/Identity providers), team management, or billing features.
+It does not currently provide:
 
-## Summary
+- OPA/Rego support
+- Organization-level policy distribution
+- Rich temporal or distributed policy state
+- Central policy administration
 
-Rygnal Core is useful for architecture validation, local demos, and core runtime development. It is not yet a complete enterprise product.
+## Risk-engine limitations
 
+The risk system combines Python orchestration with Rust/PyO3 safety primitives, including path checks and Tree-Sitter-based semantic analysis.
+
+Remaining limitations include:
+
+- Static secret-pattern coverage
+- Limited dynamic threat intelligence
+- No production agent behavior-history service
+- Fallback telemetry and operational observability gaps tracked in [issue #298](https://github.com/Rygnal/rygnal-core/issues/298)
+
+## Local service and SaaS scope
+
+The local FastAPI service exposes approval and audit operations. Rygnal Core does not include a SaaS control plane, multi-tenancy, billing, enterprise authentication, SIEM integration, or a production web dashboard.
+
+## Current architecture truth
+
+Use [Architecture Status and Issue Evidence](architecture-status.md) for implementation evidence and [Architecture Roadmap](architecture-roadmap.md) for active sequencing.
+
+Rygnal Core is useful for architecture validation, local experimentation, and continued development. It is not yet a complete production security product.
