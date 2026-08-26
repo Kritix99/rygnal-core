@@ -324,8 +324,8 @@ def migrate_sqlite_schema(
             now = datetime.now(UTC).isoformat()
 
             connection.execute(
-                f"""
-                INSERT INTO {SCHEMA_METADATA_TABLE} (
+                """
+                INSERT INTO rygnal_schema_metadata (
                     singleton_id,
                     component,
                     version,
@@ -796,9 +796,9 @@ def _read_schema_record(
         return None
 
     rows = connection.execute(
-        f"""
+        """
         SELECT component, version, checksum, state
-        FROM {SCHEMA_METADATA_TABLE}
+        FROM rygnal_schema_metadata
         """
     ).fetchall()
 

@@ -105,4 +105,3 @@ This layout supports the active Rygnal architecture:
 - Go owns CLI/TUI surfaces.
 - Python owns orchestration and guarded engine decisions.
 - Rust owns deterministic safety primitives.
-- Bubblewrap hardening remains the production Linux containment track.

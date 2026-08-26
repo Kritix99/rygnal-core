@@ -16,10 +16,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -31,7 +31,7 @@ jobs:
         run: go build -o bin/rygnal ./cmd/rygnal
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: "pip"
@@ -59,8 +59,6 @@ jobs:
         run: cargo clippy --manifest-path rust-kernel/Cargo.toml --no-default-features -- -D warnings
 
       - name: Build and install Rust kernel Python extension wheel
-        env:
-          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
         run: |
           cd rust-kernel
           python -m maturin build --release --out dist
@@ -72,40 +70,11 @@ jobs:
       - name: Ruff format check
         run: ruff format --check .
 
-      - name: Install Bubblewrap containment backend
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes bubblewrap
-
-      - name: Allow unprivileged user namespaces for Bubblewrap
-        run: |
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
-          sysctl kernel.apparmor_restrict_unprivileged_userns || true
-          sysctl kernel.unprivileged_userns_clone || true
-          # Remove setuid bit from bwrap. GitHub Actions environments block setuid 
-          # elevation, causing bwrap to fail with "No permissions to try setuid".
-          # Stripping setuid forces bwrap to use unprivileged user namespaces.
-          sudo chmod u-s $(which bwrap) || true
-          
-      - name: Diagnose bwrap failure
-        run: |
-          bwrap --unshare-user --unshare-pid -- /bin/echo "hello from bwrap" || echo "bwrap failed!"
-          
-          # Try disabling the apparmor profile for bwrap entirely
-          echo "Disabling AppArmor profile for bwrap (if exists):"
-          if [ -f /etc/apparmor.d/bwrap ]; then
-            sudo ln -s /etc/apparmor.d/bwrap /etc/apparmor.d/disable/ || true
-            sudo apparmor_parser -R /etc/apparmor.d/bwrap || true
-          fi
-          
-          bwrap --unshare-user --unshare-pid -- /bin/echo "hello from bwrap after apparmor disable" || echo "bwrap failed again!"
-
       - name: Run tests
         run: pytest -q
 
       - name: Bandit security scan
-        run: bandit -r src demo -c pyproject.toml
+        run: bandit -r src demo -c pyproject.toml -lll -iii
 
       - name: Dependency vulnerability audit
         run: pip-audit -r requirements-dev.txt

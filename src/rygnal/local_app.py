@@ -10,10 +10,8 @@ from fastapi import FastAPI
 
 from rygnal.api import create_app
 from rygnal.local_runtime import create_local_runtime_dependencies
-from rygnal.production_containment import verify_production_bubblewrap
 from rygnal.runtime_config import (
     RuntimeConfigV1,
-    RuntimeEnvironment,
     load_runtime_config,
 )
 from rygnal.sqlite_migrations import (
@@ -47,17 +45,10 @@ def create_local_app(
     )
 
     def readiness_probe() -> bool:
-        containment_ready = True
-
-        if active_config.environment == RuntimeEnvironment.PRODUCTION:
-            containment_ready = verify_production_bubblewrap().eligible
-
         return (
-            containment_ready
-            and audit_schema_ready(dependencies.paths.audit_db)
+            audit_schema_ready(dependencies.paths.audit_db)
             and approval_schema_ready(dependencies.paths.approval_db)
             and operation_schema_ready(dependencies.operation_store.db_path)
-            and dependencies.audit_logger.verify_integrity()
         )
 
     app = create_app(

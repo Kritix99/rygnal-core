@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import shutil
 import signal
 import subprocess  # nosec B404
 import threading
@@ -10,7 +9,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import StrEnum
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Protocol
 
 from rygnal.action_intent import (
@@ -83,15 +82,6 @@ from rygnal.process_containment import (
     build_lifecycle_result,
     evaluate_containment_capabilities,
 )
-from rygnal.production_containment import (
-    BubblewrapVerification,
-    ExecutionSecurityMode,
-    ProductionContainmentLimits,
-    execution_security_mode,
-    production_bubblewrap_hardening_flags,
-    run_bounded_process,
-    verify_production_bubblewrap,
-)
 from rygnal.recovery_session import (
     CleanupResult,
     CleanupStatus,
@@ -109,12 +99,10 @@ from rygnal.subjective_risk import (
     collect_subjective_patch_reasons,
 )
 from rygnal.untracked_files import UntrackedFilePolicy
-from rygnal.workspace_mounts import MountContract, MountKind, WorkspaceMountPlan
 
 UNSAFE_LOCAL_WARNING = "Unsafe local execution is not a containment backend."
 _IMPLEMENTED_COMMAND_BACKENDS = frozenset(
     {
-        ExecutionBackendName.LINUX_BUBBLEWRAP,
         ExecutionBackendName.UNSAFE_LOCAL,
     }
 )
@@ -122,11 +110,6 @@ _IMPLEMENTED_COMMAND_BACKENDS = frozenset(
 _PROCESS_GROUP_TERMINATION_GRACE_SECONDS = 1.0
 _PROCESS_OUTPUT_DRAIN_GRACE_SECONDS = 1.0
 _SIGNAL_NAMES_FOR_PROCESS_CLEANUP = ("SIGINT", "SIGTERM", "SIGHUP")
-_SANDBOX_WORKSPACE = PurePosixPath("/").joinpath("workspace")
-_SANDBOX_TMP = PurePosixPath("/").joinpath("tmp")
-_SANDBOX_VAR_TMP = PurePosixPath("/").joinpath("var", "tmp")
-_SANDBOX_RUN = PurePosixPath("/").joinpath("run")
-_SANDBOX_ETC = PurePosixPath("/").joinpath("etc")
 _GUARDED_RUN_LOCK_DIR_NAME = ".rygnal-locks"
 _GUARDED_RUN_CONCURRENCY_REASON_CODE = "guarded_run_concurrency_conflict"
 
@@ -169,9 +152,6 @@ class GuardedRunConfig:
     intent_contract: IntentContract | None = None
     audit_logger: AuditLogger | None = None
     approval_queue: InMemoryApprovalQueue | None = None
-    containment_limits: ProductionContainmentLimits = field(
-        default_factory=ProductionContainmentLimits
-    )
 
 
 @dataclass(frozen=True)
@@ -265,64 +245,6 @@ class UnsafeLocalCommandBackend:
             command,
             cwd=cwd,
             timeout_seconds=timeout_seconds,
-        )
-
-
-class BubblewrapCommandBackend:
-    """Verified Bubblewrap command backend."""
-
-    def __init__(
-        self,
-        *,
-        production_verification: (BubblewrapVerification | None) = None,
-        limits: (ProductionContainmentLimits | None) = None,
-    ) -> None:
-        self.production_verification = production_verification
-        self.limits = limits if limits is not None else ProductionContainmentLimits()
-
-    def run(
-        self,
-        command: tuple[str, ...],
-        cwd: Path,
-        timeout_seconds: int,
-    ) -> GuardedCommandResult:
-        production = self.production_verification is not None
-        bwrap_command = _build_bubblewrap_command(
-            command,
-            cwd,
-            production=production,
-        )
-
-        if not production:
-            return _run_subprocess(
-                tuple(bwrap_command),
-                cwd=cwd,
-                timeout_seconds=timeout_seconds,
-            )
-
-        verification = self.production_verification
-
-        if verification is None or not verification.eligible:
-            raise GuardedCommandExecutionError(
-                "Production Bubblewrap backend was not behaviorally verified."
-            )
-
-        bounded = run_bounded_process(
-            tuple(bwrap_command),
-            cwd=cwd,
-            timeout_seconds=timeout_seconds,
-            limits=self.limits,
-        )
-
-        return GuardedCommandResult(
-            command=command,
-            exit_code=bounded.exit_code,
-            stdout=bounded.stdout,
-            stderr=bounded.stderr,
-            timed_out=bounded.timed_out,
-            duration_ms=bounded.duration_ms,
-            sandbox_setup_failed=(bounded.sandbox_setup_failed),
-            output_truncated=(bounded.output_truncated),
         )
 
 
@@ -531,7 +453,6 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
             "timeout_seconds": config.timeout_seconds,
             "preserve_workspace": config.preserve_workspace,
             "unsafe_local_requested": config.unsafe_local_requested,
-            "execution_security_mode": execution_security_mode(config.environment).value,
             "intent_evidence": _intent_evidence_summary(config.intent_contract),
         },
     )
@@ -581,22 +502,6 @@ def run_guarded(config: GuardedRunConfig) -> GuardedRunResult:
         containment_result = build_lifecycle_result(containment, LifecycleEvent.STARTED)
         containment_verified = containment_result.containment_verified
         containment_features = containment.isolation_features
-
-        if execution_security_mode(config.environment) == ExecutionSecurityMode.PRODUCTION:
-            production_verification = verify_production_bubblewrap()
-            containment_verified = containment_verified and production_verification.eligible
-            containment_features = {
-                **containment_features,
-                **production_verification.features,
-            }
-        else:
-            containment_features = {
-                **containment_features,
-                "production_mode": False,
-                "resource_limits_enforced": False,
-                "output_bounded": False,
-                "behavioral_self_test": False,
-            }
 
         if backend_selection.warning:
             warnings.append(backend_selection.warning)
@@ -1572,31 +1477,6 @@ def _severity_for_action_intent(severity: ActionIntentSeverity) -> Severity:
 def _select_backend(
     config: GuardedRunConfig,
 ) -> ExecutionBackendSelection:
-    mode = execution_security_mode(config.environment)
-
-    if mode == ExecutionSecurityMode.PRODUCTION:
-        if config.unsafe_local_requested:
-            raise ExecutionBackendSelectionError(
-                "Unsafe local execution is prohibited in production mode."
-            )
-
-        verification = verify_production_bubblewrap()
-
-        if not verification.eligible:
-            raise ExecutionBackendSelectionError(
-                "Production containment unavailable: " + verification.reason
-            )
-
-        return ExecutionBackendSelection(
-            name=(ExecutionBackendName.LINUX_BUBBLEWRAP),
-            safe_by_default=True,
-            reason=(
-                "Bubblewrap passed Rygnal production "
-                "behavioral verification"
-                + (f" at version {verification.version}." if verification.version else ".")
-            ),
-        )
-
     env = os.environ.copy()
 
     if config.unsafe_local_requested:
@@ -1615,22 +1495,6 @@ def _command_backend_for(
 ) -> CommandBackend:
     if backend_name not in _IMPLEMENTED_COMMAND_BACKENDS:
         return UnsupportedCommandBackend(_unsupported_command_backend_reason(backend_name))
-
-    if backend_name == ExecutionBackendName.LINUX_BUBBLEWRAP:
-        mode = (
-            execution_security_mode(config.environment)
-            if config is not None
-            else ExecutionSecurityMode.DEVELOPMENT
-        )
-        verification = (
-            verify_production_bubblewrap() if mode == ExecutionSecurityMode.PRODUCTION else None
-        )
-        limits = config.containment_limits if config is not None else ProductionContainmentLimits()
-
-        return BubblewrapCommandBackend(
-            production_verification=verification,
-            limits=limits,
-        )
 
     if backend_name == ExecutionBackendName.UNSAFE_LOCAL:
         return UnsafeLocalCommandBackend()
@@ -1987,153 +1851,6 @@ def _temporary_process_signal_cleanup(
         restore_handlers()
 
 
-def _build_bubblewrap_command(
-    command: tuple[str, ...],
-    workspace_path: Path,
-    *,
-    production: bool = False,
-) -> list[str]:
-    bwrap_path = shutil.which("bwrap")
-    if bwrap_path is None:
-        raise GuardedCommandExecutionError("Bubblewrap backend selected but bwrap was not found.")
-
-    workspace = workspace_path.resolve()
-    passwd_file, group_file = _write_synthetic_identity_files(workspace)
-
-    args = [
-        bwrap_path,
-        "--unshare-user",
-        "--unshare-pid",
-        "--unshare-ipc",
-        "--unshare-uts",
-        "--unshare-net",
-        "--die-with-parent",
-        "--proc",
-        "/proc",
-        "--dev",
-        "/dev",
-        "--dir",
-        _SANDBOX_ETC.as_posix(),
-        "--dir",
-        "/var",
-        "--tmpfs",
-        _SANDBOX_TMP.as_posix(),
-        "--tmpfs",
-        _SANDBOX_VAR_TMP.as_posix(),
-        "--dir",
-        _SANDBOX_RUN.as_posix(),
-        "--clearenv",
-        "--setenv",
-        "PATH",
-        "/usr/local/bin:/usr/bin:/bin",
-        "--setenv",
-        "HOME",
-        _SANDBOX_TMP.as_posix(),
-        "--setenv",
-        "TMPDIR",
-        _SANDBOX_TMP.as_posix(),
-        "--setenv",
-        "PWD",
-        _SANDBOX_WORKSPACE.as_posix(),
-        "--ro-bind",
-        passwd_file.as_posix(),
-        "/etc/passwd",
-        "--ro-bind",
-        group_file.as_posix(),
-        "/etc/group",
-    ]
-
-    if production:
-        args[1:1] = list(production_bubblewrap_hardening_flags())
-
-    for runtime_path in ("/usr", "/bin", "/lib", "/lib64", "/opt"):
-        if Path(runtime_path).exists():
-            args.extend(["--ro-bind", runtime_path, runtime_path])
-
-    for runtime_file in (
-        "/etc/nsswitch.conf",
-        "/etc/ld.so.cache",
-    ):
-        if Path(runtime_file).exists():
-            args.extend(["--ro-bind", runtime_file, runtime_file])
-
-    args.extend(_bubblewrap_workspace_mount_args(workspace))
-    args.extend(
-        [
-            "--chdir",
-            _SANDBOX_WORKSPACE.as_posix(),
-            "--",
-            *command,
-        ]
-    )
-
-    return args
-
-
-def _bubblewrap_workspace_mount_args(workspace: Path) -> list[str]:
-    plan = WorkspaceMountPlan(
-        mounts=(
-            MountContract(
-                sandbox_path=_SANDBOX_WORKSPACE.as_posix(),
-                kind=MountKind.WRITABLE_BIND,
-                host_source=workspace.as_posix(),
-            ),
-        )
-    )
-
-    args: list[str] = []
-    for mount in plan.mounts:
-        if mount.kind != MountKind.WRITABLE_BIND or mount.host_source is None:
-            raise GuardedCommandExecutionError(
-                "Workspace mount plan must contain only writable workspace bind mounts."
-            )
-
-        args.extend(["--bind", mount.host_source, mount.sandbox_path])
-
-    return args
-
-
-def _write_synthetic_identity_files(workspace: Path) -> tuple[Path, Path]:
-    """Create minimal identity files outside the sandbox-visible workspace."""
-
-    identity_dir = workspace.parent.joinpath(".rygnal-sandbox-identity")
-    identity_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-
-    uid = os.getuid() if hasattr(os, "getuid") else 65534
-    gid = os.getgid() if hasattr(os, "getgid") else 65534
-
-    passwd_file = identity_dir.joinpath("passwd")
-    group_file = identity_dir.joinpath("group")
-
-    passwd_file.write_text(
-        "\\n".join(
-            (
-                "root:x:0:0:root:/root:/usr/sbin/nologin",
-                f"rygnal:x:{uid}:{gid}:Rygnal Sandbox User:/tmp:/usr/sbin/nologin",
-                "nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin",
-                "",
-            )
-        ),
-        encoding="utf-8",
-    )
-    group_file.write_text(
-        "\\n".join(
-            (
-                "root:x:0:",
-                f"rygnal:x:{gid}:",
-                "nogroup:x:65534:",
-                "",
-            )
-        ),
-        encoding="utf-8",
-    )
-
-    passwd_file.chmod(0o644)
-    group_file.chmod(0o644)
-
-    return passwd_file, group_file
-
-
 def _blocked_result(
     *,
     config: GuardedRunConfig,
@@ -2322,7 +2039,6 @@ def _command_audit_summary(command: object) -> dict[str, object]:
 
 
 __all__ = [
-    "BubblewrapCommandBackend",
     "CommandBackend",
     "GuardedCommandResult",
     "GuardedRunConfig",

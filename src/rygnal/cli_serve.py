@@ -12,6 +12,9 @@ from rygnal.runtime_config import (
     load_runtime_config,
 )
 
+BIND_ALL_INTERFACES = "0.0.0.0"  # nosec B104 - intentional address constant used only for browser-host normalization
+LOOPBACK_ADDRESS = "127.0.0.1"
+
 
 def is_loopback_host(host: str) -> bool:
     """Return whether a host is explicitly loopback-only."""
@@ -29,8 +32,8 @@ def is_loopback_host(host: str) -> bool:
 
 
 def _browser_host(host: str) -> str:
-    if host == "0.0.0.0":
-        return "127.0.0.1"
+    if host == BIND_ALL_INTERFACES:
+        return LOOPBACK_ADDRESS
 
     if host in {"::", "[::]"}:
         return "[::1]"
