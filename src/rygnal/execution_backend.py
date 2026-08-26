@@ -49,19 +49,19 @@ class HostBackendCapabilities:
             if configured_container_backend is not None
             else self._env.get("RYGNAL_CONFIGURED_CONTAINER_BACKEND")
         )
+
         self.unsafe_local_requested = (
             unsafe_local_requested
             if unsafe_local_requested is not None
             else self._env.get("RYGNAL_UNSAFE_LOCAL") == "1"
         )
-        self._verified_rootless_container_override = (
-            verified_rootless_container_available
-        )
+        self._verified_rootless_container_override = verified_rootless_container_available
 
     @property
     def verified_rootless_container_available(self) -> bool:
         if self._verified_rootless_container_override is not None:
             return self._verified_rootless_container_override
+
         return _probe_verified_rootless_container(self.configured_container_backend)
 
 
@@ -145,7 +145,7 @@ def _probe_docker_rootless() -> bool:
         return False
     try:
         result = subprocess.run(  # nosec B603
-            [executable, "info", "--format", "{{.SecurityOptions}}"],
+            [executable, "info", "--format", "{{json .SecurityOptions}}"],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,

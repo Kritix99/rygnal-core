@@ -1,5 +1,4 @@
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -91,64 +90,22 @@ def audit_text(path: Path) -> str:
 
 def no_backend_capabilities() -> HostBackendCapabilities:
     return HostBackendCapabilities(
-        os_name="linux",
-        has_bwrap=False,
-        bwrap_namespace_probe_passed=False,
-        signed_sandbox_helper_probe_passed=False,
-        has_systemd_run=False,
+        configured_container_backend=None,
         verified_rootless_container_available=False,
         unsafe_local_requested=False,
     )
 
 
-def systemd_only_capabilities() -> HostBackendCapabilities:
-    return HostBackendCapabilities(
-        os_name="linux",
-        has_bwrap=False,
-        bwrap_namespace_probe_passed=False,
-        signed_sandbox_helper_probe_passed=False,
-        has_systemd_run=True,
-        verified_rootless_container_available=False,
-        unsafe_local_requested=False,
-    )
-
-
-def bwrap_probe_available() -> bool:
-    bwrap = shutil.which("bwrap")
-    if bwrap is None:
-        return False
-
-    result = subprocess.run(
-        [
-            bwrap,
-            "--unshare-user",
-            "--unshare-pid",
-            "--ro-bind",
-            "/",
-            "/",
-            "--proc",
-            "/proc",
-            "true",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=3,
-    )
-    return result.returncode == 0
-
-
-def test_macos_without_verified_backend_blocks_as_guarded_result(
+def test_without_verified_backend_blocks_as_guarded_result(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo = create_repo(tmp_path / "repo")
     audit = AuditLogger(tmp_path / "audit.jsonl")
 
-    def macos_capabilities(*, env=None):
+    def unavailable_capabilities(*, env=None):
         unsafe_requested = (env or {}).get("RYGNAL_UNSAFE_LOCAL") == "1"
         return HostBackendCapabilities(
-            os_name="darwin",
             configured_container_backend=None,
             verified_rootless_container_available=False,
             unsafe_local_requested=unsafe_requested,
@@ -157,7 +114,7 @@ def test_macos_without_verified_backend_blocks_as_guarded_result(
     monkeypatch.setattr(
         guarded_runner,
         "detect_host_backend_capabilities",
-        macos_capabilities,
+        unavailable_capabilities,
     )
 
     result = run_guarded(
@@ -167,7 +124,7 @@ def test_macos_without_verified_backend_blocks_as_guarded_result(
                 "from pathlib import Path; Path('should_not_run.txt').write_text('should not run')"
             ),
             rygnal_run_root=tmp_path / "runs",
-            trace_id="trace_macos_blocked",
+            trace_id="trace_no_backend_blocked",
             audit_logger=audit,
         )
     )
@@ -178,25 +135,22 @@ def test_macos_without_verified_backend_blocks_as_guarded_result(
     assert result.patch_diff is None
     assert result.change_risk_report is None
     assert result.blocked_reason is not None
-    assert "macOS is recognized" in result.blocked_reason
-    assert "Seatbelt containment is planned" in result.blocked_reason
-    assert "verified rootless container backend" in result.blocked_reason
-    assert "supported Linux backend" in result.blocked_reason
+    assert "No verified containment backend" in result.blocked_reason
+    assert "supported rootless container backend" in result.blocked_reason
     assert not (repo / "should_not_run.txt").exists()
     assert "guarded_run.backend_blocked" in audit_actions(audit)
     assert audit.verify_integrity()
 
 
-def test_macos_explicit_unsafe_local_escape_hatch_still_runs(
+def test_explicit_unsafe_local_escape_hatch_still_runs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo = create_repo(tmp_path / "repo")
 
-    def macos_capabilities(*, env=None):
+    def unavailable_capabilities(*, env=None):
         unsafe_requested = (env or {}).get("RYGNAL_UNSAFE_LOCAL") == "1"
         return HostBackendCapabilities(
-            os_name="darwin",
             configured_container_backend=None,
             verified_rootless_container_available=False,
             unsafe_local_requested=unsafe_requested,
@@ -205,7 +159,7 @@ def test_macos_explicit_unsafe_local_escape_hatch_still_runs(
     monkeypatch.setattr(
         guarded_runner,
         "detect_host_backend_capabilities",
-        macos_capabilities,
+        unavailable_capabilities,
     )
 
     result = run_guarded(unsafe_config(repo, py_command("print('ok')")))
@@ -504,80 +458,14 @@ def test_unsupported_selected_backend_blocks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo = create_repo(tmp_path / "repo")
+    audit = AuditLogger(tmp_path / "audit.jsonl")
     monkeypatch.setattr(
         "rygnal.guarded_runner.detect_host_backend_capabilities",
-        lambda env=None: systemd_only_capabilities(),
-    )
-
-    result = run_guarded(
-        GuardedRunConfig(
-            trusted_repo_path=repo,
-            command=py_command("print('blocked')"),
-            rygnal_run_root=tmp_path / "runs",
-        )
-    )
-
-    assert result.status == GuardedRunStatus.BLOCKED
-    assert result.backend_name == "linux_systemd_user"
-    assert "not implemented" in result.blocked_reason
-
-
-@pytest.mark.parametrize(
-    ("expected_backend_name", "capability_kwargs"),
-    (
-        (
-            "linux_bubblewrap_helper",
-            {
-                "os_name": "linux",
-                "bwrap_namespace_probe_passed": False,
-                "signed_sandbox_helper_probe_passed": True,
-                "has_systemd_run": False,
-                "verified_rootless_container_available": False,
-            },
+        lambda env=None: HostBackendCapabilities(
+            configured_container_backend="podman",
+            verified_rootless_container_available=True,
+            unsafe_local_requested=False,
         ),
-        (
-            "linux_systemd_user",
-            {
-                "os_name": "linux",
-                "bwrap_namespace_probe_passed": False,
-                "signed_sandbox_helper_probe_passed": False,
-                "has_systemd_run": True,
-                "verified_rootless_container_available": False,
-            },
-        ),
-        (
-            "configured_container",
-            {
-                "os_name": "linux",
-                "bwrap_namespace_probe_passed": False,
-                "signed_sandbox_helper_probe_passed": False,
-                "has_systemd_run": False,
-                "configured_container_backend": "podman",
-                "verified_rootless_container_available": True,
-            },
-        ),
-    ),
-)
-def test_unimplemented_selected_safe_backends_block_before_command_execution(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    expected_backend_name: str,
-    capability_kwargs: dict[str, object],
-) -> None:
-    repo = create_repo(tmp_path / "repo")
-    audit = AuditLogger(tmp_path / "audit.jsonl")
-
-    def selected_capabilities(*, env=None):
-        unsafe_requested = (env or {}).get("RYGNAL_UNSAFE_LOCAL") == "1"
-        return HostBackendCapabilities(
-            unsafe_local_requested=unsafe_requested,
-            **capability_kwargs,
-        )
-
-    monkeypatch.setattr(
-        guarded_runner,
-        "detect_host_backend_capabilities",
-        selected_capabilities,
     )
 
     result = run_guarded(
@@ -587,16 +475,16 @@ def test_unimplemented_selected_safe_backends_block_before_command_execution(
                 "from pathlib import Path; Path('should_not_run.txt').write_text('ran')"
             ),
             rygnal_run_root=tmp_path / "runs",
-            trace_id=f"trace_{expected_backend_name}",
+            trace_id="trace_configured_container",
             audit_logger=audit,
         )
     )
 
     assert result.status == GuardedRunStatus.BLOCKED
-    assert result.backend_name == expected_backend_name
+    assert result.backend_name == "configured_container"
     assert result.command_result is None
     assert result.workspace_path is None
-    assert "not implemented" in (result.blocked_reason or "")
+    assert "not implemented" in result.blocked_reason
     assert not (repo / "should_not_run.txt").exists()
     assert "guarded_run.backend_blocked" in audit_actions(audit)
     assert audit.verify_integrity()
@@ -856,72 +744,6 @@ def test_blocked_run_is_audited(tmp_path: Path) -> None:
     assert audit.verify_integrity()
 
 
-def test_bubblewrap_workspace_bind_uses_workspace_mount_contract(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import rygnal.guarded_runner as guarded_runner_module
-
-    monkeypatch.setattr(
-        guarded_runner_module.shutil,
-        "which",
-        lambda name: "/usr/bin/bwrap" if name == "bwrap" else None,
-    )
-
-    command = guarded_runner_module._build_bubblewrap_command(
-        ("python", "-c", "print('ok')"),
-        tmp_path,
-    )
-
-    writable_binds = [
-        tuple(command[index + 1 : index + 3])
-        for index, item in enumerate(command)
-        if item == "--bind"
-    ]
-
-    assert writable_binds == [(tmp_path.resolve().as_posix(), "/workspace")]
-
-
-@pytest.mark.skipif(
-    not bwrap_probe_available(),
-    reason="bubblewrap not installed or namespace probe unavailable",
-)
-def test_bubblewrap_backend_can_run_simple_command(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repo = create_repo(tmp_path / "repo")
-
-    monkeypatch.setattr(
-        "rygnal.guarded_runner.detect_host_backend_capabilities",
-        lambda env=None: HostBackendCapabilities(
-            os_name="linux",
-            has_bwrap=True,
-            bwrap_namespace_probe_passed=True,
-            signed_sandbox_helper_probe_passed=False,
-            has_systemd_run=False,
-            verified_rootless_container_available=False,
-            unsafe_local_requested=False,
-        ),
-    )
-
-    result = run_guarded(
-        GuardedRunConfig(
-            trusted_repo_path=repo,
-            command=py_command("from pathlib import Path; Path('bwrap.txt').write_text('ok')"),
-            timeout_seconds=5,
-            rygnal_run_root=tmp_path / "runs",
-            preserve_workspace=True,
-        )
-    )
-
-    assert result.status == GuardedRunStatus.COMPLETED
-    assert result.backend_name == "linux_bubblewrap"
-    assert result.containment_verified is True
-    assert Path(result.workspace_path, "bwrap.txt").read_text(encoding="utf-8") == "ok"
-    assert not (repo / "bwrap.txt").exists()
-
-
 def test_high_risk_dependency_patch_requires_approval_before_completion(tmp_path: Path) -> None:
     repo = create_repo(tmp_path / "repo")
     audit = AuditLogger(tmp_path / "audit.jsonl")
@@ -1115,296 +937,6 @@ def test_subjective_locked_file_blocks_guarded_patch(tmp_path: Path) -> None:
     assert result.cleanup_performed is True
     assert not Path(result.workspace_path).exists()
     assert audit.verify_integrity()
-
-
-def test_bubblewrap_command_contains_production_hardening_flags(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import rygnal.guarded_runner as guarded_runner_module
-
-    monkeypatch.setattr(
-        guarded_runner_module.shutil,
-        "which",
-        lambda name: "/usr/bin/bwrap" if name == "bwrap" else None,
-    )
-
-    command = guarded_runner_module._build_bubblewrap_command(
-        ("python", "-c", "print('ok')"),
-        tmp_path,
-    )
-
-    assert "--unshare-user" in command
-    assert "--unshare-pid" in command
-    assert "--unshare-ipc" in command
-    assert "--unshare-uts" in command
-    assert "--unshare-net" in command
-    assert "--die-with-parent" in command
-    assert "--clearenv" in command
-    assert ["--proc", "/proc"] == command[command.index("--proc") : command.index("--proc") + 2]
-    assert ["--dev", "/dev"] == command[command.index("--dev") : command.index("--dev") + 2]
-    assert "/tmp" in [command[index + 1] for index, item in enumerate(command) if item == "--tmpfs"]
-    assert "/var/tmp" in [
-        command[index + 1] for index, item in enumerate(command) if item == "--tmpfs"
-    ]
-
-
-def test_bubblewrap_command_masks_host_identity_files(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import rygnal.guarded_runner as guarded_runner_module
-
-    monkeypatch.setattr(
-        guarded_runner_module.shutil,
-        "which",
-        lambda name: "/usr/bin/bwrap" if name == "bwrap" else None,
-    )
-
-    command = guarded_runner_module._build_bubblewrap_command(
-        ("python", "-c", "print('ok')"),
-        tmp_path,
-    )
-
-    ro_binds = [
-        tuple(command[index + 1 : index + 3])
-        for index, item in enumerate(command)
-        if item == "--ro-bind"
-    ]
-
-    passwd_sources = [source for source, dest in ro_binds if dest == "/etc/passwd"]
-    group_sources = [source for source, dest in ro_binds if dest == "/etc/group"]
-
-    assert passwd_sources
-    assert group_sources
-    assert "/etc/passwd" not in passwd_sources
-    assert "/etc/group" not in group_sources
-
-    passwd_text = Path(passwd_sources[0]).read_text(encoding="utf-8")
-    group_text = Path(group_sources[0]).read_text(encoding="utf-8")
-
-    assert "rygnal:x:" in passwd_text
-    assert "Rygnal Sandbox User" in passwd_text
-    assert "rygnal:x:" in group_text
-
-
-def test_bubblewrap_command_binds_only_workspace_as_writable(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import rygnal.guarded_runner as guarded_runner_module
-
-    monkeypatch.setattr(
-        guarded_runner_module.shutil,
-        "which",
-        lambda name: "/usr/bin/bwrap" if name == "bwrap" else None,
-    )
-
-    command = guarded_runner_module._build_bubblewrap_command(
-        ("python", "-c", "print('ok')"),
-        tmp_path,
-    )
-
-    writable_binds = [
-        tuple(command[index + 1 : index + 3])
-        for index, item in enumerate(command)
-        if item == "--bind"
-    ]
-
-    assert writable_binds == [(tmp_path.resolve().as_posix(), "/workspace")]
-    assert ["--chdir", "/workspace"] == command[
-        command.index("--chdir") : command.index("--chdir") + 2
-    ]
-
-
-@pytest.mark.skipif(
-    not bwrap_probe_available(),
-    reason="bubblewrap not installed or namespace probe unavailable",
-)
-def test_bubblewrap_backend_blocks_network_access(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repo = create_repo(tmp_path / "repo")
-
-    monkeypatch.setattr(
-        "rygnal.guarded_runner.detect_host_backend_capabilities",
-        lambda env=None: HostBackendCapabilities(
-            os_name="linux",
-            has_bwrap=True,
-            bwrap_namespace_probe_passed=True,
-            signed_sandbox_helper_probe_passed=False,
-            has_systemd_run=False,
-            verified_rootless_container_available=False,
-            unsafe_local_requested=False,
-        ),
-    )
-
-    result = run_guarded(
-        GuardedRunConfig(
-            trusted_repo_path=repo,
-            command=py_command(
-                "import socket; "
-                "blocked = False; "
-                "s = socket.socket(); "
-                "s.settimeout(1); "
-                "\\ntry:\\n"
-                "    s.connect(('1.1.1.1', 443))\\n"
-                "except OSError:\\n"
-                "    blocked = True\\n"
-                "print('network-blocked' if blocked else 'network-open')"
-            ),
-            timeout_seconds=5,
-            rygnal_run_root=tmp_path / "runs",
-            preserve_workspace=True,
-        )
-    )
-
-    assert result.status == GuardedRunStatus.COMPLETED
-    assert result.command_result is not None
-    assert "network-blocked" in result.command_result.stdout
-
-
-@pytest.mark.skipif(
-    not bwrap_probe_available(),
-    reason="bubblewrap not installed or namespace probe unavailable",
-)
-def test_bubblewrap_backend_clears_host_environment(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repo = create_repo(tmp_path / "repo")
-    monkeypatch.setenv("RYGNAL_TEST_SECRET", "super_secret_value")
-
-    monkeypatch.setattr(
-        "rygnal.guarded_runner.detect_host_backend_capabilities",
-        lambda env=None: HostBackendCapabilities(
-            os_name="linux",
-            has_bwrap=True,
-            bwrap_namespace_probe_passed=True,
-            signed_sandbox_helper_probe_passed=False,
-            has_systemd_run=False,
-            verified_rootless_container_available=False,
-            unsafe_local_requested=False,
-        ),
-    )
-
-    result = run_guarded(
-        GuardedRunConfig(
-            trusted_repo_path=repo,
-            command=py_command(
-                "import os; "
-                "print("
-                "'secret-visible' if 'RYGNAL_TEST_SECRET' in os.environ "
-                "else 'secret-cleared'"
-                ")"
-            ),
-            timeout_seconds=5,
-            rygnal_run_root=tmp_path / "runs",
-            preserve_workspace=True,
-        )
-    )
-
-    assert result.status == GuardedRunStatus.COMPLETED
-    assert result.command_result is not None
-    assert "secret-cleared" in result.command_result.stdout
-
-
-@pytest.mark.skipif(
-    not bwrap_probe_available(),
-    reason="bubblewrap not installed or namespace probe unavailable",
-)
-def test_bubblewrap_backend_keeps_tmp_paths_sandbox_local(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repo = create_repo(tmp_path / "repo")
-    marker = f"rygnal_tmp_escape_{tmp_path.name}"
-
-    host_tmp = Path("/tmp") / marker
-    host_var_tmp = Path("/var/tmp") / marker
-
-    host_tmp.unlink(missing_ok=True)
-    host_var_tmp.unlink(missing_ok=True)
-
-    monkeypatch.setattr(
-        "rygnal.guarded_runner.detect_host_backend_capabilities",
-        lambda env=None: HostBackendCapabilities(
-            os_name="linux",
-            has_bwrap=True,
-            bwrap_namespace_probe_passed=True,
-            signed_sandbox_helper_probe_passed=False,
-            has_systemd_run=False,
-            verified_rootless_container_available=False,
-            unsafe_local_requested=False,
-        ),
-    )
-
-    result = run_guarded(
-        GuardedRunConfig(
-            trusted_repo_path=repo,
-            command=py_command(
-                "from pathlib import Path; "
-                f"Path('/tmp/{marker}').write_text('tmp', encoding='utf-8'); "
-                f"Path('/var/tmp/{marker}').write_text('var_tmp', encoding='utf-8'); "
-                "print('tmp-private')"
-            ),
-            timeout_seconds=5,
-            rygnal_run_root=tmp_path / "runs",
-            preserve_workspace=True,
-        )
-    )
-
-    assert result.status == GuardedRunStatus.COMPLETED
-    assert result.command_result is not None
-    assert "tmp-private" in result.command_result.stdout
-    assert not host_tmp.exists()
-    assert not host_var_tmp.exists()
-
-
-@pytest.mark.skipif(
-    not bwrap_probe_available(),
-    reason="bubblewrap not installed or namespace probe unavailable",
-)
-def test_bubblewrap_backend_blocks_outside_workspace_writes(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repo = create_repo(tmp_path / "repo")
-
-    monkeypatch.setattr(
-        "rygnal.guarded_runner.detect_host_backend_capabilities",
-        lambda env=None: HostBackendCapabilities(
-            os_name="linux",
-            has_bwrap=True,
-            bwrap_namespace_probe_passed=True,
-            signed_sandbox_helper_probe_passed=False,
-            has_systemd_run=False,
-            verified_rootless_container_available=False,
-            unsafe_local_requested=False,
-        ),
-    )
-
-    result = run_guarded(
-        GuardedRunConfig(
-            trusted_repo_path=repo,
-            command=py_command(
-                "from pathlib import Path; "
-                "\\ntry:\\n"
-                "    Path('/etc/rygnal_escape').write_text('bad', encoding='utf-8')\\n"
-                "    print('outside-write-open')\\n"
-                "except OSError:\\n"
-                "    print('outside-write-blocked')"
-            ),
-            timeout_seconds=5,
-            rygnal_run_root=tmp_path / "runs",
-            preserve_workspace=True,
-        )
-    )
-
-    assert result.status == GuardedRunStatus.COMPLETED
-    assert result.command_result is not None
-    assert "outside-write-blocked" in result.command_result.stdout
 
 
 def test_guarded_run_audits_command_intent_before_execution_for_dirty_repo(

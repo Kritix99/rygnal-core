@@ -64,12 +64,12 @@ def test_verified_rootless_container_can_be_selected() -> None:
     assert "Verified rootless container backend" in selection.reason
 
 
-@pytest.mark.parametrize("unsafe_local_requested", [True, False])
-def test_unsafe_local_is_explicit_dev_escape_hatch(unsafe_local_requested: bool) -> None:
-    if not unsafe_local_requested:
-        return
-
-    selection = select_execution_backend(HostBackendCapabilities(unsafe_local_requested=True))
+def test_unsafe_local_is_explicit_dev_escape_hatch() -> None:
+    selection = select_execution_backend(
+        HostBackendCapabilities(
+            unsafe_local_requested=True,
+        )
+    )
 
     assert selection.name == ExecutionBackendName.UNSAFE_LOCAL
     assert selection.safe_by_default is False
