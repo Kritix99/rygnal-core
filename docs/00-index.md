@@ -11,6 +11,8 @@ These are user-facing and actively maintained.
 - README.md
 - getting-started.md
 - architecture.md
+- architecture-status.md
+- architecture-roadmap.md
 - security-model.md
 - known-limitations.md
 - v0.1-scope.md
