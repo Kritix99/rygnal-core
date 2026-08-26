@@ -11,7 +11,7 @@
       <!-- Big Coding Style Terminal Text -->
       <td style="border: none; padding: 0; vertical-align: middle; white-space: nowrap;">
         <h1 style="border: none; margin: 0; padding: 0; font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace; font-size: 34px; font-weight: 800; color: #46e12a; letter-spacing: -0.04em; text-transform: uppercase;">
-          The OS-Level Safety Kernel for AI Agents.
+          A Local-First Safety and Governance Kernel for AI Agents.
         </h1>
       </td>
     </tr>
@@ -26,25 +26,25 @@
   </a>
   <img src="https://img.shields.io/badge/status-early--MVP-orange?style=flat-square" alt="status" />
   <img src="https://img.shields.io/badge/approach-local--first-blue?style=flat-square" alt="local-first" />
-  <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="license" />
+  <img src="https://img.shields.io/badge/license-Apache--2.0-green?style=flat-square" alt="license" />
 </p>
 
 ---
 
 ## $$\Large\color{#46e12a}\texttt{What Rygnal builds}$$
 
-Rygnal is an **OS-level safety kernel** for AI coding agents that intercepts and blocks destructive file changes in milliseconds.
+Rygnal Core is an **early local-first safety and governance kernel** for evaluating AI coding-agent actions and generated repository patches.
 
-It mathematically protects your human-written code, allowing you to safely run autonomous agents unattended without risking your repository.
+It combines deterministic policy, patch-risk analysis, approval binding, audit evidence, and disposable Git workspaces. The current release is an architecture foundation and must not be presented as production containment.
 
 
 | Capability | What it does |
 | :--- | :--- |
-| <code style="color: #4ec9b0;">🛡️ Invisible PTY Interception</code> | Pauses risky actions inline with `[Y/N]`, keeping terminal UI intact. |
-| <code style="color: #4ec9b0;">📦 Isolated Git Sandboxing</code> | Traps the agent in a hidden worktree to test changes first. |
+| <code style="color: #4ec9b0;">🛡️ Guarded Review Flow</code> | Evaluates agent requests and generated patches before trusted mutation. |
+| <code style="color: #4ec9b0;">📦 Disposable Git Workspace</code> | Generates and reviews changes away from the trusted working tree. This is not OS-level containment. |
 | <code style="color: #4ec9b0;">🦀 Rust Semantic Engine</code> | Scores structural AST diffs and temporal decay in `<100ms`. |
 | <code style="color: #4ec9b0;">📝 Declarative Guardrails</code> | Shields critical files instantly using a `.rygnal.yaml` list. |
-| <code style="color: #4ec9b0;">📋 Deterministic Audit</code> | Writes immutable `.jsonl` logs for every intercepted patch. |
+| <code style="color: #4ec9b0;">📋 Tamper-Evident Audit</code> | Hash-chains structured audit events in local JSONL and SQLite storage. |
 
 
 
@@ -79,7 +79,7 @@ It mathematically protects your human-written code, allowing you to safely run a
           <span style="font-weight: 700; font-size: 16px; letter-spacing: -0.02em; color: #f3f4f6;">Contributing</span>
         </div>
         <p style="margin: 0; font-size: 14px; line-height: 1.6; color: #9ca3af;">
-          We welcome bug reports, architecture discussions, and focused pull requests. Review our <a href="./../CONTRIBUTING.md" style="color: #06b6d4; text-decoration: none; font-weight: 500;">Contribution Guidelines &rarr;</a> to get started.
+          We welcome bug reports, architecture discussions, and focused pull requests. Review our <a href="./CONTRIBUTING.md" style="color: #06b6d4; text-decoration: none; font-weight: 500;">Contribution Guidelines &rarr;</a> to get started.
         </p>
       </td>
       <!-- Separator Line -->
@@ -97,7 +97,7 @@ It mathematically protects your human-written code, allowing you to safely run a
           <span style="font-weight: 700; font-size: 16px; letter-spacing: -0.02em; color: #f3f4f6;">Ecosystem</span>
         </div>
         <p style="margin: 0; font-size: 14px; line-height: 1.6; color: #9ca3af;">
-          Designed to seamlessly drop into production environments, CI/CD pipelines, and runtime execution layers without local friction.
+          Designed as a local-first architecture foundation for guarded execution, review, and approval workflows. Production containment is not currently implemented.
         </p>
       </td>
     </tr>
